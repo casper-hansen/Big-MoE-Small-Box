@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "big-moe-small-box"
+version = "0.1.0"
+description = "Run big Mixture-of-Experts models on a small box: one GPU, some RAM, an NVMe drive"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSE.glm-flash-lite"]
+dependencies = [
+    "huggingface_hub>=0.34",
+    "uv>=0.5",  # creates the servers' pinned Python environments
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+bigmoe = "bigmoe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"bigmoe.models.glm53" = ["requirements/*.txt", "kernels/nv2/*", "data/*", "baselines/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

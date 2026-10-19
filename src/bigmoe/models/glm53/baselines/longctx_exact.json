@@ -1,0 +1,312 @@
+{
+ "started": "2026-10-19T03:24:44+0200",
+ "context_length": 131072,
+ "question": "\n\nThe text above is a concatenation of Python source files, each starting with a '### file:' header. Name the first three files in the order they appear, then explain in a few sentences what the very first file is for.",
+ "env": {
+  "GLM53_EC_WARM": "/home/casper/glm-scratch/glm-flash-lite-main/data/stats_own_dec.json",
+  "GLM53_K_HCFUSE": "1",
+  "GLM53_NV": "2",
+  "GLM53_TRITON_PIN": "/home/casper/glm-scratch/glm-flash-lite-main/data/triton_pin_exact.json",
+  "GLM53_NV_CTL_CPU": "6",
+  "GLM53_MAIN_CPUS": "0",
+  "GLM53_NV_CPU": "0",
+  "GLM53_EC_RESERVE_GB": "1.0",
+  "GLM53_EC_MAX_SLOTS": "1376",
+  "GLM53_EC": "1",
+  "GLM53_CPU_TIER": "0",
+  "GLM53_EC_ELASTIC_GB": "10",
+  "GLM53_NV_STORE": "/home/casper/glm-scratch/glm-flash-lite-main/store/glm53_flash_exl3_3.05bpw_experts.bin",
+  "GLM53_K_FTSPLIT": "0",
+  "GLM53_EC_STAGE_GB": "2.6",
+  "GLM53_NV_READER_CPUS": "7-11",
+  "GLM53_K_OVL": "0",
+  "GLM53_EC_STAGE_MIN": "512",
+  "GLM53_ZC_STATS": "/home/casper/glm-scratch/glm-flash-lite-main/data/stats_own_dec.json"
+ },
+ "runs": {
+  "1024": {
+   "prompt_tokens": 1024,
+   "ttft_s": 19.51,
+   "prefill_tok_s": 52.5,
+   "completion_tokens": 202,
+   "decode_s": 30.91,
+   "decode_tok_s": 6.5,
+   "finish": "stop",
+   "text_sha256": "968f20c442aa30f4d774bb8b436cc2ae952d7408f880432f9d61677369f0e7cf",
+   "text": "The first three files, in order, are:\n\n1. `exllamav3/__init__.py`\n2. `exllamav3/architecture/__init__.py`\n3. `exllamav3/architecture/afmoe.py`\n\nThe very first file, `exllamav3/__init__.py`, is the package initializer for the `exllamav3` library. Its main job is to import PyTorch up front and raise a helpful, actionable error if it's missing \u2014 since the package intentionally doesn't install torch automatically (because the correct torch build depends on the user's CUDA setup), it points users to installation instructions instead. It then applies default CUDA allocator settings (enabling expandable segments unless the user has configured the allocator themselves, skipped on Windows or unsupported torch builds), and finally exposes the library's public API by importing key classes like `Config`, `Model`, `Tokenizer`, `Cache`, `Generator`, and sampler utilities."
+  },
+  "8192": {
+   "prompt_tokens": 8192,
+   "ttft_s": 21.65,
+   "prefill_tok_s": 378.4,
+   "completion_tokens": 236,
+   "decode_s": 35.95,
+   "decode_tok_s": 6.54,
+   "finish": "stop",
+   "text_sha256": "f8a24adafd5b2161676fa1838801f2f1bef48f78c653565dfedc6574fb571396",
+   "text": "The first three files, in order of appearance, are:\n\n1. `exllamav3/__init__.py`\n2. `exllamav3/architecture/__init__.py`\n3. `exllamav3/architecture/afmoe.py`\n\nThe very first file, `exllamav3/__init__.py`, is the package initializer for the exllamav3 library. Its main job is to verify that PyTorch is installed before anything else runs \u2014 since exllamav3 intentionally does not declare torch as a default dependency (because the correct torch build depends on the user's CUDA setup), it raises a helpful error message with installation instructions if the import fails. It then applies default CUDA caching allocator settings (enabling expandable segments) unless the user has already configured the allocator themselves, has set the `EXL3_EXPANDABLE_SEGMENTS` environment variable to disable it, or is on Windows where the feature isn't reliably supported. Finally, it exposes the library's public API by importing key classes such as `Config`, `Model`, `Tokenizer`, `Cache`, `Generator`, and sampler components."
+  }
+ },
+ "stats_end": {
+  "requests": 3,
+  "completion_tokens": 446,
+  "expert_cache": [
+   {
+    "device": "cuda:0",
+    "layers": 42,
+    "slots": 1376,
+    "slot_bytes": 9437184,
+    "arena_gb": 12.99,
+    "elastic": {
+     "enter": 3,
+     "exit": 3,
+     "realloc_fail": 0,
+     "wb": 2430,
+     "flex_chunks": 36,
+     "flex_gb": 10.87,
+     "in_prefill": false
+    },
+    "mem_alloc_gb": 22.87,
+    "mem_peak_gb": 22.87,
+    "hits": 3008,
+    "misses": 60220,
+    "admitted": 0,
+    "no_victim": 0,
+    "evictions": 0,
+    "hit_rate": 0.0476,
+    "stage": {
+     "forwards": 6,
+     "layers": 246,
+     "experts": 67592,
+     "overflow": 0,
+     "begin_ms": 2.2711559940944426,
+     "per_buffer": 295
+    },
+    "picks_hist": {
+     "32": 42
+    },
+    "stage_timing_last_forward": null
+   }
+  ],
+  "k_hcfuse": {
+   "fused_sites": 40140,
+   "flushes": 446,
+   "fallback_blocks": 270,
+   "checked_sites": 0,
+   "check_mismatch": 0
+  },
+  "nv2": {
+   "ram_slots": 4543,
+   "ram_gib": 39.929,
+   "pf_ring": 192,
+   "exclusive": true,
+   "cpu_tier": false,
+   "pol": [
+    0.17,
+    0.023,
+    0.38,
+    0.145,
+    0.165,
+    0.04,
+    0.4,
+    0.12,
+    0.395,
+    0.75,
+    0.0,
+    0.0,
+    32.0,
+    0.0
+   ],
+   "host": {
+    "reqs": 18732,
+    "dec_reqs": 18732,
+    "small_reqs": 0,
+    "picks": 149856,
+    "vram": 68523,
+    "ram": 57865,
+    "nvme": 23468,
+    "inflight_hit": 0,
+    "lane_zc": 57865,
+    "lane_cpu": 0,
+    "lane_nvg": 23468,
+    "lane_nvc": 0,
+    "reads": 23468,
+    "read_bytes": 221471834112,
+    "wb_landed": 73558,
+    "wb_dup": 0,
+    "adm_freed": 81033,
+    "adm_pinned": 292,
+    "evictions": 18549,
+    "cpu_jobs": 0,
+    "cpu_experts": 0,
+    "cpu_tokens": 0,
+    "stage_ram": 27242,
+    "stage_nv": 42006,
+    "stage_reads": 42006,
+    "read_err": 0,
+    "alloc_fail": 0,
+    "land_pushed": 73532,
+    "prefetch": 0,
+    "plan_ns": 136739875,
+    "ctl_busy_ns": 157018507,
+    "cpu_busy_ns": 0,
+    "cpu_wait_land_ns": 0,
+    "read_ms_x1000": 1462310299,
+    "stage_wait_ns": 57338172114,
+    "stage_job_ns": 57855102307,
+    "wb_bulk": 2430,
+    "dec_tok": 18732,
+    "notice_ns": 0,
+    "notice_max_ns": 0,
+    "serve_max_ns": 43331,
+    "reply_ns": 154034985,
+    "wb_issued": 73558,
+    "wb_drop": 0,
+    "vring_hits": 372,
+    "lane_b70": 0,
+    "b70_jobs": 0,
+    "b70_rows": 0,
+    "b70_wait_ns": 0,
+    "b70_rtt_ns": 0,
+    "b70_err": 0,
+    "b70_rtt_max_ns": 0,
+    "resident": 4417,
+    "inflight": 0,
+    "free": 126,
+    "landing": 0
+   },
+   "dev": {
+    "hit": 68523,
+    "miss": 81333,
+    "admit": 81333,
+    "novict": 0,
+    "evict": 78869,
+    "wb": 73564,
+    "wb_noslot": 5305,
+    "fix": 0,
+    "bad_rows": 0,
+    "reply_wait_ns": 117502976,
+    "reply_waits": 18732,
+    "nv_wait_ns": 24176206848,
+    "nv_waits": 23468,
+    "timeouts": 0
+   },
+   "py": {
+    "elastic_wb": 2430,
+    "elastic_wb_ms": 874.5905389987456,
+    "stage_wait_ms": 55230.27739001918,
+    "staged_calls": 246,
+    "dec_calls": 18732,
+    "dq_bounce_calls": 804
+   },
+   "decode_per_step": {
+    "steps_est": 446,
+    "tokens_est": 446,
+    "picks": 336.0,
+    "vram_hits": 153.639,
+    "ram_hits": 129.742,
+    "nvme": 52.619,
+    "cpu_experts": 0.0,
+    "zc_admits": 129.742,
+    "nvme_gpu": 52.619,
+    "nvme_cpu": 0.0,
+    "reply_wait_ms": 0.263,
+    "nvme_wait_ms": 54.207,
+    "cpu_busy_ms": 0.0,
+    "b70_experts": 0.0,
+    "b70_wait_ms": 0.0
+   },
+   "b70": {
+    "on": false,
+    "keys": 0,
+    "jobs": 0,
+    "rows": 0,
+    "rtt_us_mean": 0.0,
+    "rtt_us_max": 0.0,
+    "wait_us_mean": 0.0,
+    "err": 0
+   },
+   "memcg": {
+    "current": 45.333,
+    "peak": 45.349,
+    "max": 52.0,
+    "anon": 45.222,
+    "file": 0.015,
+    "kernel": 0.095,
+    "pagetables": 0.092,
+    "shmem": 0.015,
+    "unevictable": 0.0,
+    "slab": 0.001,
+    "host_avail": 12.826
+   },
+   "decode_per_token": {
+    "vram_hits": 153.639,
+    "ram_hits": 129.742,
+    "nvme": 52.619,
+    "cpu_experts": 0.0,
+    "zc_admits": 129.742,
+    "nvme_gpu": 52.619,
+    "nvme_cpu": 0.0,
+    "reply_wait_ms": 0.263,
+    "nvme_wait_ms": 54.207,
+    "cpu_busy_ms": 0.0,
+    "b70_experts": 0.0,
+    "b70_wait_ms": 0.0
+   },
+   "latency": {
+    "n": 4096,
+    "us_pub_to_notice_rel": {
+     "p50": 62.8,
+     "p90": 110.6,
+     "p99": 119.8,
+     "mean": 61.8
+    },
+    "us_host_serve": {
+     "p50": 4.5,
+     "p90": 20.3,
+     "p99": 30.0,
+     "mean": 7.5
+    },
+    "us_step_wait": {
+     "p50": 2.0,
+     "p90": 17.4,
+     "p99": 27.6,
+     "mean": 5.6
+    },
+    "us_pub_to_seen": {
+     "p50": 8.2,
+     "p90": 23.6,
+     "p99": 32.8,
+     "mean": 11.3
+    },
+    "us_step_after_reply": {
+     "p50": 24.6,
+     "p90": 34.8,
+     "p99": 41.0,
+     "mean": 24.5
+    },
+    "us_copy": {
+     "p50": 2291.7,
+     "p90": 5386.8,
+     "p99": 8723.4,
+     "mean": 2791.7
+    },
+    "copy_gbps_p50": 18.4,
+    "jobs_per_call": 4.16,
+    "us_gap_copy_to_next_pub": {
+     "p50": 468.0,
+     "p90": 575.5,
+     "p99": 9037.2,
+     "mean": 651.8
+    },
+    "us_layer_total": {
+     "p50": 2838.5,
+     "p90": 6204.0,
+     "p99": 11965.1,
+     "mean": 3482.1
+    }
+   }
+  }
+ },
+ "finished": "2026-10-19T03:26:53+0200"
+}

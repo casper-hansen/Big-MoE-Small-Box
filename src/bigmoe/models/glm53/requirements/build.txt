@@ -1,0 +1,7 @@
+# Build environment only (on top of runtime.txt): compiles exllamav3 and the engine's extensions.
+nvidia-cuda-nvcc==13.0.88
+nvidia-cuda-crt==13.0.88
+nvidia-nvvm==13.0.88
+nvidia-cuda-cccl==13.0.85
+ninja==1.13.2
+wheel==0.48.0
