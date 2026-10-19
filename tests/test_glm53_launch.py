@@ -28,7 +28,8 @@ def spec_for(tmp_path, monkeypatch, mode, **kw):
 
 @pytest.mark.parametrize("mode,fname", [("nvme", "longctx_nvme.json"), ("nvme-exact", "longctx_exact.json")])
 def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
-    box, spec = spec_for(tmp_path, monkeypatch, mode)
+    # the reference runs were measured with the old 52 GiB cap and a 1376-slot expert cache: pass them explicitly
+    box, spec = spec_for(tmp_path, monkeypatch, mode, memory_gb=52.0, vram_expert_slots=1376)
     ref = json.loads((BASE / fname).read_text())["env"]
     ours = {k: v for k, v in spec.env.items() if k.startswith("GLM53_") and not k.endswith("_BUILD")}
     assert set(ours) == set(ref)
@@ -44,12 +45,13 @@ def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
 
 
 def test_argv(tmp_path, monkeypatch):
+    monkeypatch.setattr(system, "meminfo", lambda: {"MemTotal": 60.9, "MemAvailable": 50.0})
     box, spec = spec_for(tmp_path, monkeypatch, "nvme")
     assert spec.argv[:3] == ["/envs/glm53/bin/python", "-m", "bigmoe.models.glm53.engine.server"]
     assert spec.argv[3:] == ["-m", str(box.backend.model_dir(box)), "-cs", "131072", "--max-batch-size", "8",
                              "-chunk_size", "8192", "-ambs", "4", "--host", "127.0.0.1", "--port", "30000",
                              "--served-name", "glm-5.3-flash"]
-    assert spec.memory_gb == 52.0
+    assert spec.memory_gb == 56.0   # default on a 60 GiB+ box (measured best)
     _, spec = spec_for(tmp_path, monkeypatch, "nvme-exact", context=524288, cache_quant=8, chunk_size=4096)
     assert "-ambs" not in spec.argv and spec.argv[spec.argv.index("-cq") + 1] == "8"
     assert spec.argv[spec.argv.index("-cs") + 1] == "524288" and spec.argv[spec.argv.index("-chunk_size") + 1] == "4096"

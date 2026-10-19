@@ -72,24 +72,17 @@ __global__ void nv_pub_k(const int64_t* __restrict__ sel, const __half* __restri
         const int nx = bsz * H / 8;
         for (int i = t; i < nx; i += blockDim.x) reinterpret_cast<int4*>(hx)[i] = reinterpret_cast<const int4*>(z)[i];
     }
-    if (pf && npf > 0)
+    if (t == 0)   // rank order: pf[] is the router's top-k of layer li+1, best first; VRAM-resident predictions dropped
     {
-        for (int e = t; e < E; e += blockDim.x) pfm[e] = 0;
-        __syncthreads();
-        for (int i = t; i < npf; i += blockDim.x)
-        {
-            const long long e = pf[i] - first;
-            if (e >= 0 && e < E && slotof_next[e] < 0) pfm[e] = 1;
-        }
-        __syncthreads();
-        if (t == 0)
-        {
-            int k = 0;
-            for (int e = 0; e < E && k < MAXP; ++e) if (pfm[e]) r->pf_key[k++] = (li + 1) * E + e;
-            r->npf = k;
-        }
+        int k = 0;
+        if (pf && npf > 0)
+            for (int i = 0; i < npf && k < MAXP; ++i)
+            {
+                const long long e = pf[i] - first;
+                if (e >= 0 && e < E && slotof_next[e] < 0) r->pf_key[k++] = (li + 1) * E + (int) e;
+            }
+        r->npf = k;
     }
-    else if (t == 0) r->npf = 0;
     if (t == 0) { r->li = li; r->nu = nu; r->np = n; r->ntok = bsz; r->kind = kind; const long long tp = (long long) gtime(); r->tpub = tp; dc[DC_TPUB] = tp; }
     __threadfence_system();
     __syncthreads();
@@ -111,12 +104,11 @@ __global__ __launch_bounds__(PUBF_T) void nv_pub_fast_k(const int64_t* __restric
     const int64_t* __restrict__ pf, int npf, const int* __restrict__ slotof_next)
 {
     __shared__ int cnt[MAXU];
-    __shared__ unsigned char pfm[MAXU];
-    __shared__ int wsum[PUBF_T / 32], wsum2[PUBF_T / 32];
+    __shared__ int wsum[PUBF_T / 32];
     __shared__ long long s_seq;
     const int t = threadIdx.x, lane = t & 31, wp = t >> 5;
     const bool do_pf = pf && npf > 0;
-    for (int e = t; e < E; e += blockDim.x) { cnt[e] = 0; pfm[e] = 0; }
+    for (int e = t; e < E; e += blockDim.x) cnt[e] = 0;
     if (t == 0)
     {
         const long long sq = dc[DC_SEQ] + 1;
@@ -129,12 +121,6 @@ __global__ __launch_bounds__(PUBF_T) void nv_pub_fast_k(const int64_t* __restric
         const long long e = sel[s] - first;
         if (e >= 0 && e < E) atomicAdd(&cnt[e], 1);
     }
-    if (do_pf)
-        for (int i = t; i < npf; i += blockDim.x)
-        {
-            const long long e = pf[i] - first;
-            if (e >= 0 && e < E && slotof_next[e] < 0) pfm[e] = 1;
-        }
     if (t == 0)
     {
         const long long sq = s_seq;
@@ -150,20 +136,19 @@ __global__ __launch_bounds__(PUBF_T) void nv_pub_fast_k(const int64_t* __restric
         const int nx = bsz * H / 8;
         for (int i = t; i < nx; i += blockDim.x) reinterpret_cast<int4*>(hx)[i] = reinterpret_cast<const int4*>(z)[i];
     }
-    // ballot compaction, one expert per thread (E <= PUBF_T)
+    // ballot compaction, one expert per thread (E <= PUBF_T); same ascending order as before
     const int e = t;
     const bool f = e < E && cnt[e] > 0;
-    const bool g = do_pf && e < E && pfm[e];
-    const unsigned bf = __ballot_sync(0xffffffffu, f), bg = __ballot_sync(0xffffffffu, g);
+    const unsigned bf = __ballot_sync(0xffffffffu, f);
     const unsigned lt = (1u << lane) - 1u;
-    if (lane == 0) { wsum[wp] = __popc(bf); wsum2[wp] = __popc(bg); }
+    if (lane == 0) wsum[wp] = __popc(bf);
     __syncthreads();
-    int base = 0, base2 = 0, tot = 0, tot2 = 0;
+    int base = 0, tot = 0;
     #pragma unroll
     for (int k = 0; k < PUBF_T / 32; ++k)
     {
-        if (k < wp) { base += wsum[k]; base2 += wsum2[k]; }
-        tot += wsum[k]; tot2 += wsum2[k];
+        if (k < wp) base += wsum[k];
+        tot += wsum[k];
     }
     if (e < E)
     {
@@ -174,20 +159,24 @@ __global__ __launch_bounds__(PUBF_T) void nv_pub_fast_k(const int64_t* __restric
             uexp[u] = e;
             r->key[u] = li * E + e; r->cls[u] = slotof[e] >= 0 ? LN_VRAM : 0; r->cnt[u] = cnt[e];
         }
-        if (g)
-        {
-            const int k = base2 + __popc(bg & lt);
-            if (k < MAXP) r->pf_key[k] = (li + 1) * E + e;
-        }
     }
     if (n <= MAXP)
         for (int s = t; s < n; s += blockDim.x) { r->pe[s] = (int) (sel[s] - first); r->pw[s] = __half2float(w[s]); }
     if (t == 0)
     {
         dc[DC_NU] = tot;
-        r->npf = do_pf ? min(tot2, MAXP) : 0;
         r->li = li; r->nu = tot; r->np = n; r->ntok = bsz; r->kind = kind;
         const long long tp = (long long) gtime(); r->tpub = tp; dc[DC_TPUB] = tp;
+    }
+    if (wp == 0)
+    {
+        // prefetch hints in RANK order: pf[] is the router's top-k of layer li+1 (best first); VRAM-resident ones dropped
+        long long ee = 0;
+        bool ok = false;
+        if (do_pf && lane < npf) { ee = pf[lane] - first; ok = ee >= 0 && ee < E && slotof_next[ee] < 0; }
+        const unsigned bo = __ballot_sync(0xffffffffu, ok);
+        if (ok) { const int k = __popc(bo & lt); if (k < MAXP) r->pf_key[k] = (li + 1) * E + (int) ee; }
+        if (lane == 0) r->npf = do_pf ? min(__popc(bo), MAXP) : 0;
     }
     __threadfence_system();
     __syncthreads();

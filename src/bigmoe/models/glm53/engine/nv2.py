@@ -16,8 +16,8 @@ Per MoE layer call with <= GLM53_EC_STAGE_MIN picks (decode, small forwards), no
   combine  waits for the CPU job (bounded), adds its fp32 partial
 Prefill (>= stage_min picks): staging buffers filled on the copy stream from RAM slots (pinned for the forward) and,
 for NVMe-only experts, from a pinned FIFO ring that a reader fills several layers ahead (GLM53_NV_PF_RING slots).
-Env: GLM53_NV_RAM_GB (auto), GLM53_NV_MARGIN_GB (3), GLM53_NV_THREADS (16 readers), GLM53_NV_PIECE_KB (2304),
-     GLM53_NV_PF_RING (192), GLM53_NV_PF_QD (24), GLM53_NV_EXCL (1), GLM53_NV_ELASTIC_WB (1), GLM53_NV_LAND (64),
+Env: GLM53_NV_RAM_GB (auto), GLM53_NV_MARGIN_GB (1), GLM53_NV_THREADS (16 readers), GLM53_NV_PIECE_KB (2304),
+     GLM53_NV_PF_RING (128), GLM53_NV_PF_QD (24), GLM53_NV_EXCL (1), GLM53_NV_ELASTIC_WB (1), GLM53_NV_LAND (64),
      GLM53_NV_FREE_LO (96), GLM53_NV_CPU (0: S2; 1: S3 CPU tier), GLM53_NV_NVCPU (0), GLM53_NV_CPU_CPUS (2-23),
      GLM53_NV_CPU_MODE (-1 auto), GLM53_NV_CLAMP (1: swiglu clamp on the CPU share, B004 fix), GLM53_NV_POL (cost model
      "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone"), GLM53_NV_MAXCPU (32), GLM53_NV_CTL_CPU (25),
@@ -150,8 +150,8 @@ class Nv2:
         self.home = self.ct[self.off["home"]: self.off["home"] + self.K * 24].view(torch.int64)
         self.res = self.ct[self.off["res"]: self.off["res"] + self.K * 4].view(torch.int32)
         # ---- RAM tier + prefill ring sizes
-        ring_pf = int(g("GLM53_NV_PF_RING", "192"))
-        margin = float(g("GLM53_NV_MARGIN_GB", "3")) * GiB
+        ring_pf = int(g("GLM53_NV_PF_RING", "128"))
+        margin = float(g("GLM53_NV_MARGIN_GB", "1")) * GiB
         mem = NT.cgroup_mem()
         want = g("GLM53_NV_RAM_GB", "auto")
         if want == "auto":
@@ -242,7 +242,7 @@ class Nv2:
                  "lane_nvg", "lane_nvc", "reads", "read_bytes", "wb_landed", "wb_dup", "adm_freed", "adm_pinned",
                  "evictions", "cpu_jobs", "cpu_experts", "cpu_tokens", "stage_ram", "stage_nv", "stage_reads", "read_err",
                  "alloc_fail", "land_pushed", "prefetch", "plan_ns", "ctl_busy_ns", "cpu_busy_ns", "cpu_wait_land_ns",
-                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns",
+                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "pf_keys", "pf_skip", "pf_used", "pf_wasted",
                  "resident", "inflight", "free", "landing"]
         return dict(zip(names, ext().counters()))
 

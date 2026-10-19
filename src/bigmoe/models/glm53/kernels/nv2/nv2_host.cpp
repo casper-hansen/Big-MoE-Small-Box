@@ -146,6 +146,7 @@ struct Counters
     std::atomic<long long> lane_b70{0}, b70_jobs{0}, b70_rows{0}, b70_wait_ns{0}, b70_rtt_ns{0}, b70_err{0}, b70_rtt_max_ns{0};
     std::atomic<long long> reply_ns{0}, plan_ns{0}, ctl_busy_ns{0}, cpu_busy_ns{0}, cpu_wait_land_ns{0}, read_ms_x1000{0},
         stage_wait_ns{0}, stage_job_ns{0}, wb_bulk{0};
+    std::atomic<long long> pf_keys{0}, pf_skip{0}, pf_used{0}, pf_wasted{0};   // prefetch precision counters
 };
 
 struct Engine;
@@ -169,6 +170,7 @@ struct Engine
     std::vector<int32_t> owner, pinc, lprev, lnext; int lru_old = -1, lru_new = -1;
     std::vector<int32_t> freel;
     std::vector<uint8_t> prot; std::vector<int32_t> protl;
+    std::vector<uint8_t> pfs; int pf_max = 4;   // prefetched and not yet demanded; GLM53_NV_PF_MAX (4 = best measured)
     std::vector<float> score;
     std::mutex mu; std::condition_variable land_cv;
     int64_t land_tail = 0;
@@ -236,6 +238,7 @@ struct Engine
     int evict_key(int key)
     {
         const int s = slot_of[key];
+        if (pfs[key]) { C.pf_wasted++; pfs[key] = 0; }   // prefetched, evicted before any demand use
         __atomic_store_n(&ram_res[key], 0, __ATOMIC_RELEASE);
         set_home(key, ph);
         kst[key] = KS_NONE; slot_of[key] = -1; owner[s] = SL_FREE;
@@ -338,6 +341,7 @@ struct Engine
                 if (!exclusive || kst[key] != KS_RES) continue;
                 const int s = slot_of[key];
                 if (pinc[s] > 0 || prot[key]) { C.adm_pinned++; lru_remove(s); lru_push_old(s); continue; }
+                if (pfs[key]) { C.pf_used++; pfs[key] = 0; }   // admitted to VRAM: the prefetch was used
                 free_slot(evict_key(key));
                 C.evictions--;   // not a capacity eviction
                 C.adm_freed++;
@@ -432,6 +436,7 @@ struct Engine
             const int key = r.key[u];
             if (r.cls[u] == LN_VRAM) { p.lane[u] = LN_VRAM; V.push_back({ u, key, r.cnt[u], 0, 0 }); continue; }
             if (b70 && b70k[key]) { p.lane[u] = LN_B70; nb70++; C.lane_b70++; continue; }
+            if (pfs[key]) { C.pf_used++; pfs[key] = 0; }   // a prefetched expert is demanded (resident or in flight)
             if (kst[key] == KS_RES)
             {
                 lru_touch(slot_of[key]);
@@ -472,11 +477,13 @@ struct Engine
         }
         p.ncpu = ncpu + nb70; p.nnv = nnv;
         // layer-ahead prefetch hints (next layer's predicted picks): read the non-resident ones now (behind demand reads)
-        for (int i = 0; i < r.npf && i < MAXP; ++i)
+        const int npf_lim = std::min(std::min(r.npf, (int) MAXP), pf_max);   // rank order: the first pf_max are the best
+        for (int i = 0; i < npf_lim; ++i)
         {
             const int key = r.pf_key[i];
-            if (key < 0 || key >= K || kst[key] != KS_NONE || (b70_on && b70k[key])) continue;
-            if (start_read(key, true, nullptr)) C.prefetch++;
+            C.pf_keys++;
+            if (key < 0 || key >= K || kst[key] != KS_NONE || (b70_on && b70k[key])) { C.pf_skip++; continue; }
+            if (start_read(key, true, nullptr)) { C.prefetch++; pfs[key] = 1; }
         }
         C.plan_ns += (long long) ((now_ms() - t0) * 1e6);
     }
@@ -894,6 +901,8 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t
     for (auto& ev : e.pf_ev) cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
     e.score.assign(score.data_ptr<float>(), score.data_ptr<float>() + e.K);
     e.slot_of.assign(e.K, -1); e.kvr.assign(e.K, -1); e.kst.assign(e.K, KS_NONE); e.karr.assign(e.K, 0); e.prot.assign(e.K, 0);
+    e.pfs.assign(e.K, 0);
+    if (const char* pm = getenv("GLM53_NV_PF_MAX")) e.pf_max = std::max(0, atoi(pm));
     e.owner.assign(e.nram, SL_FREE); e.pinc.assign(e.nram, 0); e.lprev.assign(e.nram, -1); e.lnext.assign(e.nram, -1);
     for (int s = e.nram - 1; s >= 0; --s) e.freel.push_back(s);
     for (int k = 0; k < e.K; ++k) { e.ram_res[k] = 0; e.set_home(k, ph); }
@@ -1043,7 +1052,7 @@ std::vector<int64_t> counters()
         c.evictions, c.cpu_jobs, c.cpu_experts, c.cpu_tokens, c.stage_ram, c.stage_nv, c.stage_reads, c.read_err,
         c.alloc_fail, c.land_pushed, c.prefetch, c.plan_ns, c.ctl_busy_ns, c.cpu_busy_ns, c.cpu_wait_land_ns,
         c.read_ms_x1000, c.stage_wait_ns, c.stage_job_ns, c.wb_bulk, c.dec_tok, c.notice_ns, c.notice_max_ns, c.serve_max_ns, c.reply_ns, c.wb_issued, c.wb_drop, c.vring_hits,
-        c.lane_b70, c.b70_jobs, c.b70_rows, c.b70_wait_ns, c.b70_rtt_ns, c.b70_err, c.b70_rtt_max_ns };
+        c.lane_b70, c.b70_jobs, c.b70_rows, c.b70_wait_ns, c.b70_rtt_ns, c.b70_err, c.b70_rtt_max_ns, c.pf_keys, c.pf_skip, c.pf_used, c.pf_wasted };
     std::lock_guard<std::mutex> lk(e.mu);
     int res = 0, inf = 0; for (int k = 0; k < e.K; ++k) { res += e.kst[k] == KS_RES; inf += e.kst[k] == KS_INFLIGHT; }
     v.push_back(res); v.push_back(inf); v.push_back((int64_t) e.freel.size()); v.push_back(e.land_tail - e.hc[HC_WBN]);

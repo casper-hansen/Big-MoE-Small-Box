@@ -45,7 +45,7 @@ class GLM53Options:
     cache_quant: int = None  # KV-cache bits (-cq); None = FP16
     chunk_size: int = 8192
     max_batch_size: int = 8
-    vram_expert_slots: int = 1376  # leaves room for a desktop on the same GPU; None = all free VRAM
+    vram_expert_slots: int = None  # None = all free VRAM (measured best); an int caps the expert cache
     planner_cost: str = TUNED_PLANNER
     cpus: object = "auto"  # or a CpuLayout, or {"main", "controller", "lane", "readers"}
     slim: bool = True
@@ -76,9 +76,9 @@ class GLM53(ModelBackend):
 
     @property
     def default_memory_gb(self) -> float:
-        """52 GiB (the measured setting on a 64 GB box); on smaller hosts MemTotal - 8 GiB (desktop / OS headroom)."""
+        """56 GiB on a 60 GiB+ box (measured best: 4.8 GiB host headroom at peak); smaller hosts MemTotal - 8 GiB."""
         total = system.meminfo().get("MemTotal", 64)
-        return 52.0 if total >= 60 else float(max(15, int(total - 8)))
+        return 56.0 if total >= 60 else float(max(15, int(total - 8)))
 
     def matches(self, ref, config):
         if super().matches(ref, None):
