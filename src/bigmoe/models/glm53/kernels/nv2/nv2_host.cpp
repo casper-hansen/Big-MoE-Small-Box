@@ -147,6 +147,8 @@ struct Counters
     std::atomic<long long> reply_ns{0}, plan_ns{0}, ctl_busy_ns{0}, cpu_busy_ns{0}, cpu_wait_land_ns{0}, read_ms_x1000{0},
         stage_wait_ns{0}, stage_job_ns{0}, wb_bulk{0};
     std::atomic<long long> pf_keys{0}, pf_skip{0}, pf_used{0}, pf_wasted{0};   // prefetch precision counters
+    std::atomic<long long> lane_skip{0}, lossy_calls{0}, lossy_tok{0}, lossy_tok_skip{0}, lossy_cold_x1e6{0},
+        lossy_skip_x1e6{0}, lossy_coldu{0}, lossy_want{0}, lossy_bg_reads{0};   // BCP
 };
 
 struct Engine;
@@ -170,6 +172,11 @@ struct Engine
     std::vector<int32_t> owner, pinc, lprev, lnext; int lru_old = -1, lru_new = -1;
     std::vector<int32_t> freel;
     std::vector<uint8_t> prot; std::vector<int32_t> protl;
+    // BCP lossy verify (GLM53_NV_LOSSY=1 or ext().set_lossy; approximate, not lossless): see lossy_plan
+    bool lossy_on = false; float lossy_eps = 0.0f, lossy_whi = 2.0f; int lossy_renorm = 0, lossy_pf = 0, lossy_bg = 0;
+    int lossy_lo = 0, lossy_hi = 1 << 30;
+    int tail_r = 0, tail_scope = 0;   // Strata tail skip (patch_tail.py); tail_r 0 = off
+    std::vector<uint8_t> lwant; std::vector<int16_t> luix;
     std::vector<uint8_t> pfs; int pf_max = 4;   // prefetched and not yet demanded; GLM53_NV_PF_MAX (4 = best measured)
     std::vector<float> score;
     std::mutex mu; std::condition_variable land_cv;
@@ -423,10 +430,139 @@ struct Engine
     // ---------------- plan_layer (moetier semantics) ----------------
     struct PK { int u, key, cnt; double arr; float sc; };
     std::vector<PK> V, Rm, N;
+    bool lossy_cold(const Req& r, int u) const
+    {
+        const int key = r.key[u];
+        return r.cls[u] != LN_VRAM && kst[key] == KS_NONE && !(b70_on && b70k[key]);
+    }
+    // BCP: per token, cold picks sorted by weight; fetch largest-first while the token's remaining cold mass > eps
+    // (fraction of its routed mass) or the pick's own fraction >= whi. The union over tokens is what gets read, so a
+    // cold expert fetched for one token is exact for every token that picked it.
+    void lossy_plan(const Req& r, Rep& p)
+    {
+        const int topk = std::max(1, r.np / std::max(1, r.ntok));
+        p.rn_on = lossy_renorm; p.rn_topk = topk;
+        for (int t = 0; t < MAXB; ++t) p.rn_sc[t] = 1.0f;
+        long long ncu = 0;
+        for (int u = 0; u < r.nu; ++u)
+        {
+            lwant[u] = 0;
+            const int e = r.key[u] - r.li * E;
+            if (e >= 0 && e < E) luix[e] = (int16_t) u;
+            ncu += lossy_cold(r, u);
+        }
+        for (int t = 0; t < r.ntok; ++t)
+        {
+            float cw[MAXP]; int cu[MAXP]; int nc = 0; float W = 0.f;
+            for (int j = 0; j < topk; ++j)
+            {
+                const int i = t * topk + j;
+                if (i >= r.np) break;
+                const float w = r.pw[i]; W += w;
+                const int e = r.pe[i];
+                if (e < 0 || e >= E) continue;
+                const int u = luix[e];
+                if (u < 0 || !lossy_cold(r, u)) continue;
+                int k = nc++;
+                while (k > 0 && cw[k - 1] < w) { cw[k] = cw[k - 1]; cu[k] = cu[k - 1]; --k; }
+                cw[k] = w; cu[k] = u;
+            }
+            if (W <= 0.f || nc == 0) continue;
+            float m = 0.f;
+            for (int k = 0; k < nc; ++k) m += cw[k];
+            C.lossy_cold_x1e6 += (long long) (1e6f * m / W);
+            for (int k = 0; k < nc; ++k)
+                if (m > lossy_eps * W || cw[k] >= lossy_whi * W) { lwant[cu[k]] = 1; m -= cw[k]; }
+        }
+        for (int t = 0; t < r.ntok; ++t)   // after the union: skipped mass per token, renorm scales
+        {
+            float W = 0.f, S = 0.f;
+            for (int j = 0; j < topk; ++j)
+            {
+                const int i = t * topk + j;
+                if (i >= r.np) break;
+                const float w = r.pw[i]; W += w;
+                const int e = r.pe[i];
+                if (e < 0 || e >= E) continue;
+                const int u = luix[e];
+                if (u >= 0 && lossy_cold(r, u) && !lwant[u]) S += w;
+            }
+            C.lossy_tok++;
+            C.lossy_skip_x1e6 += (long long) (W > 0.f ? 1e6f * S / W : 0.f);
+            if (S > 0.f) C.lossy_tok_skip++;
+            if (t < MAXB) p.rn_sc[t] = (W - S > 1e-6f) ? W / (W - S) : 1.0f;
+        }
+        long long nw = 0;
+        for (int u = 0; u < r.nu; ++u) nw += lwant[u];
+        C.lossy_coldu += ncu; C.lossy_want += nw; C.lossy_calls++;
+    }
+    // Strata tail skip (set_tail / GLM53_NV_TAIL): a pick is skipped only when every token of the call routes it at
+    // rank >= tail_r of its top-k (rank by routing weight, 0 = best); scope 1 also covers RAM-tier picks. No renormalisation.
+    void lossy_tail_plan(const Req& r, Rep& p)
+    {
+        const int topk = std::max(1, r.np / std::max(1, r.ntok));
+        p.rn_on = 0; p.rn_topk = topk;
+        for (int t = 0; t < MAXB; ++t) p.rn_sc[t] = 1.0f;
+        for (int u = 0; u < r.nu; ++u)
+        {
+            const int e = r.key[u] - r.li * E;
+            if (e >= 0 && e < E) luix[e] = (int16_t) u;
+        }
+        int minr[MAXU];
+        for (int u = 0; u < r.nu; ++u) minr[u] = 1 << 20;
+        for (int t = 0; t < r.ntok; ++t)
+            for (int j = 0; j < topk; ++j)
+            {
+                const int i = t * topk + j;
+                if (i >= r.np) break;
+                const int e = r.pe[i];
+                if (e < 0 || e >= E) continue;
+                const int u = luix[e];
+                if (u < 0) continue;
+                const float w = r.pw[i];
+                int rank = 0;
+                for (int j2 = 0; j2 < topk; ++j2)
+                {
+                    if (j2 == j || t * topk + j2 >= r.np) continue;
+                    const float w2 = r.pw[t * topk + j2];
+                    if (w2 > w || (w2 == w && j2 < j)) ++rank;
+                }
+                minr[u] = std::min(minr[u], rank);
+            }
+        long long nw = 0;
+        for (int u = 0; u < r.nu; ++u)
+        {
+            const int key = r.key[u];
+            const bool cold = lossy_cold(r, u);
+            const bool ram = tail_scope == 1 && r.cls[u] != LN_VRAM && kst[key] == KS_RES && kvr[key] < 0;
+            lwant[u] = ((cold || ram) && minr[u] >= tail_r) ? 0 : 1;
+            nw += lwant[u];
+        }
+        C.lossy_calls++; C.lossy_want += nw;
+    }
+    void lossy_bg_reads(const Req& r)   // heaviest skipped experts first, low priority (behind demand reads)
+    {
+        float bw[MAXU]; int bk[MAXU]; int nb = 0;
+        for (int u = 0; u < r.nu && nb < MAXU; ++u)
+        {
+            if (!lossy_cold(r, u) || lwant[u]) continue;
+            float w = 0.f;
+            for (int i = 0; i < r.np; ++i) if (r.pe[i] == r.key[u] - r.li * E) w += r.pw[i];
+            int k = nb++;
+            while (k > 0 && bw[k - 1] < w) { bw[k] = bw[k - 1]; bk[k] = bk[k - 1]; --k; }
+            bw[k] = w; bk[k] = r.key[u];
+        }
+        for (int k = 0; k < std::min(nb, lossy_bg); ++k)
+            if (kst[bk[k]] == KS_NONE && start_read(bk[k], false, nullptr)) { C.lossy_bg_reads++; pfs[bk[k]] = 1; }
+    }
     void plan_and_reply(const Req& r, Rep& p)
     {
         const double t0 = now_ms();
-        const bool dec = r.kind == RK_DECODE;
+        const bool dec = r.kind == RK_DECODE || r.kind == RK_VERIFY;
+        const bool lossy = lossy_on && r.kind == RK_VERIFY && r.np <= MAXP && r.li >= lossy_lo && r.li <= lossy_hi;
+        p.rn_on = 0; p.rn_topk = 8;
+        if (lossy && tail_r > 0) lossy_tail_plan(r, p);
+        else if (lossy) lossy_plan(r, p);
         const bool cpu = dec && pol.cpu_on && cpu_ready && r.np <= MAXP && r.ntok <= MAXB;
         V.clear(); Rm.clear(); N.clear();
         int nnv = 0, nb70 = 0;
@@ -441,10 +577,12 @@ struct Engine
             {
                 lru_touch(slot_of[key]);
                 if (kvr[key] >= 0) { p.lane[u] = LN_RAM; C.lane_zc++; C.vring_hits++; if (dec) C.ram++; continue; }   // VRAM-ring backed: GPU lane
+                if (lossy && tail_r > 0 && tail_scope == 1 && !lwant[u]) { p.lane[u] = LN_SKIP; C.lane_skip++; continue; }
                 Rm.push_back({ u, key, r.cnt[u], 0, score[key] });
             }
             else
             {
+                if (lossy && kst[key] == KS_NONE && !lwant[u]) { p.lane[u] = LN_SKIP; C.lane_skip++; continue; }
                 double a = 0;
                 if (kst[key] == KS_INFLIGHT) { a = karr[key]; C.inflight_hit++; }
                 else if (!start_read(key, true, &a)) { a = 1e9; hc[HC_ERR] = 19; fprintf(stderr, "nv2: no RAM slot for key %d\n", key); }
@@ -478,13 +616,15 @@ struct Engine
         p.ncpu = ncpu + nb70; p.nnv = nnv;
         // layer-ahead prefetch hints (next layer's predicted picks): read the non-resident ones now (behind demand reads)
         const int npf_lim = std::min(std::min(r.npf, (int) MAXP), pf_max);   // rank order: the first pf_max are the best
-        for (int i = 0; i < npf_lim; ++i)
+        if (lossy && lossy_bg > 0) lossy_bg_reads(r);
+        for (int i = 0; i < (lossy ? std::min(npf_lim, lossy_pf) : npf_lim); ++i)
         {
             const int key = r.pf_key[i];
             C.pf_keys++;
             if (key < 0 || key >= K || kst[key] != KS_NONE || (b70_on && b70k[key])) { C.pf_skip++; continue; }
             if (start_read(key, true, nullptr)) { C.prefetch++; pfs[key] = 1; }
         }
+        if (lossy) for (int u = 0; u < r.nu; ++u) { const int e = r.key[u] - r.li * E; if (e >= 0 && e < E) luix[e] = -1; }
         C.plan_ns += (long long) ((now_ms() - t0) * 1e6);
     }
 
@@ -500,7 +640,7 @@ struct Engine
             for (int u = 0; u < r.nu; ++u) { prot[r.key[u]] = 1; protl.push_back(r.key[u]); }
             drain_logs(s);                         // write-back landings may evict: never this request's keys
             plan_and_reply(r, p);
-            C.reqs++; (r.kind == RK_DECODE ? C.dec_reqs : C.small_reqs)++; if (r.kind == RK_DECODE) C.dec_tok += r.ntok;
+            C.reqs++; (r.kind != RK_SMALL ? C.dec_reqs : C.small_reqs)++; if (r.kind != RK_SMALL) C.dec_tok += r.ntok;
         }
         if (p.ncpu > 0)
         {
@@ -515,7 +655,9 @@ struct Engine
                 const int ln = p.lane[u];
                 if (ln != LN_CPU && ln != LN_NVC && ln != LN_B70) continue;
                 const int topk = r.np / std::max(1, r.ntok);
-                cj.e[cj.np] = e; cj.t[cj.np] = i / std::max(1, topk); cj.w[cj.np] = r.pw[i]; cj.lane[cj.np] = ln; cj.np++;
+                const int tt = i / std::max(1, topk);
+                cj.e[cj.np] = e; cj.t[cj.np] = tt; cj.w[cj.np] = r.pw[i] * ((p.rn_on && tt < MAXB) ? p.rn_sc[tt] : 1.0f);
+                cj.lane[cj.np] = ln; cj.np++;
             }
             cpu_job_seq.store(s, std::memory_order_release);
         }
@@ -903,6 +1045,22 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t
     e.slot_of.assign(e.K, -1); e.kvr.assign(e.K, -1); e.kst.assign(e.K, KS_NONE); e.karr.assign(e.K, 0); e.prot.assign(e.K, 0);
     e.pfs.assign(e.K, 0);
     if (const char* pm = getenv("GLM53_NV_PF_MAX")) e.pf_max = std::max(0, atoi(pm));
+    {
+        const char* v;
+        e.lossy_on = (v = getenv("GLM53_NV_LOSSY")) && atoi(v) == 1;
+        if ((v = getenv("GLM53_NV_LOSSY_EPS"))) e.lossy_eps = (float) atof(v);
+        if ((v = getenv("GLM53_NV_LOSSY_WHI"))) e.lossy_whi = (float) atof(v);
+        if ((v = getenv("GLM53_NV_LOSSY_RENORM"))) e.lossy_renorm = atoi(v);
+        if ((v = getenv("GLM53_NV_LOSSY_PF"))) e.lossy_pf = std::max(0, atoi(v));
+        if ((v = getenv("GLM53_NV_LOSSY_BG"))) e.lossy_bg = std::max(0, atoi(v));
+        if ((v = getenv("GLM53_NV_LOSSY_LO"))) e.lossy_lo = atoi(v);
+        if ((v = getenv("GLM53_NV_LOSSY_HI"))) e.lossy_hi = atoi(v);
+        if ((v = getenv("GLM53_NV_TAIL"))) e.tail_r = atoi(v);
+        if ((v = getenv("GLM53_NV_TAIL_SCOPE"))) e.tail_scope = atoi(v);
+        e.lwant.assign(MAXU, 0); e.luix.assign(e.E, -1);
+        if (e.lossy_on) fprintf(stderr, "nv2: BCP lossy verify eps %.3f whi %.3f renorm %d pf %d bg %d layers %d..%d\n",
+                                e.lossy_eps, e.lossy_whi, e.lossy_renorm, e.lossy_pf, e.lossy_bg, e.lossy_lo, e.lossy_hi);
+    }
     e.owner.assign(e.nram, SL_FREE); e.pinc.assign(e.nram, 0); e.lprev.assign(e.nram, -1); e.lnext.assign(e.nram, -1);
     for (int s = e.nram - 1; s >= 0; --s) e.freel.push_back(s);
     for (int k = 0; k < e.K; ++k) { e.ram_res[k] = 0; e.set_home(k, ph); }
@@ -1052,7 +1210,8 @@ std::vector<int64_t> counters()
         c.evictions, c.cpu_jobs, c.cpu_experts, c.cpu_tokens, c.stage_ram, c.stage_nv, c.stage_reads, c.read_err,
         c.alloc_fail, c.land_pushed, c.prefetch, c.plan_ns, c.ctl_busy_ns, c.cpu_busy_ns, c.cpu_wait_land_ns,
         c.read_ms_x1000, c.stage_wait_ns, c.stage_job_ns, c.wb_bulk, c.dec_tok, c.notice_ns, c.notice_max_ns, c.serve_max_ns, c.reply_ns, c.wb_issued, c.wb_drop, c.vring_hits,
-        c.lane_b70, c.b70_jobs, c.b70_rows, c.b70_wait_ns, c.b70_rtt_ns, c.b70_err, c.b70_rtt_max_ns, c.pf_keys, c.pf_skip, c.pf_used, c.pf_wasted };
+        c.lane_b70, c.b70_jobs, c.b70_rows, c.b70_wait_ns, c.b70_rtt_ns, c.b70_err, c.b70_rtt_max_ns, c.pf_keys, c.pf_skip, c.pf_used, c.pf_wasted, c.lane_skip, c.lossy_calls, c.lossy_tok, c.lossy_tok_skip,
+        c.lossy_cold_x1e6, c.lossy_skip_x1e6, c.lossy_coldu, c.lossy_want, c.lossy_bg_reads };
     std::lock_guard<std::mutex> lk(e.mu);
     int res = 0, inf = 0; for (int k = 0; k < e.K; ++k) { res += e.kst[k] == KS_RES; inf += e.kst[k] == KS_INFLIGHT; }
     v.push_back(res); v.push_back(inf); v.push_back((int64_t) e.freel.size()); v.push_back(e.land_tail - e.hc[HC_WBN]);
@@ -1275,6 +1434,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("stage_end", &stage_end, py::call_guard<py::gil_scoped_release>());
     m.def("set_stage_qd", &set_stage_qd);
     m.def("shutdown", &shutdown, py::call_guard<py::gil_scoped_release>());
+    m.def("set_lossy", [](int on, double eps, double whi, int renorm, int pf, int bg, int lo, int hi) {
+        Engine& e = *G; std::lock_guard<std::mutex> lk(e.mu);
+        e.lossy_on = on == 1; e.lossy_eps = (float) eps; e.lossy_whi = (float) whi; e.lossy_renorm = renorm;
+        e.lossy_pf = std::max(0, pf); e.lossy_bg = std::max(0, bg); e.lossy_lo = lo; e.lossy_hi = hi;
+        if (e.luix.size() != size_t(e.E)) e.luix.assign(e.E, -1);
+        if (e.lwant.size() != size_t(MAXU)) e.lwant.assign(MAXU, 0);
+    });
+    m.def("set_tail", [](int r, int scope) {
+        Engine& e = *G; std::lock_guard<std::mutex> lk(e.mu);
+        e.tail_r = std::max(0, std::min(r, 9)); e.tail_scope = scope == 1 ? 1 : 0;
+    });
     m.def("sizes", [] { return std::vector<int64_t>{ (int64_t) sizeof(Req), (int64_t) sizeof(Rep), (int64_t) sizeof(LogE), MAXU, MAXP, RQ, LG, LR, MAXB, HC_N, DC_N, ST_N, DBG }; });
     dev_bind(m);
 }

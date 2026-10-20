@@ -176,6 +176,43 @@ def make_sampler(sp):
                         min_p=float(sp.get("min_p") or 0.0))
 
 
+
+# ---- BCP / KL instrumentation (box-only experiment) -----------------------------------------------------------------
+KL = {"on": os.environ.get("GLM53_KL_CAPTURE") == "1", "prompt": None, "gen": [], "steps": []}
+BCP = {"lossy_dec": os.environ.get("GLM53_NV_LOSSY_DEC") == "1", "force": None, "installed": False}
+
+
+def _bcp_install():
+    if BCP["installed"]:
+        return
+    BCP["installed"] = True
+    from . import nv2 as _nv2
+    orig = model.forward
+
+    def fwd(*a, **kw):
+        ids = kw["input_ids"] if "input_ids" in kw else (a[0] if a else None)
+        params = kw["params"] if "params" in kw else (a[1] if len(a) > 1 else None)
+        if not (isinstance(params, dict) and params.get("pinned_staging")):
+            return orig(*a, **kw)
+        ntok = int(ids.shape[-1])
+        cs = params.get("cache_seqlens")
+        p0 = int(cs[0]) if cs is not None else -1
+        _nv2.VERIFY[0] = ntok > 1 or BCP["lossy_dec"]
+        try:
+            out = orig(*a, **kw)
+        finally:
+            _nv2.VERIFY[0] = False
+        if KL["on"] and ids.shape[0] == 1:
+            with torch.inference_mode():
+                v, ix = out[0].float().log_softmax(-1).topk(256, dim=-1)
+            KL["steps"].append({"p0": p0, "ids": [int(x) for x in ids[0].tolist()],
+                                "lp": [[round(x, 4) for x in row] for row in v.tolist()], "ix": ix.tolist()})
+        return out
+
+    model.forward = fwd
+    print(" -- BCP instrumentation installed (verify flag, KL capture %s)" % KL["on"], flush=True)
+
+
 @app.on_event("startup")
 async def startup():
     G["gen"] = AsyncGenerator(model=model, cache=cache, tokenizer=tok, max_batch_size=args.max_batch_size,
@@ -185,6 +222,7 @@ async def startup():
                               draft_confidence=args.draft_confidence, ngram_match_min=args.ngram_match_min,
                               record_draft_stats=bool(draft_model is not None or args.ngram_match_min),
                               recurrent_cache_size=int(args.recurrent_cache_size * 1024 ** 3))
+    _bcp_install()
 
 
 def ids_of(body):
@@ -206,6 +244,13 @@ async def run_job(ids, sp, stop_strings=None):
     job = AsyncJob(gen, input_ids=ids, max_new_tokens=max(1, max_new), sampler=make_sampler(sp),
                    stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
                    **({"max_rq_tokens": rq} if rq else {}))
+    if KL["on"]:
+        KL["prompt"] = [int(x) for x in ids.flatten().tolist()]
+        KL["gen"] = []
+        KL["steps"] = []
+    if BCP["force"] is not None:
+        job.constrain_output_now(torch.tensor([BCP["force"]], dtype=torch.long))
+        BCP["force"] = None
     G["stats"]["requests"] += 1
     n, text, done = 0, "", False
     try:
@@ -214,6 +259,8 @@ async def run_job(ids, sp, stop_strings=None):
                 continue
             chunk = r.get("text") or ""
             tids = r.get("token_ids")
+            if KL["on"] and tids is not None:
+                KL["gen"] += [int(x) for x in tids.flatten().tolist()]
             n += int(tids.numel()) if tids is not None else (1 if chunk else 0)
             text += chunk
             fin = None
@@ -511,6 +558,58 @@ async def la(on: int = 1):
     """N136: runtime lookahead switch for same-server A/B (takes effect at the next decode step)."""
     from . import k_lookahead
     return JSONResponse({"enabled": k_lookahead.set_enabled(bool(on)), "stats": k_lookahead.summary()})
+
+
+# ---- BCP / KL endpoints (box-only experiment) -------------------------------------------------------------------------
+
+@app.post("/bcp")
+async def bcp_set(req: Request):
+    b = await req.json()
+    from . import nv2 as _nv2
+    _nv2.ext().set_lossy(int(b.get("on", 0)), float(b.get("eps", 0.0)), float(b.get("whi", 2.0)),
+                         int(b.get("renorm", 0)), int(b.get("pf", 0)), int(b.get("bg", 0)), int(b.get("lo", 0)),
+                         int(b.get("hi", 1 << 30)))
+    _nv2.ext().set_tail(int(b.get("tail", 0)), int(b.get("tail_scope", 0)))
+    BCP["lossy_dec"] = bool(b.get("lossy_dec", False))
+    KL["on"] = bool(b.get("kl", KL["on"]))
+    return JSONResponse({"ok": True, "cfg": b, "kl": KL["on"]})
+
+
+@app.get("/kl_capture")
+async def kl_capture():
+    d = {"prompt": KL["prompt"], "gen": KL["gen"], "steps": KL["steps"], "eos": list(EOS)}
+    KL["steps"] = []
+    return JSONResponse(d)
+
+
+@app.post("/kl_force")
+async def kl_force(req: Request):
+    b = await req.json()
+    ids = torch.tensor([[int(x) for x in b["prompt"]]], dtype=torch.long)
+    BCP["force"] = [int(x) for x in b["ref"]]
+    t0 = time.time()
+    n = 0
+    async for _text, n, _fin in run_job(ids, {"temperature": 0, "max_new_tokens": len(b["ref"])}):
+        pass
+    return JSONResponse({"n": n, "secs": time.time() - t0})
+
+
+@app.post("/kl_teacher")
+async def kl_teacher(req: Request):
+    b = await req.json()
+    while len(G["gen"].jobs):
+        await asyncio.sleep(0.05)
+    seq = [int(x) for x in b["ids"]]
+    s0, cnt = int(b["start"]), int(b["count"])
+    pad = (-len(seq)) % 64
+    x = torch.tensor([seq + [seq[-1]] * pad], dtype=torch.long)
+    with torch.inference_mode():
+        logits = model.forward(x, {"attn_mode": "flash_attn_nc"})
+        v, ix = logits[0, s0:s0 + cnt].float().log_softmax(-1).topk(256, dim=-1)
+    del logits
+    torch.cuda.empty_cache()
+    return JSONResponse({"start": s0, "count": cnt, "lp": [[round(a, 4) for a in r] for r in v.tolist()],
+                         "ix": ix.tolist()})
 
 
 @app.get("/health")

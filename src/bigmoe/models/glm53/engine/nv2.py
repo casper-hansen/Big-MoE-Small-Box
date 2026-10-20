@@ -35,6 +35,7 @@ from . import nv_tier as NT
 GiB = 1024 ** 3
 _EXT = None
 NV = None
+VERIFY = [False]   # BCP: set by the server around generator verify forwards (lossy-policy eligible)
 
 
 def _cpus(spec):
@@ -242,7 +243,7 @@ class Nv2:
                  "lane_nvg", "lane_nvc", "reads", "read_bytes", "wb_landed", "wb_dup", "adm_freed", "adm_pinned",
                  "evictions", "cpu_jobs", "cpu_experts", "cpu_tokens", "stage_ram", "stage_nv", "stage_reads", "read_err",
                  "alloc_fail", "land_pushed", "prefetch", "plan_ns", "ctl_busy_ns", "cpu_busy_ns", "cpu_wait_land_ns",
-                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "pf_keys", "pf_skip", "pf_used", "pf_wasted",
+                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "pf_keys", "pf_skip", "pf_used", "pf_wasted", "lane_skip", "lossy_calls", "lossy_tok", "lossy_tok_skip", "lossy_cold_x1e6", "lossy_skip_x1e6", "lossy_coldu", "lossy_want", "lossy_bg_reads",
                  "resident", "inflight", "free", "landing"]
         return dict(zip(names, ext().counters()))
 
@@ -353,7 +354,7 @@ class Nv2:
                 pf = self._predict(li + 1, z, bsz)
             npf = bsz * 8
             son = p.slotof[li + 1]
-        e.nv_pub(s, ww, zp, n, bsz, self.H, li, self.E, p.first, p.slotof[li], 0 if dec else 1, int(send_x),
+        e.nv_pub(s, ww, zp, n, bsz, self.H, li, self.E, p.first, p.slotof[li], (2 if VERIFY[0] else 0) if dec else 1, int(send_x),
                  self.a["hc"], self.a["req"], self.a["hx"], self.dc, self.uidx, self.uexp, self.timeout_ns, pf, npf, son)
         so, wo = self.sel_out[:n], self.w_out[:n]
         e.nv_step(s, ww, so, wo, n, p.first, li, self.E, p.S, int(dec), p.slotof, self.a["home"], self.a["res"], p.tabs,

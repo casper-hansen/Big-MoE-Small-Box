@@ -224,9 +224,11 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
         const long long e = sel[s] - first;
         int ln = LN_VRAM;
         if (e >= 0 && e < E) { const int u = uidx[e]; if (u >= 0) ln = ulane[u]; }
-        const bool c = ln == LN_CPU || ln == LN_NVC || ln == LN_B70;
+        const bool c = ln == LN_CPU || ln == LN_NVC || ln == LN_B70 || ln == LN_SKIP;
         sel_out[s] = c ? -1 : sel[s];
-        w_out[s] = c ? __float2half(0.0f) : w[s];
+        float rsc = 1.0f;
+        if (s_ok && rp->rn_on) { const int tk = s / max(1, (int) rp->rn_topk); if (tk < MAXB) rsc = rp->rn_sc[tk]; }
+        w_out[s] = c ? __float2half(0.0f) : (rsc == 1.0f ? w[s] : __float2half(__half2float(w[s]) * rsc));
     }
     if (t < 32) mask[t] = 0;
     if (t == 0)
@@ -242,7 +244,7 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
         {
             const int u = uidx[e];
             const int ln = u >= 0 ? ulane[u] : LN_VRAM;
-            if (ln != LN_RZC && ln != LN_NZC) atomicOr(&mask[e >> 5], 1u << (e & 31));   // zero-copy lanes: no admission
+            if (ln != LN_RZC && ln != LN_NZC && ln != LN_SKIP) atomicOr(&mask[e >> 5], 1u << (e & 31));   // zero-copy lanes: no admission
         }
     }
     __syncthreads();
@@ -343,7 +345,7 @@ __global__ void nv_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
         for (int u = t; u < nu; u += blockDim.x)
         {
             const int ln = ulane[u];
-            if (ln == LN_CPU || ln == LN_NVC || ln == LN_B70) continue;
+            if (ln == LN_CPU || ln == LN_NVC || ln == LN_B70 || ln == LN_SKIP) continue;
             const int e = uexp[u];
             const long long key = (long long) li * E + e;
             const int s = slotof_all[key];
