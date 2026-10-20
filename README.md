@@ -177,7 +177,7 @@ Tried and not kept: caps on the reader's bytes in flight (prefetch 2 / 3 / 9 MB,
 | `cache_quant` | `None` | KV-cache bits; `8` for 512k context |
 | `chunk_size` | 8192 | prefill chunk; `4096` for 512k context |
 | `vram_expert_slots` | `None` | all free VRAM (1,408 expert slots on a 24 GB card); an integer caps the cache, e.g. 1376 leaves room for a desktop on the GPU |
-| `speculation`, `ngram_min`, `draft_tokens` | `"none"`, 2, 5 | `speculation="ngram"` drafts tokens from the context and verifies them with the target model: +13-27 % when the answer copies the context, 0-6 % slower otherwise, one request at a time; see below |
+| `speculation`, `ngram_min`, `draft_tokens` | `"none"`, 2, 5 | `speculation="ngram"` drafts tokens from the context and verifies them with the target model: +13-27 % when the answer copies the context, within noise otherwise (-2 to +4 %), one request at a time; see below |
 | `prefix_cache_gb` | 1.0 | host RAM for exllamav3's recurrent-state prefix cache (`-rcs`, ~143 MB per checkpoint); the rest goes to the RAM expert tier. 4 keeps 28 checkpoints instead of 7 and decodes ~5 % slower |
 | `planner_cost`, `cpus`, `max_batch_size`, `slim`, `verify_weights` | | see `bigmoe models` |
 
@@ -195,23 +195,25 @@ A verify window also dedupes experts across its tokens: on the copy prompt a tok
 
 | prompt | `none` | `ngram` | accepted tokens per step |
 |---|---|---|---|
-| copy a 178-line source file | 8.34 tok/s | 10.77 tok/s (+29 %) | 4.97 |
-| add docstrings to a 121-line module (output the whole file) | 7.52 | 8.54 (+14 %) | 2.14 |
-| CSV (30 rows) to JSON | 10.18 | 9.93 (-2 %) | 1.00 |
-| MoE explanation (prose) | 10.96 | 10.74 (-2 %) | 1.00 |
-| short story | 11.87 | 11.33 (-5 %) | 1.00 |
-| LRU cache module (code) | 9.69 | 9.49 (-2 %) | 1.00 |
+| copy a 178-line source file | 8.86 tok/s | 11.26 tok/s (+27 %) | 4.97 |
+| add docstrings to a 121-line module (output the whole file) | 7.91 | 8.96 (+13 %) | 2.09 |
+| CSV (30 rows) to JSON | 10.75 | 10.56 (-2 %) | 1.00 |
+| MoE explanation (prose) | 11.21 | 11.18 (0 %) | 1.00 |
+| short story | 11.85 | 12.29 (+4 %) | 1.00 |
+| LRU cache module (code) | 10.20 | 10.04 (-2 %) | 1.00 |
 
-Single runs of 384 new tokens, one server per column, current defaults (commit 1812368); the table before that commit, with the smaller RAM tier, had copy 7.79 / 9.88 and prose 10.30 / 9.68. So turn it on for work that copies the context (editing files, quoting, reformatting); elsewhere it costs 2-5 % in these single runs (32 fewer cache slots, and the caches leave a verify-heavy answer in a slightly worse state for the next one).
+Two runs per column, alternating, 384 new tokens, current defaults (commit 185ea7f, with the streaming CPU lane). Copying runs into the SSD here too: a 5-token verify step reads ~270 records, ~86 % of the step at the drive's 6.7 GB/s. Where nothing is drafted the difference is now within run-to-run noise (-2 to +4 %; before the streaming CPU lane it cost 2-5 %: 32 fewer cache slots, and the caches leave a verify-heavy answer in a slightly worse state for the next one). So for one user doing editing, quoting or reformatting work it is worth turning on; it stays off by default because with it requests run one at a time (`-ambs 1`) instead of up to four together.
 
 Outputs are not bit-identical to `none`. On the copy prompt the output matched byte for byte. On the prose prompt it matched for 370 characters and then differed at a near-tie token: verification runs the same weights in different GEMM shapes, and fp16 rounding can flip a near-tie. The `none` path reproduces its own output exactly across runs.
 
 ## Context length
 
-The 11 sparse-attention (MLA/DSA) layers keep ~17 KB of KV cache per token in VRAM; the 34 linear-attention (KDA) layers have constant-size state. Every extra 128k tokens costs ~220 VRAM expert slots, and prefill needs ~590 slots free for its staging buffers. Contexts are capped at 512k on purpose; 256k keeps the FP16 KV cache and costs ~3-4 % of decode speed.
+The 11 sparse-attention (MLA/DSA) layers keep ~17 KB of KV cache per token in VRAM; the 34 linear-attention (KDA) layers have constant-size state. Every extra 128k tokens costs ~220 VRAM expert slots, and prefill needs ~590 slots free for its staging buffers. Contexts are capped at 512k on purpose; 256k keeps the FP16 KV cache and costs ~3-4 % of decode speed. The KV cache is reserved for the whole context up front, so a smaller `context` is a free speedup when prompts stay short: with the current defaults, 64k decodes 3.2 % and 32k 4.6 % faster than 128k (same five prompts, 384 new tokens; 128k is the mean of three runs).
 
 | `context` | KV cache | VRAM expert slots | result |
 |---|---|---|---|
+| 32,768 | FP16 | 1,600 | decode +4.6 % vs 128k (56.45 vs 53.98 tok/s summed over five prompts) |
+| 65,536 | FP16 | 1,536 | decode +3.2 % (55.72) |
 | 131,072 | FP16 | 1,376 (1,408 uncapped) | default |
 | 262,144 | FP16 | 1,184 | 250k prompt: 725 / 7.76 tok/s |
 | 524,288 | 8-bit, chunk 4096 | 960 | 510k prompt: 387 / 7.40 tok/s |
