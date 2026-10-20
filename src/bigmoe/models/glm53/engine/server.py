@@ -10,6 +10,8 @@ No output caps: max_tokens defaults to the remaining context. /generate and /tok
 """
 import argparse, asyncio, json, os, re, sys, time, uuid
 import torch
+from . import exl3_patch                 # prompt / tail checkpoint patches for exllamav3 (before its modules load)
+print(" -- exllamav3 patch: " + exl3_patch.apply(), flush=True)
 from exllamav3 import model_init
 from exllamav3.generator import AsyncGenerator, AsyncJob
 from exllamav3.generator.sampler import ArgmaxSampler, ComboSampler
