@@ -135,8 +135,8 @@ def _job_ok(gen, job):
 
 
 def _gen_ok(gen):
-    return (gen.draft_model is None and not gen.ngram_match_min and len(gen.active_jobs) == 1 and not gen.pending_jobs
-            and "mrope" not in gen.model.caps and gen.visualizer is None)
+    return (gen.draft_model is None and (not gen.ngram_match_min or NG_HOOK is not None) and len(gen.active_jobs) == 1
+            and not gen.pending_jobs and "mrope" not in gen.model.caps and gen.visualizer is None)
 
 
 def _launch(gen, st, job, ids, par, pos, seq_len_after):
@@ -182,9 +182,18 @@ def _can_lookahead(gen, job):
     return True
 
 
+# n-gram hybrid (ngram_policy.wants_draft): with prompt-lookup drafting on, single-token steps keep the lookahead while the
+# context gives no draft; a step whose lookahead forward is already in flight ignores a draft that appears (the next
+# step drafts instead), and no lookahead is launched when the policy expects to draft at the next step
+NG_HOOK = None
+
+
 def iterate_gen_la(gen, results, draft_tokens=None, _orig=None):
     st = _ST
     p = st.pending
+    if draft_tokens is not None and p is not None and ENABLED and NG_HOOK is not None:
+        STATS["ng_draft_ignored"] = STATS.get("ng_draft_ignored", 0) + 1
+        draft_tokens = None
     if draft_tokens is not None or not ENABLED:
         if p is not None:
             st.pending = None
@@ -234,7 +243,10 @@ def iterate_gen_la(gen, results, draft_tokens=None, _orig=None):
 
     # lookahead: forward(k+1) on the device token, before the host sees it
     la = None
-    if gen.active_jobs == [job] and not gen.pending_jobs and _can_lookahead(gen, job):
+    ng_next = NG_HOOK is not None and gen.ngram_match_min and NG_HOOK(job)
+    if ng_next:
+        STATS["ng_la_skip"] = STATS.get("ng_la_skip", 0) + 1
+    if gen.active_jobs == [job] and not gen.pending_jobs and not ng_next and _can_lookahead(gen, job):
         pos1 = seq.kv_position + 1
         la = {"job": job, "logits": _launch(gen, st, job, ids, par, pos1, len(seq.sequence_ids) + 1),
               "par": par, "pos": pos1}

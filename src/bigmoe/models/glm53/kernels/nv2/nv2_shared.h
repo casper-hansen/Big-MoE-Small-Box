@@ -13,13 +13,16 @@ constexpr int LR = 256;     // landing ring (fresh RAM slots for VRAM victims)
 constexpr int MAXB = 8;     // tokens per CPU job
 
 // host control words (mapped int64)
-enum { HC_PUB = 0, HC_ACK = 1, HC_ERR = 2, HC_WBN = 3, HC_ADMN = 4, HC_LANDT = 5, HC_CDONE = 6, HC_N = 64 };
+enum { HC_PUB = 0, HC_ACK = 1, HC_ERR = 2, HC_WBN = 3, HC_ADMN = 4, HC_LANDT = 5, HC_CDONE = 6, HC_CPDONE = 7, HC_N = 64 };
+// HC_CPDONE: seq of the last request whose nv_copy finished (layer-ahead staging DMAs start after it: no PCIe contention
+// with that layer's own admission copies)
 // device control words (device int64)
 enum { DC_SEQ = 0, DC_LANDH = 1, DC_WBN = 2, DC_ADMN = 3, DC_NU = 4, DC_TPUB = 5, DC_CDONE = 6, DC_N = 16 };
-constexpr int DBGW = 8;    // debug ring words per request
+constexpr int DBGW = 16;   // debug ring words per request (0-7 pub/step/copy, 8-9 combine start/go, 10 fix done)
 constexpr int DBG = 4096;   // latency debug ring (device: tpub, t_step, t_seen; host: t_notice, t_reply)
 // lanes (reply)
-enum { LN_RAM = 0, LN_NVG = 1, LN_CPU = 2, LN_VRAM = 3, LN_NVC = 4, LN_RZC = 5, LN_NZC = 6, LN_B70 = 7, LN_SKIP = 8 };   // LN_SKIP (BCP lossy verify): cold pick skipped (masked, weight 0), no read
+enum { LN_RAM = 0, LN_NVG = 1, LN_CPU = 2, LN_VRAM = 3, LN_NVC = 4, LN_RZC = 5, LN_NZC = 6, LN_B70 = 7, LN_SKIP = 8, LN_STG = 9 };
+// LN_STG: GPU lane, admitted like LN_RAM, but nv_copy reads the expert from its VRAM staging slot (Rep.stg[u]): D2D   // LN_SKIP (BCP lossy verify): cold pick skipped (masked, weight 0), no read
 // LN_B70 (N137): computed by the B70 expert server from its own VRAM; masked on the GPU like a CPU pick, the CPU
 // worker posts it to the B70 ring and adds the returned rows into hout before HC_CDONE
 // LN_RAM / LN_NVG: GPU, admitted to VRAM (copy) | LN_RZC / LN_NZC: GPU zero-copy from the (landed) RAM slot, not admitted
@@ -37,6 +40,9 @@ struct Req {                 // device -> host, one per MoE layer call (seq writ
     float pw[MAXP];          // per pick: routing weight
     int32_t npf, pad2;       // prefetch hints: predicted picks of the NEXT layer (not VRAM-resident), deduped
     int32_t pf_key[MAXP];
+    int32_t has_lg, has_plg; // 1: lg holds this layer's router logits / plg the layer-ahead guess for layer li + 1
+    uint16_t lg[MAXU];       // fp16 router logits of all E experts (residency policy / trace)
+    uint16_t plg[MAXU];      // fp16 predicted router logits of layer li + 1 (prefetch / staging policy, trace)
 };
 
 struct Rep {                 // host -> device (seq written last)
@@ -45,6 +51,7 @@ struct Rep {                 // host -> device (seq written last)
     int32_t lane[MAXU];
     int32_t rn_on, rn_topk;  // BCP renorm: token t's kept picks scaled by rn_sc[t] (skipped routed mass restored)
     float rn_sc[MAXB];
+    int32_t stg[MAXU];       // LN_STG: staging pool slot holding the expert (device address table nv2 stg_addr)
 };
 
 struct LogE { int64_t seq; int32_t key, slot; };

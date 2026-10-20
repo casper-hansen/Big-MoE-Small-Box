@@ -8,6 +8,9 @@ from bigmoe.models import glm53
 
 BASE = Path(glm53.__file__).parent / "baselines"
 PATHS = ("GLM53_EC_WARM", "GLM53_ZC_STATS", "GLM53_TRITON_PIN", "GLM53_NV_STORE")
+# deliberate changes since the reference runs: the planner's NVMe arrival model (nvlat, nvdeep; see TUNED_PLANNER), and
+# mode nvme-exact runs exllamav3's stock prefill (the prompt / tail checkpoint patch changes its greedy answers)
+CHANGED = {"nvme": {"GLM53_NV_POL": glm53.TUNED_PLANNER}, "nvme-exact": {"GLM53_EXL3_PATCHES": "0"}}
 
 
 class FakeRuntime:
@@ -30,7 +33,7 @@ def spec_for(tmp_path, monkeypatch, mode, **kw):
 def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
     # the reference runs were measured with the old 52 GiB cap and a 1376-slot expert cache: pass them explicitly
     box, spec = spec_for(tmp_path, monkeypatch, mode, memory_gb=52.0, vram_expert_slots=1376)
-    ref = json.loads((BASE / fname).read_text())["env"]
+    ref = dict(json.loads((BASE / fname).read_text())["env"], **CHANGED[mode])
     ours = {k: v for k, v in spec.env.items() if k.startswith("GLM53_") and not k.endswith("_BUILD")}
     assert set(ours) == set(ref)
     for k, v in ref.items():
@@ -76,6 +79,9 @@ def test_speculation_option(tmp_path, monkeypatch):
     assert "-ngram" not in spec.argv and "-ndt" not in spec.argv   # off by default
     _, spec = spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram")
     assert spec.argv[spec.argv.index("-ngram") + 1] == "2" and spec.argv[spec.argv.index("-ndt") + 1] == "5"
+    # one recurrent slot with drafts (the rewind history would take 2.7 GB of expert cache at -ambs 4): the last -ambs wins
+    i = len(spec.argv) - 1 - spec.argv[::-1].index("-ambs")
+    assert spec.argv[i + 1] == "1" and i > spec.argv.index("-ambs")
     _, spec = spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram", ngram_min=3, draft_tokens=4)
     assert spec.argv[spec.argv.index("-ngram") + 1] == "3" and spec.argv[spec.argv.index("-ndt") + 1] == "4"
     with pytest.raises(ValueError):

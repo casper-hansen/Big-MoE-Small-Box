@@ -545,8 +545,10 @@ struct Fwd4
     std::atomic<int> next{0};
     // late-bound jobs (engine: NVMe->CPU picks): bound by the first unit that needs them, once their landing arrives
     const std::function<bool(int)>* bind = nullptr;
+    const std::function<bool(int)>* down = nullptr;   // partial landing: late job's down bytes landed (blocking)
     std::vector<uint8_t> jlate;
     std::vector<Ctr> c_bind;            // 0 unbound, 1 binding, 2 bound, 3 failed (skipped)
+    std::vector<Ctr> c_dlate;           // 0 unchecked, 1 checking, 2 landed
 };
 
 // true when job j's expert pointers are valid (late jobs: bind on first use; a failed bind skips the job)
@@ -671,6 +673,17 @@ inline void fwd4_fn(void* vc, int, int)
         else if (U.kind == U_DOWN)
         {
             spin_until(F.c_act[U.j].v, BI);
+            if (F.down && F.jlate[U.j])
+            {
+                std::atomic<int>& dv = F.c_dlate[U.j].v;
+                int z = 0;
+                if (dv.load(std::memory_order_acquire) == 0 && dv.compare_exchange_strong(z, 1, std::memory_order_acq_rel))
+                {
+                    (*F.down)(F.jobs[U.j].e);
+                    dv.store(2, std::memory_order_release);
+                }
+                else while (dv.load(std::memory_order_acquire) < 2) _mm_pause();
+            }
             const void* xp[MAXM]; const float* qs[MAXM];
             for (int i = 0; i < J.m; ++i) { xp[i] = F.xd.data() + size_t(s0 + i) * XI; qs[i] = F.qd.data() + size_t(s0 + i) * BI; }
             const int tk = E.d.k / 16, R = F.rd, C = F.cd;
@@ -713,10 +726,11 @@ template <typename PoolT>
 // late_e (optional, indexed by expert id): experts whose bytes may not be resident yet; their jobs run after every other
 // job and are bound by bind_late(e) (blocking until landed; false = skip) when a worker first reaches them.
 void moe_forward4(PoolT& pool, const Layer& L, const float* x, int ntok, const std::vector<std::vector<std::pair<int, float>>>& route, float* out, int mode,
-                  const uint8_t* late_e = nullptr, const std::function<bool(int)>* bind_late = nullptr)
+                  const uint8_t* late_e = nullptr, const std::function<bool(int)>* bind_late = nullptr,
+                  const std::function<bool(int)>* down_late = nullptr)
 {
     static Fwd4 F;
-    F.L = &L; F.x = x; F.out = out; F.ntok = ntok; F.jobs.clear(); F.joff.clear(); F.jlate.clear(); F.bind = bind_late;
+    F.L = &L; F.x = x; F.out = out; F.ntok = ntok; F.jobs.clear(); F.joff.clear(); F.jlate.clear(); F.bind = bind_late; F.down = down_late;
     int nram = 0;
     for (int pass = 0; pass < (late_e ? 2 : 1); ++pass)
     {
@@ -752,6 +766,8 @@ void moe_forward4(PoolT& pool, const Layer& L, const float* x, int ntok, const s
     grow(F.sg, ns); grow(F.su, ns); grow(F.sd, size_t(ns) * BI);
     grow(F.pg, size_t(F.nbg) * ns * I); grow(F.pu, size_t(F.nbg) * ns * I); grow(F.pd, size_t(F.nbd) * ns * H);
     if (int(F.c_prep.size()) < nj) { F.c_prep = std::vector<Ctr>(nj + 8); F.c_gu = std::vector<Ctr>(nj + 8); F.c_act = std::vector<Ctr>(nj + 8); F.c_down = std::vector<Ctr>(nj + 8); F.c_bind = std::vector<Ctr>(nj + 8); }
+    if (int(F.c_dlate.size()) < nj) F.c_dlate = std::vector<Ctr>(nj + 8);
+    for (int j = 0; j < nj; ++j) F.c_dlate[j].v.store(0, std::memory_order_relaxed);
     F.n_gu.assign(nj, 2 * F.nbg * F.ncg); F.n_down.assign(nj, F.nbd * F.ncd);
     for (int j = 0; j < nj; ++j) { F.c_prep[j].v.store(0, std::memory_order_relaxed); F.c_gu[j].v.store(0, std::memory_order_relaxed); F.c_act[j].v.store(0, std::memory_order_relaxed); F.c_down[j].v.store(0, std::memory_order_relaxed); F.c_bind[j].v.store(0, std::memory_order_relaxed); }
     F.units.clear();

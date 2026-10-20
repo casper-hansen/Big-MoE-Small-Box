@@ -22,6 +22,13 @@ Env: GLM53_NV_RAM_GB (auto), GLM53_NV_MARGIN_GB (1), GLM53_NV_THREADS (16 reader
      GLM53_NV_CPU_MODE (-1 auto), GLM53_NV_CLAMP (1: swiglu clamp on the CPU share, B004 fix), GLM53_NV_POL (cost model
      "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone"), GLM53_NV_MAXCPU (32), GLM53_NV_CTL_CPU (25),
      GLM53_NV_READER_CPUS (26-39), GLM53_NV_TIMEOUT_S (20), GLM53_NV_COPY_GRID (48)
+2026-10-20 (nv2_host.cpp): GLM53_NV_TNZC (0.6 ms: GPU cost of a zero-copy NVMe pick after landing; < 0 legacy model),
+     GLM53_NV_PARTIAL (1: an NVMe->CPU job binds at gate+up landing, down units wait), GLM53_NV_PRIO (1: reader classes
+     demand > prefetch > bulk), GLM53_NV_HI_MB (12) / GLM53_NV_LO_MB (6) in-flight caps, GLM53_NV_PF_LIFO (1),
+     GLM53_NV_DPIECE_KB (1024: decode read pieces), GLM53_NV_WB_EARLY (1: write-backs drained at nv_copy completion),
+     GLM53_NV_PF_MULTI (2 prefetch hints per verify-window token), GLM53_NV_RZC1 (1: verify windows do not admit RAM picks
+     of one token), GLM53_NV_STG / GLM53_NV_STG_MAX (0 / 3: layer-ahead DMA staging pool, experimental, off).
+     Diagnostics: timeline() (per-layer breakdown in summary()), ext().trace_set / trace_take (routing trace)
 N137 B70 expert tier (needs the CPU tier, GLM53_NV_CPU=1): GLM53_B70 (0), GLM53_B70_RING (/run/local-ai/shared/b70.ring,
      created by b70tier/b70srv.py on the B70), GLM53_B70_N (3000 experts), GLM53_B70_ORDER (score: warm-score order after the VRAM warm
      set | rr: the RAM tier's round-robin rank), GLM53_B70_TIMEOUT_S (2). Decode picks of B70-resident experts are masked
@@ -82,7 +89,8 @@ class Nv2:
     def __init__(self, pool):
         e = ext()
         sz = e.sizes()
-        self.SREQ, self.SREP, self.SLOG, self.MAXU, self.MAXP, self.RQ, self.LG, self.LR, self.MAXB, HCN, DCN, STN, DBG = sz
+        self.SREQ, self.SREP, self.SLOG, self.MAXU, self.MAXP, self.RQ, self.LG, self.LR, self.MAXB, HCN, DCN, STN, DBG, DBGW = sz
+        self.DBGW = DBGW
         self.pool = pool
         self.dev = pool.device
         dev_idx = self.dev.index or 0
@@ -173,12 +181,18 @@ class Nv2:
         self.vring = torch.empty((max(nvr, 1), self.slot), dtype=torch.uint8, device=self.dev) if nvr else None
         self.vring_addr = [self.vring[i].data_ptr() for i in range(nvr)] if nvr else []
         self.ram_addr_dev = torch.tensor(self.vring_addr or [0], dtype=torch.int64, device=self.dev)
+        # layer-ahead VRAM staging pool (GLM53_NV_STG slots, GLM53_NV_STG_MAX per layer; 0 = off)
+        nstg = int(g("GLM53_NV_STG", "0"))
+        self.stg = torch.empty((max(nstg, 1), self.slot), dtype=torch.uint8, device=self.dev) if nstg else None
+        self.stg_addr = [self.stg[i].data_ptr() for i in range(nstg)] if nstg else []
+        self.stg_addr_dev = torch.tensor(self.stg_addr or [0], dtype=torch.int64, device=self.dev)
         # ---- device scratch
         D = lambda n, dt=torch.int32: torch.zeros(n, dtype=dt, device=self.dev)
         self.dc, self.uidx, self.uexp, self.ulane = D(DCN, torch.int64), D(self.E), D(self.MAXU), D(self.MAXU)
         self.jobx, self.jobnv = D(pool.jobs.numel() // 2), D(pool.jobs.numel() // 2)
+        self.jobsrc = D(pool.jobs.numel() // 2, torch.int64)
         self.dflag, self.dstats = D(1, torch.int64), D(STN, torch.int64)
-        self.dbg = D(DBG * 8, torch.int64)
+        self.dbg = D(DBG * DBGW, torch.int64)
         self.sel_out = torch.empty(16384, dtype=torch.int64, device=self.dev)
         self.w_out = torch.empty(16384, dtype=torch.half, device=self.dev)
         # ---- scores (tie-break: colder first to the CPU)
@@ -199,6 +213,8 @@ class Nv2:
                int(self.wb_on), int(g("GLM53_NV_LAND", "64")), int(g("GLM53_NV_FREE_LO", "96")),
                torch.tensor(self.vring_addr, dtype=torch.int64))
         e.set_stage_qd(int(g("GLM53_NV_PF_QD", "24")))
+        if self.stg_addr:
+            e.stg_init(torch.tensor(self.stg_addr, dtype=torch.int64), int(g("GLM53_NV_STG_MAX", "3")))
         pol = [float(x) for x in g("GLM53_NV_POL", "0.17,0.023,0.38,0.145,0.165,0.040,0.40,0.12,0.395,0.75").split(",")]
         self.pol = pol + [1.0 if self.cpu_on else 0.0, 1.0 if g("GLM53_NV_NVCPU", "1" if self.cpu_on else "0") == "1" else 0.0,
                           float(g("GLM53_NV_MAXCPU", "32")), 1.0 if g("GLM53_NV_NOADMIT", "1" if self.cpu_on else "0") == "1" else 0.0]
@@ -243,7 +259,9 @@ class Nv2:
                  "lane_nvg", "lane_nvc", "reads", "read_bytes", "wb_landed", "wb_dup", "adm_freed", "adm_pinned",
                  "evictions", "cpu_jobs", "cpu_experts", "cpu_tokens", "stage_ram", "stage_nv", "stage_reads", "read_err",
                  "alloc_fail", "land_pushed", "prefetch", "plan_ns", "ctl_busy_ns", "cpu_busy_ns", "cpu_wait_land_ns",
-                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "pf_keys", "pf_skip", "pf_used", "pf_wasted", "lane_skip", "lossy_calls", "lossy_tok", "lossy_tok_skip", "lossy_cold_x1e6", "lossy_skip_x1e6", "lossy_coldu", "lossy_want", "lossy_bg_reads",
+                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "pf_keys", "pf_skip", "pf_used", "pf_wasted", "lane_skip", "lossy_calls", "lossy_tok", "lossy_tok_skip", "lossy_cold_x1e6", "lossy_skip_x1e6", "lossy_coldu", "lossy_want", "lossy_bg_reads", "promoted", "stg_issued", "stg_ready", "stg_hit", "stg_late",
+                 "stg_nofree", "stg_dup", "stg_waste", "wb_early", "partial_lands", "partial_binds", "wb_lat_us",
+                 "wb_lat_max_us", "ring_low", "ring_low_vfree",
                  "resident", "inflight", "free", "landing"]
         return dict(zip(names, ext().counters()))
 
@@ -354,18 +372,32 @@ class Nv2:
                 pf = self._predict(li + 1, z, bsz)
             npf = bsz * 8
             son = p.slotof[li + 1]
+        lgp = self._lg_ptr(li) if (dec and bsz == 1) else 0
+        plgp = self._pfb[1][0].data_ptr() if (pf and bsz == 1 and 1 in self._pfb) else 0
         e.nv_pub(s, ww, zp, n, bsz, self.H, li, self.E, p.first, p.slotof[li], (2 if VERIFY[0] else 0) if dec else 1, int(send_x),
-                 self.a["hc"], self.a["req"], self.a["hx"], self.dc, self.uidx, self.uexp, self.timeout_ns, pf, npf, son)
+                 self.a["hc"], self.a["req"], self.a["hx"], self.dc, self.uidx, self.uexp, self.timeout_ns, pf, npf, son, lgp, plgp)
         so, wo = self.sel_out[:n], self.w_out[:n]
         e.nv_step(s, ww, so, wo, n, p.first, li, self.E, p.S, int(dec), p.slotof, self.a["home"], self.a["res"], p.tabs,
                   p.owner, p.refb, p.pin, p.ctl, p.jobs, self.jobx, self.jobnv, self.dstats, p.cbase.data_ptr(), p.spc,
                   p.rec, p.off_u, p.off_d, self.a["hc"], self.a["rep"], self.dc, self.uidx, self.ulane, self.a["wbl"],
-                  self.a["adml"], self.a["land"], self.dflag, self.timeout_ns, int(self.wb_on), self.dbg)
+                  self.a["adml"], self.a["land"], self.dflag, self.timeout_ns, int(self.wb_on), self.dbg,
+                  self.stg_addr_dev.data_ptr() if self.stg_addr else 0, self.jobsrc)
         e.nv_copy(p.ctl, p.jobs, self.jobx, self.jobnv, li, self.E, self.a["home"], self.a["res"], p.cbase.data_ptr(), p.spc,
                   p.rec, p.sg, p.su, p.sd, p.off_u, p.off_d, self.ram_addr_dev, self.dc, self.uexp, self.ulane, p.slotof,
-                  p.tabs, self.ph, self.a["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg)
+                  p.tabs, self.ph, self.a["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg, self.jobsrc)
         self.st["dec_calls" if dec else "small_calls"] += 1
         return so.view(sel.shape), wo.view(w.shape), send_x
+
+    def _lg_ptr(self, li):
+        """Device address of layer li's single-row router logits (exllamav3 routing_dots writes them for bsz 1)."""
+        lp = getattr(self, "_lgp", None)
+        if lp is None:
+            lp = self._lgp = []
+            for m in self.pool.mods:
+                t = getattr(getattr(m, "routing_cfg", None), "router_logits_bsz1", None)
+                ok = t is not None and t.is_cuda and t.dtype == torch.half and t.numel() >= self.E and t.is_contiguous()
+                lp.append(t.data_ptr() if ok else 0)
+        return lp[li]
 
     def predict_early(self, li, z, bsz):
         """N136: launch layer li+1's routing guess on the side stream before layer li's router runs (decode only)."""
@@ -408,7 +440,8 @@ class Nv2:
 
     def combine(self, fhs):
         f = fhs if fhs.is_contiguous() else fhs.contiguous()
-        ext().nv_combine(f, self.dflag, self.a["hc"] + 6 * 8, self.a["hout"], self.dstats, self.a["hc"], self.timeout_ns)
+        ext().nv_combine(f, self.dflag, self.a["hc"] + 6 * 8, self.a["hout"], self.dstats, self.a["hc"], self.timeout_ns,
+                         self.dbg, self.dc)
         return f
 
     # ---- CPU tier -------------------------------------------------------------------------------------------------
@@ -563,8 +596,8 @@ class Nv2:
         copy start / end, admitted jobs; host (CLOCK_REALTIME): notice, reply. Host-device offset removed with the
         minimum of (host notice - device publish), so the host-side gaps are relative to the fastest observed."""
         d = ext().peek(self.dbg.data_ptr(), self.dbg.numel())
-        d = np.asarray(d, np.int64).reshape(-1, 8)
-        hs, hn, hr = [t.numpy() for t in ext().dbg_host()]
+        d = np.asarray(d, np.int64).reshape(-1, self.DBGW)
+        hs, hn, hr = [t.numpy() for t in ext().dbg_host()[:3]]
         ok = (d[:, 0] > 0) & (hs == d[:, 0]) & (d[:, 6] > 0) & (d[:, 4] > 0)
         if ok.sum() < 8:
             return {"n": int(ok.sum())}
@@ -585,11 +618,55 @@ class Nv2:
                 "jobs_per_call": round(float(nj.mean()), 2), "us_gap_copy_to_next_pub": q(gap) if len(gap) else None,
                 "us_layer_total": q(np.diff(d[:, 1])[consec]) if consec.any() else None}
 
+    def timeline(self):
+        """Mean per-layer breakdown of consecutive decode layer calls (us). Device: pub -> reply seen (A), -> copy start
+        (B), copy kernel (C; C_fix = block 0 done fixing rows incl. NVMe landing waits), copy end -> combine start (D:
+        MoE kernel), combine wait for the CPU job (E), combine end -> next pub (F: glue, next attention, router).
+        Host: CPU job span, CPU end relative to combine start, demand-read landing relative to copy start."""
+        d = ext().peek(self.dbg.data_ptr(), self.dbg.numel())
+        d = np.asarray(d, np.int64).reshape(-1, self.DBGW)
+        hs, hn, hr, cs, ce, nr, npf, inf, lm = [t.numpy() for t in ext().dbg_host()]
+        ok = (d[:, 0] > 0) & (hs == d[:, 0]) & (d[:, 6] > 0) & (d[:, 4] > 0) & (d[:, 9] >= d[:, 8]) & (d[:, 8] >= d[:, 6])
+        if ok.sum() < 16:
+            return {"n": int(ok.sum())}
+        o = np.argsort(d[ok, 0])
+        d, hn, hr, cs, ce, nr, npf, inf, lm = [x[ok][o] for x in (d, hn, hr, cs, ce, nr, npf, inf, lm)]
+        off = np.min(hn - d[:, 1])
+        consec = np.diff(d[:, 0]) == 1
+        i = np.nonzero(consec)[0]
+        nxt = d[i + 1, 1]
+        D = d[i]
+        tot = (nxt - D[:, 1]).astype(np.float64)
+        good = (tot > 0) & (tot < 50e6)
+        i, D, nxt, tot = i[good], D[good], nxt[good], tot[good]
+        m = lambda x: round(float(np.mean(x)) / 1e3, 1)
+        parts = {"A_pub_to_reply": D[:, 3] - D[:, 1], "B_step": D[:, 5] - D[:, 3], "C_copy": D[:, 6] - D[:, 5],
+                 "D_moe": D[:, 8] - D[:, 6], "E_cpu_wait": D[:, 9] - D[:, 8], "F_rest": nxt - D[:, 9]}
+        out = {"n": int(len(i)), "us_layer_mean": m(tot), "parts_us_mean": {k: m(v) for k, v in parts.items()},
+               "C_fix_us_mean": m(np.where(D[:, 10] > 0, D[:, 10] - D[:, 5], 0)), "jobs_per_call": round(float(D[:, 7].mean()), 2)}
+        has = (cs[i] >= hn[i]) & (ce[i] >= cs[i]) & (cs[i] - hn[i] < 50e6)
+        cpu_span = (ce[i] - cs[i])[has]
+        out["cpu_job_us_mean"] = m(cpu_span) if len(cpu_span) else None
+        late = ((ce[i] - off) - D[:, 8])[has]
+        out["cpu_end_minus_combine_start_us_mean"] = m(late) if len(late) else None
+        out["cpu_start_minus_pub_us_mean"] = m(((cs[i] - off) - D[:, 1])[has]) if has.any() else None
+        dr = nr[i] > 0
+        out["frac_layers_demand_read"] = round(float(dr.mean()), 3)
+        out["frac_layers_inflight_hit"] = round(float((inf[i] > 0).mean()), 3)
+        if dr.any():
+            lmv = lm[i][dr]
+            okl = lmv > 0
+            out["demand_land_minus_copy_start_us_mean"] = m(((lmv - off) - D[dr][:, 5])[okl]) if okl.any() else None
+            out["layer_us_mean_with_demand"] = m(tot[dr]); out["layer_us_mean_without"] = m(tot[~dr]) if (~dr).any() else None
+            out["parts_with_demand"] = {k: m(v[dr]) for k, v in parts.items()}
+            out["parts_without"] = {k: m(v[~dr]) for k, v in parts.items()} if (~dr).any() else None
+        return out
+
     def summary(self):
         c = self.counters()
         d = self.dstats.tolist()
         dn = ["hit", "miss", "admit", "novict", "evict", "wb", "wb_noslot", "fix", "bad_rows", "reply_wait_ns", "reply_waits",
-              "nv_wait_ns", "nv_waits", "timeouts"]
+              "nv_wait_ns", "nv_waits", "timeouts", "noslot_ring_x1e6", "noslot_jobs"]
         dev = dict(zip(dn, d))
         steps = max(1, c["dec_reqs"] // self.L)
         toks = max(1, c["dec_tok"] // self.L)
@@ -618,6 +695,10 @@ class Nv2:
             out["latency"] = self.latency()
         except Exception as ex:
             out["latency"] = str(ex)
+        try:
+            out["timeline"] = self.timeline()
+        except Exception as ex:
+            out["timeline"] = repr(ex)
         return out
 
 

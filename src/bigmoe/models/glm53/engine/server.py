@@ -224,6 +224,11 @@ async def startup():
                               draft_confidence=args.draft_confidence, ngram_match_min=args.ngram_match_min,
                               record_draft_stats=bool(draft_model is not None or args.ngram_match_min),
                               recurrent_cache_size=int(args.recurrent_cache_size * 1024 ** 3))
+    if args.ngram_match_min and os.environ.get("GLM53_NG_POLICY", "1") == "1":   # cost-aware n-gram drafting
+        from exllamav3.generator.generator import Generator
+        from exllamav3.generator.job import Job
+        from . import ngram_policy
+        ngram_policy.install(Generator, Job)
     _bcp_install()
 
 
@@ -237,7 +242,10 @@ async def run_job(ids, sp, stop_strings=None):
     """Yields (text so far, completion tokens, finish or None) once per generator step."""
     gen = G["gen"]
     max_new = sp.get("max_new_tokens")
-    room = CTX - ids.shape[-1] - (args.num_draft_tokens or 8) - 2
+    # the end-of-turn tail checkpoints (exl3_patch) hold up to 4 cache pages: a job that reserves pages for the whole
+    # remaining context (no GLM53_MAX_RQ_TOKENS, e.g. mode nvme-exact) would otherwise wait for pages forever
+    tails = 4 * 256 if os.environ.get("GLM53_EXL3_PATCHES", "1") == "1" else 0
+    room = CTX - ids.shape[-1] - (args.num_draft_tokens or 8) - 2 - tails
     max_new = room if max_new is None else min(int(max_new), room)
     # N119: GLM53_MAX_RQ_TOKENS = page-allocation round per job (exllamav3 max_rq_tokens: the job requeues itself after
     # that many tokens and keeps going; NOT an output cap). Without it every job reserves pages for the whole remaining
@@ -537,6 +545,9 @@ async def stats():
     if os.environ.get("GLM53_NV") == "2":
         from . import nv2
         st["nv2"] = nv2.summary()
+    if args.ngram_match_min:
+        from . import ngram_policy
+        st["ngram"] = ngram_policy.summary()
     return JSONResponse(st)
 
 
@@ -544,6 +555,65 @@ async def stats():
 async def nv_trace():
     from . import nv_tier
     return JSONResponse(nv_tier.save_trace())
+
+
+@app.get("/nv2_trace")
+async def nv2_trace(on: int = -1, path: str = ""):
+    """Routing trace of decode-class layer calls (host engine): on=1 starts, on=0 stops + clears; path= saves (npy)."""
+    from . import nv2
+    if on >= 0:
+        nv2.ext().trace_set(int(on))
+        return JSONResponse({"on": on})
+    t = nv2.ext().trace_take().numpy()
+    if path:
+        import numpy as np
+        np.save(path, t)
+    return JSONResponse({"words": int(t.size), "path": path})
+
+
+@app.get("/nv2_host")
+async def nv2_host():
+    """Host-engine counters only (no device access, safe to poll during generation)."""
+    from . import nv2
+    return JSONResponse(nv2.NV.counters())
+
+
+@app.get("/router_bias")
+async def router_bias(path: str):
+    """Selection biases of the routed layers in nv2 layer order, [L, E] float32 (.npy)."""
+    from . import nv2
+    import numpy as np
+    rows = []
+    for m in nv2.NV.pool.mods:
+        b = m.routing_cfg.e_score_correction_bias
+        rows.append(b.float().cpu().numpy() if b is not None else np.zeros(nv2.NV.E, np.float32))
+    np.save(path, np.stack(rows))
+    return JSONResponse({"layers": len(rows), "path": path})
+
+
+@app.get("/cpu_bench")
+async def cpu_bench(n: int = 20, k: int = 2, m: int = 1, li: int = 10, mode: int = -1, rt: int = -1):
+    """CPU-lane forward speed on RAM-resident experts of layer li (server must be idle): k experts x m tokens."""
+    from . import nv2
+    while len(G["gen"].jobs):
+        await asyncio.sleep(0.05)
+    e = nv2.ext()
+    old_rt = e.cpu_knob("rt", rt)
+    ks = e.state()[1].numpy()
+    E = nv2.NV.E
+    res = [x for x in range(E) if ks[li * E + x] == 2][:k]
+    x = (torch.randn(m, nv2.NV.H) * 0.35).float()
+    sel = torch.tensor([res] * m, dtype=torch.int32)
+    w = torch.full((m, len(res)), 0.25)
+    out = e.cpu_forward(li, x, sel, w, mode)
+    t0 = time.perf_counter()
+    for _ in range(n):
+        out = e.cpu_forward(li, x, sel, w, mode)
+    dt = (time.perf_counter() - t0) / n
+    e.cpu_knob("rt", old_rt)
+    return JSONResponse({"ms_per_call": round(dt * 1e3, 3), "ms_per_expert": round(dt * 1e3 / max(1, len(res)), 3),
+                         "experts": len(res), "tokens": m, "rt": e.cpu_knob("rt", -1) if rt < 0 else rt,
+                         "out_norm": float(out.norm())})
 
 
 @app.get("/nv_verify")

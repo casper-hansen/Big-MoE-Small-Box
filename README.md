@@ -86,6 +86,33 @@ That table is glm-flash-lite's `bench/sweep.py`: random-token prompts, 3 reps; c
 
 These numbers were measured before the engine became this package. `bigmoe verify` reproduces them through the package: in mode `nvme-exact` the answers are byte-identical and prefill / decode speeds are within 0.2 %; in mode `nvme`, prefill is within 1 % and decode 0.3-2.2 % lower, with one 4.2 % outlier at 120k that a second run did not repeat (1.1 %). Mode `nvme` answers drift apart from run to run after a few hundred characters: which experts the CPU lane computes in fp32 depends on timing.
 
+### Decode tuning (2026-10-20)
+
+Where a decode layer's time goes (`/stats` -> `nv2.timeline`, per-layer means over the last 4,096 layer calls): ~1.6 ms when none of its experts has to come from NVMe, ~3.8-4.5 ms when one does (35-50 % of layers), because a 9.44 MB record takes ~1.45 ms of the SSD and the layer cannot finish before its last record lands. The SSD runs at ~75 % of its 6.7 GB/s with 50-70 reads per token, so it is the binding resource; RAM-tier misses, not PCIe or the CPU lane, set the pace. The changes below are exact (they move work between lanes or reorder I/O; the math of every expert is unchanged):
+
+| change | effect |
+|---|---|
+| scheduler: realistic NVMe arrival model (1.45 ms per record instead of 0.395) and the real cost of a zero-copy NVMe expert in the MoE kernel (~0.6 ms vs ~0.39 ms on the CPU lane): experts that land late now go to the CPU lane | +3-5 % on prose / story / code |
+| the CPU lane starts an NVMe expert once its gate and up bytes have landed; the down projection waits for the rest | +1.6 % |
+| NVMe reader priorities: demand reads first (FIFO, so a layer's records land one after another), prefetches newest first and only while no demand read is queued and less than 6 MB is in flight, prefill staging last; a queued prefetch that a layer demands is promoted | demand reads land ~10 % sooner, ~+1 % |
+| write-backs drained when each layer's copy kernel finishes and landing slots restocked from the write-back thread | neutral on plain decode, needed by verify windows |
+
+Old switches vs the new defaults, same server build, same prompt order, 384 new tokens, greedy, thinking off, two runs each:
+
+| prompt | before | after | |
+|---|---|---|---|
+| copy a 178-line source file | 7.42 / 7.46 tok/s | 7.81 / 7.81 tok/s | +5.0 % |
+| MoE explanation (prose) | 9.48 / 9.46 | 9.88 / 10.03 | +5.1 % |
+| short story | 10.10 / 10.12 | 10.83 / 10.76 | +6.8 % |
+| LRU cache module (code) | 8.55 / 8.54 | 8.96 / 9.10 | +5.7 % |
+| 40 board games (list) | 9.81 / 9.85 | 10.38 / 10.41 | +5.8 % |
+
+NVMe reads and VRAM hits per token are unchanged (same placement policy); the time per token is not.
+
+`bigmoe verify` afterwards (current defaults, long prompts, ~250-token answers): mode `nvme` decodes at 9.93 / 9.97 / 9.97 / 10.21 tok/s after 1k / 8k / 32k / 120k-token prompts (reference 7.92-8.35, the previous verify run 8.40-8.57; prefill 113 / 778 / 840 / 838 tok/s), every answer names the first three files correctly and drifts from the reference after 144-385 characters as before; mode `nvme-exact` answers are byte-identical to the reference at 1k and 8k, decode 7.37 / 7.47 tok/s (reference 6.50 / 6.54). Mode `nvme-exact` runs exllamav3's stock prefill (`GLM53_EXL3_PATCHES=0`): the single-pass prompt checkpoint changes the fp16 rounding of the recurrent state and with it the greedy answers. Jobs that reserve cache pages for the whole remaining context now leave room for the four end-of-turn tail checkpoint pages; without that, in mode `nvme-exact` the second request waited for pages forever.
+
+Tried and not kept: smarter replacement policies (offline simulation over decode traces: LRU 39.6 misses per token, the best practical router-score policy 37.1, Belady's optimum 15.0, so -6 % at most), more prefetch (`GLM53_NV_PF_MAX=8`: -5 %, the SSD is already the bottleneck), DMA staging of the next layer's predicted experts into a VRAM pool (`GLM53_NV_STG`, off: the copy phase shrinks but the DMA contends with zero-copy experts on PCIe during the MoE kernel), a makespan-search split of RAM experts between the lanes, and the CPU lane's register-accumulator kernel (5-10 % faster per expert in place, but the lanes are already balanced).
+
 ## How it works
 
 `AutoBox(model)` resolves the model to a backend: an alias, a Hugging Face repo id, or a local checkpoint directory, pinned to a commit. `prepare()` (and `from_pretrained`, `start`) runs every step that is not done yet. Each step remembers its result, so the check is instant once everything is in place:
@@ -116,20 +143,31 @@ These numbers were measured before the engine became this package. `bigmoe verif
 | `cache_quant` | `None` | KV-cache bits; `8` for 512k context |
 | `chunk_size` | 8192 | prefill chunk; `4096` for 512k context |
 | `vram_expert_slots` | `None` | all free VRAM (1,408 expert slots on a 24 GB card); an integer caps the cache, e.g. 1376 leaves room for a desktop on the GPU |
-| `speculation`, `ngram_min`, `draft_tokens` | `"none"`, 2, 5 | `speculation="ngram"` drafts tokens from the context and verifies them with the target model; off by default, see below |
+| `speculation`, `ngram_min`, `draft_tokens` | `"none"`, 2, 5 | `speculation="ngram"` drafts tokens from the context and verifies them with the target model: +13-27 % when the answer copies the context, 0-6 % slower otherwise, one request at a time; see below |
 | `planner_cost`, `cpus`, `max_batch_size`, `slim`, `verify_weights` | | see `bigmoe models` |
 
 ## Optional: n-gram speculation
 
-`bigmoe start -o speculation=ngram` drafts tokens by matching the last `ngram_min` tokens against the context (prompt lookup, no draft model) and verifies `draft_tokens` drafts per step with the target model. It is off by default, and we have not found a workload where it is faster on this box. Measured with single runs of 384 new tokens:
+`bigmoe start -o speculation=ngram` drafts tokens by matching the end of the context against earlier text (prompt lookup, no draft model) and verifies up to `draft_tokens` drafts per step with the target model. On this box a draft token is not free: every token of a verify window brings its own routed experts, and the cold ones come from RAM or NVMe, so a rejected draft costs real SSD reads. Stock prompt lookup was slower everywhere here (copy 7.2, edit 5.7, CSV to JSON 4.2, prose 6.3 tok/s). What turns it into a speedup:
 
-| prompt | mode | `none` | `ngram` |
+- **Cost-aware drafting** (`engine/ngram_policy.py`): a draft needs a suffix match of at least 4 tokens and a recent per-token acceptance rate of at least 0.7 (EWMA); a match of 12+ tokens re-arms a job with a 2-token probe; the draft length is cut to what the acceptance rate makes worth verifying. Prose almost never drafts; copying drafts the full 5 tokens.
+- **Lookahead stays on**: single-token steps keep the decode lookahead while the context offers no draft.
+- **One recurrent slot** (`-ambs 1`, set automatically): exllamav3 keeps `draft_tokens + 1` recurrent-state snapshots per slot and KDA layer for rewinding rejected drafts (4 MB each). At the default 4 slots that is 2.7 GB of VRAM, which shrank the expert cache from 1,408 to 1,120 slots and made every prompt 5-10 % slower; with one slot it costs 32 slots. With speculation on, one request runs at a time (others queue).
+- **No dropped write-backs**: a verify window admits many experts at once. When the VRAM victim landing ring ran dry, victims used to be dropped from both tiers and re-read from NVMe later (60 drops and +33 % NVMe reads per token on the copy prompt). Now the device stops admitting for that call instead (zero-copy), and the write-back thread drains and recycles landing slots as soon as each layer's copy kernel finishes.
+- **Verify-window prefetch and admission**: the layer-ahead routing guess covers every token of the window (rows interleaved by rank); NVMe experts shared by several tokens are admitted, experts picked by one token are read once, zero-copy.
+
+A verify window also dedupes experts across its tokens: on the copy prompt a token needs 265 unique experts instead of 337, and NVMe reads per token drop from 70 to 62. Measured with single runs of 384 new tokens, mode `nvme`, prompts in this order on one server:
+
+| prompt | `none` | `ngram` | accepted tokens per step |
 |---|---|---|---|
-| copy a 178-line source file | `nvme` | 7.31 tok/s | 7.24 tok/s |
-| copy a 178-line source file | `nvme-exact` | 5.78 tok/s | 2.54 tok/s |
-| MoE explanation (prose) | `nvme-exact` | 7.37 tok/s | 4.58 tok/s |
+| copy a 178-line source file | 7.79 tok/s | 9.88 tok/s (+27 %) | 4.97 |
+| add docstrings to a 121-line module (output the whole file) | 6.92 | 7.83 (+13 %) | 2.14 |
+| CSV (30 rows) to JSON | 9.55 | 9.40 | 1.00 |
+| MoE explanation (prose) | 10.30 | 9.68 | 1.00 |
+| short story | 10.81 | 10.66 | 1.00 |
+| LRU cache module (code) | 8.96 | 8.90 | 1.00 |
 
-Verification touches more cold experts per accepted token than single-token steps (77 vs 54 NVMe picks per token on the copy prompt in `nvme` mode), so the extra accepted tokens do not translate into speed here.
+So turn it on for work that copies the context (editing files, quoting, reformatting); elsewhere it costs 0-6 % in these single runs (32 fewer cache slots, and the caches leave a verify-heavy answer in a slightly worse state for the next one).
 
 Outputs are not bit-identical to `none`. On the copy prompt the output matched byte for byte. On the prose prompt it matched for 370 characters and then differed at a near-tie token: verification runs the same weights in different GEMM shapes, and fp16 rounding can flip a near-tie. The `none` path reproduces its own output exactly across runs.
 
@@ -156,6 +194,8 @@ The 11 sparse-attention (MLA/DSA) layers keep ~17 KB of KV cache per token in VR
 | DRAM (2 channels) | ~60 GB/s | - | 2.9-3.6 GB per token: 16-20 tok/s |
 
 The three limits are within ~15 % of each other, so fixing one moves the bottleneck. Today's speed is about half of what they allow, because each of the 42 MoE layers waits for its slowest lane. A second NVMe in RAID0 or 128 GB of RAM would lift the ceiling to ~20 tok/s; more CPU cores help only together with one of those (estimates, not measured).
+
+Measured at 128k context on chat (2026-10-20): the useful NVMe reads per token are 45-50 on prose and 60-70 on code (prefetches included), so at 1.45 ms per record the SSD alone caps decode at ~14 tok/s on prose and ~10-11 on code, against 9.9-10.8 and 7.8-9.1 tok/s now. Offline simulation over decode traces puts the best practical replacement policy only 6 % below LRU in misses, so the remaining headroom is in overlapping the reads better and in RAM capacity (every +5 % of RAM-tier slots removes ~11 % of the misses in the LRU simulation).
 
 ## Adding a model
 

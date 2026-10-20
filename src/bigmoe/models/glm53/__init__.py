@@ -35,7 +35,10 @@ EXLLAMAV3 = SourceBuild("exllamav3", "1.5.1", "https://codeload.github.com/turbo
 # planner cost model "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone" (ms). Upstream's cb = 0.165 ms per CPU-lane expert
 # is calibrated for 22 EPYC cores; with 5 Ryzen lane cores an expert costs ~0.65 ms and the stock model overloads the
 # lane. Tuned on the RTX 3090 box (2026-10-19, C1 chat): cb 0.165 -> 9.5, 0.30 -> 10.1, 0.40 -> 10.1, 0.65 -> 9.7 tok/s.
-TUNED_PLANNER = "0.17,0.023,0.38,0.145,0.40,0.10,0.40,0.12,0.395,0.75"
+# NVMe arrival model (2026-10-20): one 9.44 MB record takes ~1.45 ms of the SN850X at 6.7 GB/s and demand reads queue
+# behind each other (nvdeep 0.395 -> 1.45, nvlat 0.12 -> 0.25). With the engine's zero-copy cost for landed NVMe picks
+# (tnzc 0.6 ms in the MoE kernel vs ~0.39 ms on the CPU lane) the late NVMe picks go to the CPU: +3-5 % decode.
+TUNED_PLANNER = "0.17,0.023,0.38,0.145,0.40,0.10,0.40,0.25,1.45,0.75"
 MODES = ("nvme", "nvme-exact")
 # speculation: "ngram" drafts tokens from the context (prompt lookup) and verifies them with the target model (see README).
 SPECULATION = ("none", "ngram")
@@ -252,7 +255,9 @@ class GLM53(ModelBackend):
         env = {}
         if o.mode == "nvme-exact":
             reserve, k, mode_args = "1.0", "0", []
-            env.update(GLM53_NV="2", GLM53_NV_CPU="0", GLM53_K_HCFUSE="1")
+            # stock exllamav3 prefill: the single-pass prompt checkpoint (exl3_patch) prefills the last page boundary in
+            # one pass, which changes the fp16 rounding of the recurrent state and with it the greedy answers
+            env.update(GLM53_NV="2", GLM53_NV_CPU="0", GLM53_K_HCFUSE="1", GLM53_EXL3_PATCHES="0")
         else:
             reserve, k, mode_args = "1.5", "1", ["-ambs", "4"]
             env.update(GLM53_NV="2", GLM53_NV_CPU="1", GLM53_K_FTSPLIT="0", GLM53_K_OVL="0", GLM53_NV_VRING="24",
@@ -290,7 +295,9 @@ class GLM53(ModelBackend):
         if o.cache_quant:
             argv += ["-cq", str(o.cache_quant)]
         if o.speculation == "ngram":   # n-gram drafts + exact verification; user extra args come after and can override
-            argv += ["-ngram", str(o.ngram_min), "-ndt", str(o.draft_tokens)]
+            # one recurrent slot: exllamav3 keeps (ndt + 1) recurrent-state snapshots per slot and KDA layer for rewinding
+            # drafts (4 MB each, 34 layers), which at -ambs 4 costs 2.7 GB of VRAM expert cache (1408 -> 1120 slots)
+            argv += ["-ngram", str(o.ngram_min), "-ndt", str(o.draft_tokens), "-ambs", "1"]
         argv += ["--host", box.host, "--port", str(box.port), "--served-name", box.served_name, *box.extra_args]
         # ambient engine variables would silently change the configuration: only the ones set here reach the server
         unset = tuple(v for v in os.environ if v.startswith(("GLM53_", "EXL3_", "EXLLAMAV3_")) and v not in env)
