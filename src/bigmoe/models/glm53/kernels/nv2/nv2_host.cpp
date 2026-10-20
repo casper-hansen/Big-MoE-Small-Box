@@ -44,6 +44,7 @@ static inline void cpu_moe_forward(Pool& pool, const Layer& L, const float* x, i
 }
 #include "nv2_shared.h"
 #include <sys/mman.h>
+#include <cpuid.h>
 #include <fcntl.h>
 
 using namespace nv2s;
@@ -61,6 +62,18 @@ enum { B70_W_MAGIC = 0, B70_W_STATE = 4, B70_W_LOAD_SEQ = 6, B70_W_LOAD_ACK = 7,
 static inline long long realtime_ns() { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec; }
 static inline double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static inline void cpu_relax() { _mm_pause(); }
+// AMD MONITORX / MWAITX (user mode, CPUID 8000_0001 ECX bit 29): wait in C1 until the monitored line is written (another
+// core: ~0.4 us, a device's DMA write invalidates it too) or the timer (~8.75 cycles per ns on the 7600X) expires
+static bool mwaitx_ok()
+{
+    unsigned a, b, c, d;
+    return __get_cpuid(0x80000001, &a, &b, &c, &d) && (c & (1u << 29));
+}
+__attribute__((target("mwaitx"))) static inline void mwx_wait64(const volatile int64_t* p, int64_t want, unsigned cycles)
+{
+    _mm_monitorx(const_cast<int64_t*>(p), 0, 0);
+    if (__atomic_load_n(p, __ATOMIC_ACQUIRE) != want) _mm_mwaitx(2, 0, cycles);
+}
 static void pin_self(int cpu) { if (cpu < 0) return; cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu, &s); pthread_setaffinity_np(pthread_self(), sizeof(s), &s); }
 static void pin_self_set(const std::vector<int>& cpus) { if (cpus.empty()) return; cpu_set_t s; CPU_ZERO(&s); for (int c : cpus) CPU_SET(c, &s); pthread_setaffinity_np(pthread_self(), sizeof(s), &s); }
 
@@ -82,6 +95,7 @@ struct Track
 {
     std::atomic<int> left{0}; std::atomic<int> err{0}; DoneFn fn = nullptr; void* ctx = nullptr; int64_t tag = 0; double t0 = 0;
     int fd = -1; int64_t off = 0, dst = 0, len = 0, piece = 0, next = 0; int cls = 0; int key = -1;
+    int inp = 0;   // pieces in flight (reader mu)
     std::atomic<uint64_t> done_mask{0}; uint64_t part_mask = 0; PartFn part = nullptr; std::atomic<int> part_fired{0};
 };
 struct Piece { int fd; int64_t off, dst, len; Track* tr; int cls; double vdone; };
@@ -94,12 +108,19 @@ struct Reader
     int64_t infl[RC_N] = { 0, 0, 0 };          // bytes in flight per class
     int64_t hi_cap = int64_t(12) << 20, lo_cap = int64_t(6) << 20;
     bool lifo = true, prio = true;
+    // GLM53_NV_TRACK_QD: at most this many pieces of one decode read (demand / prefetch) in flight, 0 = unlimited. The
+    // SSD serves concurrent pieces in parallel, so a record's 9 pieces otherwise land together at its end; capped, they
+    // land in order (gate, up, down) while other records' pieces keep the queue deep, and the CPU lane streams them
+    int tqd = 0;
     std::unordered_map<int, Track*> queued;     // key -> track that still has undispatched pieces (classes > 0)
     bool quit = false;
     std::atomic<long> recs{0}, pieces{0}, promoted{0};
     // device emulation (set_read_rate, diagnostics): pieces complete no faster than a single device of rate_bps would
     // serve them in dispatch order (0 = off)
     double rate_bps = 0, vfin = 0;
+    // per-key landed-piece bitmask (engine-owned, reset by the engine before submit): bit i = piece i of the key's read
+    // has landed (pieces of up to 64 per read). Streams NVMe->CPU experts into the CPU lane (GLM53_NV_STREAM)
+    uint64_t* pmask = nullptr;
     static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     void start(int n, std::vector<int> cpus)
     {
@@ -107,8 +128,9 @@ struct Reader
         if (const char* v = getenv("GLM53_NV_LO_MB")) lo_cap = int64_t(atof(v) * 1048576.0);
         if (const char* v = getenv("GLM53_NV_PF_LIFO")) lifo = atoi(v) != 0;
         if (const char* v = getenv("GLM53_NV_PRIO")) prio = atoi(v) != 0;
-        fprintf(stderr, "[nv2] reader: %d threads, priority %d, demand cap %.1f MB, prefetch cap %.1f MB, prefetch lifo %d\n",
-                n, int(prio), hi_cap / 1048576.0, lo_cap / 1048576.0, int(lifo));
+        if (const char* v = getenv("GLM53_NV_TRACK_QD")) tqd = std::max(0, atoi(v));
+        fprintf(stderr, "[nv2] reader: %d threads, priority %d, demand cap %.1f MB, prefetch cap %.1f MB, prefetch lifo %d, track qd %d\n",
+                n, int(prio), hi_cap / 1048576.0, lo_cap / 1048576.0, int(lifo), tqd);
         for (int i = 0; i < n; ++i) th.emplace_back([this, cpus] { pin_self_set(cpus); loop(); });
     }
     void submit(int fd, int64_t off, int64_t dst, int64_t len, int64_t piece, int cls, DoneFn fn, void* ctx, int64_t tag, int key = -1,
@@ -150,13 +172,29 @@ struct Reader
         cv.notify_all();
         return true;
     }
-    int pick() const   // caller holds mu: class allowed to start a piece now, or -1
+    // first track of d (from the back for LIFO) that may start a piece: decode classes honour the track_qd cap
+    Track* first_ok(const std::deque<Track*>& d, bool back, bool capped) const
     {
-        if (!q[RC_DEMAND].empty()) return infl[RC_DEMAND] < hi_cap ? RC_DEMAND : -1;
+        if (d.empty()) return nullptr;
+        if (!capped || tqd <= 0) return back ? d.back() : d.front();
+        if (back) { for (auto it = d.rbegin(); it != d.rend(); ++it) if ((*it)->inp < tqd) return *it; }
+        else { for (Track* t : d) if (t->inp < tqd) return t; }
+        return nullptr;
+    }
+    // caller holds mu: the class and track allowed to start a piece now (false: none). Demand first: while a demand
+    // track is queued nothing else starts, even when every queued demand track is at its track_qd cap
+    bool pick(int& c, Track*& tr) const
+    {
+        if (!q[RC_DEMAND].empty())
+        {
+            if (infl[RC_DEMAND] >= hi_cap) return false;
+            tr = first_ok(q[RC_DEMAND], false, true); c = RC_DEMAND;
+            return tr != nullptr;
+        }
         const int64_t tot = infl[0] + infl[1] + infl[2];
-        if (!q[RC_PREFETCH].empty() && tot < lo_cap) return RC_PREFETCH;
-        if (!q[RC_BULK].empty()) return RC_BULK;
-        return -1;
+        if (!q[RC_PREFETCH].empty() && tot < lo_cap && (tr = first_ok(q[RC_PREFETCH], lifo, true))) { c = RC_PREFETCH; return true; }
+        if (!q[RC_BULK].empty()) { tr = q[RC_BULK].front(); c = RC_BULK; return true; }
+        return false;
     }
     void loop()
     {
@@ -165,19 +203,20 @@ struct Reader
             Piece p;
             {
                 std::unique_lock<std::mutex> lk(mu);
-                int c = -1;
-                cv.wait(lk, [&] { return quit || (c = pick()) >= 0; });
+                int c = -1; Track* tr = nullptr;
+                cv.wait(lk, [&] { return quit || pick(c, tr); });
                 if (quit) return;
                 auto& d = q[c];
-                Track* tr = (c == RC_PREFETCH && lifo) ? d.back() : d.front();
                 const int64_t n = std::min(tr->piece, tr->len - tr->next);
                 double vd = 0;
                 if (rate_bps > 0) { vfin = std::max(vfin, now_s()) + double(n) / rate_bps; vd = vfin; }
                 p = { tr->fd, tr->off + tr->next, tr->dst + tr->next, n, tr, c, vd };
-                tr->next += n;
+                tr->next += n; tr->inp++;
                 if (tr->next >= tr->len)
                 {
-                    if (c == RC_PREFETCH && lifo) d.pop_back(); else d.pop_front();
+                    if (tr == d.front()) d.pop_front();
+                    else if (tr == d.back()) d.pop_back();
+                    else d.erase(std::find(d.begin(), d.end(), tr));
                     if (tr->key >= 0) { auto it = queued.find(tr->key); if (it != queued.end() && it->second == tr) queued.erase(it); }
                 }
                 infl[c] += n;
@@ -198,10 +237,16 @@ struct Reader
             {
                 std::lock_guard<std::mutex> lk(mu);
                 infl[p.cls] -= p.len;
+                p.tr->inp--;
             }
             cv.notify_all();
             pieces++;
             if (err) p.tr->err = err;
+            if (pmask && p.tr->key >= 0 && !err)
+            {
+                const int64_t idx = (p.off - p.tr->off) / p.tr->piece;
+                if (idx < 64) __atomic_fetch_or(&pmask[p.tr->key], uint64_t(1) << idx, __ATOMIC_RELEASE);
+            }
             if (p.tr->part && !err)
             {
                 const int idx = int((p.off - p.tr->off) / p.tr->piece);
@@ -230,6 +275,10 @@ struct Pol
     double g0 = 0.17, thit = 0.023, tzc = 0.38, ca = 0.145, cb = 0.165, ctok = 0.040, push = 0.40;
     double nvlat = 0.12, nvdeep = 0.395, nvone = 0.75;
     double tnzc = 0.6;    // GPU cost of a zero-copy NVMe pick after landing, ms (GLM53_NV_TNZC; < 0 = legacy model)
+    // streaming (GLM53_NV_STREAM): CPU-lane time left for an NVMe->CPU pick after its last byte lands, ms (GLM53_NV_CBT;
+    // < 0 = legacy model: the lane starts the pick at its arrival). The lane computes the bands as they land, so it is
+    // done at max(lane free + cb, arrival + cbt) instead of max(lane free, arrival) + cb
+    double cbt = -1;
     int cpu_on = 0, nvcpu_on = 0, maxcpu = 32, nv_noadmit = 0;
 };
 
@@ -307,9 +356,17 @@ struct Engine
     std::vector<long long> dbg_cs = std::vector<long long>(DBG, 0), dbg_ce = std::vector<long long>(DBG, 0),
         dbg_nr = std::vector<long long>(DBG, 0), dbg_npf = std::vector<long long>(DBG, 0),
         dbg_inf = std::vector<long long>(DBG, 0), dbg_lm = std::vector<long long>(DBG, 0);
+    // dbg_la: last landing of ANY NVMe pick of the request (its demand reads and the in-flight prefetches it picked);
+    // dbg_nc: CPU-lane experts of the request, RAM picks + 1000 * NVMe->CPU picks
+    std::vector<long long> dbg_la = std::vector<long long>(DBG, 0), dbg_nc = std::vector<long long>(DBG, 0);
     std::vector<int64_t> kseq;      // key -> seq of the request that issued its read (> 0 demand, < 0 prefetch)
+    std::vector<int64_t> kreq;      // key -> seq of the latest request that picked it while its read was in flight
+    int cur_ncr = 0, cur_ncn = 0;
     // partial landing (GLM53_NV_PARTIAL): gu_res[key] = 1 once the gate+up bytes of an in-flight read have landed
     bool partial = true; std::vector<uint8_t> gu_res;
+    // streaming (GLM53_NV_STREAM): an NVMe->CPU pick is bound as soon as its read starts and each gate / up / down band
+    // unit of the CPU lane waits only for the read pieces that hold its bytes (pmask), instead of gate+up / whole record
+    bool stream = true; std::vector<uint64_t> pmask; std::vector<int64_t> kpiece;
     static void on_partial(void* ctx, int64_t tag)
     {
         Engine* e = static_cast<Engine*>(ctx);
@@ -400,6 +457,9 @@ struct Engine
     bool trace_on = false; std::vector<int32_t> trace; std::mutex trace_mu;
     int64_t wb_read = 0, adm_read = 0;
     int ctl_cpu = -1, dev_index = 0, wb_cpu = -1;
+    // GLM53_NV_CTL_MWX: the controller waits for the next request with MWAITX (timer cycles; 0 = PAUSE spin) instead of
+    // spinning, so the main thread's core can idle while the GPU works (all cores share one voltage rail)
+    unsigned ctl_mwx = 0;
     Pol pol;
     Counters C;
     // CPU tier
@@ -489,6 +549,9 @@ struct Engine
                 const int64_t sq = e->kseq[key];
                 if (sq > 0) { long long& lm = e->dbg_lm[sq % DBG]; lm = std::max(lm, realtime_ns()); }
                 e->kseq[key] = 0;
+                const int64_t rq = e->kreq[key];
+                if (rq > 0) { long long& la = e->dbg_la[rq % DBG]; la = std::max(la, realtime_ns()); }
+                e->kreq[key] = 0;
             }
             if (e->kst[key] == KS_INFLIGHT)
             {
@@ -521,6 +584,8 @@ struct Engine
         else karr[key] = std::max(t, nv_free_at) + pol.nvdeep + pol.nvlat;
         if (arrival) *arrival = karr[key];
         if (partial) gu_res[key] = 0;
+        kpiece[key] = cls == RC_BULK ? piece : dpiece;
+        __atomic_store_n(&pmask[key], uint64_t(0), __ATOMIC_RELEASE);
         rd.submit(fd, int64_t(key) * rec_bytes, ram_addr[s], slot_bytes, cls == RC_BULK ? piece : dpiece, cls, &Engine::on_land, this, key, key,
                   (partial && cls != RC_BULK) ? &Engine::on_partial : nullptr, off_d);
         C.reads++; C.read_bytes += slot_bytes;
@@ -820,7 +885,7 @@ struct Engine
         const bool dec = r.kind == RK_DECODE || r.kind == RK_VERIFY;
         const bool lossy = lossy_on && r.kind == RK_VERIFY && r.np <= MAXP && r.li >= lossy_lo && r.li <= lossy_hi;
         p.rn_on = 0; p.rn_topk = 8;
-        cur_nr = cur_npf = cur_inf = 0;
+        cur_nr = cur_npf = cur_inf = 0; cur_ncr = cur_ncn = 0;
         if (trace_on && dec && r.np <= MAXP)
         {
             std::lock_guard<std::mutex> lt(trace_mu);
@@ -874,9 +939,9 @@ struct Engine
             {
                 if (lossy && kst[key] == KS_NONE && !lwant[u]) { p.lane[u] = LN_SKIP; C.lane_skip++; continue; }
                 double a = 0;
-                if (kst[key] == KS_INFLIGHT) { a = karr[key]; C.inflight_hit++; cur_inf++; if (rd.promote(key)) C.promoted++; }
+                if (kst[key] == KS_INFLIGHT) { a = karr[key]; C.inflight_hit++; cur_inf++; kreq[key] = cur_seq; if (rd.promote(key)) C.promoted++; }
                 else if (!start_read(key, RC_DEMAND, &a)) { a = 1e9; hc[HC_ERR] = 19; fprintf(stderr, "nv2: no RAM slot for key %d\n", key); }
-                else { kseq[key] = cur_seq; cur_nr++; }
+                else { kseq[key] = cur_seq; kreq[key] = cur_seq; cur_nr++; }
                 N.push_back({ u, key, r.cnt[u], a - t0, score[key] });
                 nnv++;
             }
@@ -892,7 +957,7 @@ struct Engine
             if (!dec) { p.lane[k.u] = LN_RAM; C.lane_zc++; continue; }
             const double ce = c + pol.cb + pol.ctok * (k.cnt - 1);
             const double ge = g + pol.tzc;
-            if (cpu && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_CPU; ncpu++; C.lane_cpu++; }
+            if (cpu && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_CPU; ncpu++; cur_ncr++; C.lane_cpu++; }
             // verify window: an expert only one of its tokens picked is read once either way; zero-copy it instead of
             // admitting it, which keeps the VRAM cache and the write-back landing ring for the shared ones
             else if (rzc1 && r.ntok > 1 && k.cnt == 1) { g = ge; p.lane[k.u] = LN_RZC; C.lane_zc++; }
@@ -901,13 +966,14 @@ struct Engine
         for (auto& k : N)
         {
             const double a = std::max(0.0, k.arr);
-            const double ce = std::max(c, a) + pol.cb + pol.ctok * (k.cnt - 1);
+            const double cx = pol.cb + pol.ctok * (k.cnt - 1);
+            const double ce = (stream && pol.cbt >= 0) ? std::max(c + cx, a + pol.cbt) : std::max(c, a) + cx;
             // cold: zero-copy, keep VRAM. A verify window admits NVMe picks shared by several of its tokens instead (the
             // fused decode kernel reads a zero-copy expert once per token that picked it)
             const bool nzc = dec && pol.nv_noadmit && (r.ntok == 1 || k.cnt == 1);
             // GPU cost after landing: zero-copy in the MoE kernel (tnzc, GLM53_NV_TNZC; < 0: legacy push + thit model)
             const double ge = (nzc && pol.tnzc >= 0) ? std::max(g, a) + pol.tnzc : std::max(g, a + pol.push) + pol.thit;
-            if (cpu && pol.nvcpu_on && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_NVC; ncpu++; C.lane_nvc++; }
+            if (cpu && pol.nvcpu_on && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_NVC; ncpu++; cur_ncn++; C.lane_nvc++; }
             else if (nzc) { g = pol.tnzc >= 0 ? ge : std::max(g, a) + pol.tzc; p.lane[k.u] = LN_NZC; C.lane_nvg++; }
             else { g = ge; p.lane[k.u] = LN_NVG; C.lane_nvg++; }
         }
@@ -961,9 +1027,9 @@ struct Engine
             for (int u = 0; u < r.nu; ++u) { prot[r.key[u]] = 1; protl.push_back(r.key[u]); }
             drain_logs(s);                         // write-back landings may evict: never this request's keys
             cur_seq = s;
-            dbg_lm[s % DBG] = 0; dbg_cs[s % DBG] = 0; dbg_ce[s % DBG] = 0;
+            dbg_lm[s % DBG] = 0; dbg_cs[s % DBG] = 0; dbg_ce[s % DBG] = 0; dbg_la[s % DBG] = 0;
             plan_and_reply(r, p);
-            dbg_nr[s % DBG] = cur_nr; dbg_npf[s % DBG] = cur_npf; dbg_inf[s % DBG] = cur_inf;
+            dbg_nr[s % DBG] = cur_nr; dbg_npf[s % DBG] = cur_npf; dbg_inf[s % DBG] = cur_inf; dbg_nc[s % DBG] = cur_ncr + 1000 * cur_ncn;
             C.reqs++; (r.kind != RK_SMALL ? C.dec_reqs : C.small_reqs)++; if (r.kind != RK_SMALL) C.dec_tok += r.ntok;
         }
         if (p.ncpu > 0)
@@ -1012,7 +1078,8 @@ struct Engine
             const Req& r = req[s % RQ];
             if (__atomic_load_n(&r.seq, __ATOMIC_ACQUIRE) != s)
             {
-                cpu_relax();
+                if (ctl_mwx) mwx_wait64(&r.seq, s, ctl_mwx);
+                else cpu_relax();
                 if ((++n & 1023) == 0 && now_ms() - last > 200.0) std::this_thread::sleep_for(std::chrono::microseconds(20));
                 continue;
             }
@@ -1033,7 +1100,12 @@ struct Engine
         while (!quit.load(std::memory_order_relaxed))
         {
             const int64_t s = cpu_job_seq.load(std::memory_order_acquire);
-            if (s == last) { if (++idle < 400000) _mm_pause(); else std::this_thread::sleep_for(std::chrono::microseconds(20)); continue; }
+            if (s == last)
+            {
+                if (++idle < 400000) { if (g_mwx) mwx_while_eq64(&cpu_job_seq, uint64_t(last)); else _mm_pause(); }
+                else std::this_thread::sleep_for(std::chrono::microseconds(20));
+                continue;
+            }
             idle = 0;
             const double t0 = now_ms();
             dbg_cs[s % DBG] = realtime_ns();
@@ -1099,12 +1171,25 @@ struct Engine
             // first worker that reaches it, after every resident job's units
             std::vector<uint8_t> late(E, 0);
             for (int k = 0; k < np; ++k) if (cj.lane[k] == LN_NVC) { late[cj.e[k]] = 1; r1[cj.t[k]].push_back({ cj.e[k], cj.w[k] }); }
+            if (stream)
+            {
+                // late experts in planned landing order (late[e] = 1 + rank): the streaming units follow it
+                std::vector<std::pair<double, int>> ord;
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    for (int x = 0; x < E; ++x) if (late[x]) ord.push_back({ karr[li * E + x], x });
+                }
+                std::sort(ord.begin(), ord.end());
+                for (size_t q = 0; q < ord.size(); ++q) late[ord[q].second] = uint8_t(1 + std::min<size_t>(q, 250));
+            }
             std::function<bool(int)> bind_late = [&](int ex) -> bool {
                 std::unique_lock<std::mutex> lk(mu);
                 int k = -1;
                 for (int q = 0; q < np; ++q) if (cj.e[q] == ex && cj.lane[q] == LN_NVC) { k = q; break; }
                 if (k < 0) return false;
                 const int key = li * E + ex;
+                // streaming: bind at once (the slot is fixed at start_read); each unit waits for its own pieces
+                if (stream && kst[key] == KS_INFLIGHT) { C.partial_binds++; return bind(k); }
                 if (kst[key] != KS_RES)
                 {
                     const double tw = now_ms();
@@ -1127,7 +1212,32 @@ struct Engine
                 if (kst[key] != KS_RES) { hc[HC_ERR] = 32; return false; }
                 return true;
             };
-            n135::moe_forward4(pool, Ly, xf.data(), ntok, r1, hout, mode, late.data(), &bind_late, partial ? &down_late : nullptr);
+            // streaming: block until bytes [lo, hi) of expert ex's record have landed (the reader's piece mask)
+            std::function<bool(int, int64_t, int64_t)> wait_bytes = [&](int ex, int64_t lo, int64_t hi) -> bool {
+                const int key = li * E + ex;
+                if (__atomic_load_n(&ram_res[key], __ATOMIC_ACQUIRE) == 1) return true;
+                const int64_t pc = kpiece[key];
+                if (pc <= 0 || (hi - 1) / pc >= 64)
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    land_cv.wait_for(lk, std::chrono::seconds(10), [&] { return kst[key] == KS_RES; });
+                    if (kst[key] != KS_RES) { hc[HC_ERR] = 32; return false; }
+                    return true;
+                }
+                const int b0 = int(lo / pc), b1 = int((hi - 1) / pc);
+                const uint64_t need = (b1 >= 63 ? ~uint64_t(0) : ((uint64_t(1) << (b1 + 1)) - 1)) & ~((uint64_t(1) << b0) - 1);
+                const double tw = now_ms();
+                long n = 0;
+                while ((__atomic_load_n(&pmask[key], __ATOMIC_ACQUIRE) & need) != need)
+                {
+                    if (__atomic_load_n(&ram_res[key], __ATOMIC_ACQUIRE) == 1) return true;
+                    if (g_mwx) mwx_while_mask64(&pmask[key], need); else _mm_pause();
+                    if ((++n & 8191) == 0 && now_ms() - tw > 10000.0) { hc[HC_ERR] = 32; return false; }
+                }
+                return true;
+            };
+            n135::moe_forward4(pool, Ly, xf.data(), ntok, r1, hout, mode, late.data(), &bind_late, partial ? &down_late : nullptr,
+                               stream ? &wait_bytes : nullptr, off_u, off_d);
             goto n135_done;
         }
         if (any1 || !nb) cpu_moe_forward(pool, Ly, xf.data(), ntok, r1, hout, mode);
@@ -1388,7 +1498,7 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t
     Engine& e = *G;
     e.L = int(L); e.E = int(E); e.K = int(L * E); e.H = int(H); e.I = int(I);
     e.rec_bytes = rec_bytes; e.slot_bytes = slot_bytes; e.piece = piece;
-    { const char* v = getenv("GLM53_NV_DPIECE_KB"); e.dpiece = (v && *v ? atoll(v) : 1024) * 1024; e.dpiece = std::max<int64_t>(4096, e.dpiece / 4096 * 4096); } e.off_u = off_u; e.off_d = off_d; e.fd = int(fd); e.ph = ph;
+    { const char* v = getenv("GLM53_NV_DPIECE_KB"); e.dpiece = (v && *v ? atoll(v) : 512) * 1024; e.dpiece = std::max<int64_t>(4096, e.dpiece / 4096 * 4096); } e.off_u = off_u; e.off_d = off_d; e.fd = int(fd); e.ph = ph;
     e.hc = (volatile int64_t*) hc; e.req = (Req*) req; e.rep = (Rep*) rep; e.wbl = (LogE*) wbl; e.adml = (LogE*) adml;
     e.land = (int32_t*) land; e.home = (volatile int64_t*) home; e.ram_res = (volatile int32_t*) ram_res;
     e.hx = (uint16_t*) hx; e.hout = (float*) hout;
@@ -1399,11 +1509,14 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t
     for (auto& ev : e.pf_ev) cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
     e.score.assign(score.data_ptr<float>(), score.data_ptr<float>() + e.K);
     e.slot_of.assign(e.K, -1); e.kvr.assign(e.K, -1); e.kst.assign(e.K, KS_NONE); e.karr.assign(e.K, 0); e.prot.assign(e.K, 0);
-    e.pfs.assign(e.K, 0); e.kseq.assign(e.K, 0); e.gu_res.assign(e.K, 0);
+    e.pfs.assign(e.K, 0); e.kseq.assign(e.K, 0); e.kreq.assign(e.K, 0); e.gu_res.assign(e.K, 0);
     if (const char* pm = getenv("GLM53_NV_PARTIAL")) e.partial = atoi(pm) != 0;
+    if (const char* pm = getenv("GLM53_NV_STREAM")) e.stream = atoi(pm) != 0;
+    e.pmask.assign(e.K, 0); e.kpiece.assign(e.K, 0);
     if (const char* pm = getenv("GLM53_NV_PF_MAX")) e.pf_max = std::max(0, atoi(pm));
     if (const char* pm = getenv("GLM53_NV_PF_MULTI")) e.pf_multi = std::max(0, atoi(pm));
     if (const char* pm = getenv("GLM53_NV_TNZC")) e.pol.tnzc = atof(pm);
+    if (const char* pm = getenv("GLM53_NV_CBT")) e.pol.cbt = atof(pm);
     if (const char* pm = getenv("GLM53_NV_WB_EARLY")) e.wb_early = atoi(pm) != 0;
     if (const char* pm = getenv("GLM53_NV_RZC1")) e.rzc1 = atoi(pm) != 0;
     {
@@ -1427,8 +1540,21 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t
     for (int k = 0; k < e.K; ++k) { e.ram_res[k] = 0; e.set_home(k, ph); }
     e.exclusive = exclusive != 0; e.land_target = int(land_target); e.free_lo = int(free_lo);
     e.ctl_cpu = int(ctl_cpu);
+    {
+        // the controller waits with MWAITX by default where the CPU has it (20000 timer cycles ~ 2.3 us on the 7600X): with
+        // the main thread sleeping on the token event too, core 0 idles and the lane cores clock 4.8 instead of 4.34 GHz.
+        // The CPU lane's own waits stay PAUSE spins by default (MWAITX there measured no further clock gain)
+        const bool mx = mwaitx_ok();
+        const char* v = getenv("GLM53_NV_CTL_MWX");
+        e.ctl_mwx = mx ? unsigned(v && *v ? std::max(0, atoi(v)) : 20000) : 0;
+        v = getenv("GLM53_NV_LANE_MWX");
+        g_mwx = mx && v && *v ? unsigned(std::max(0, atoi(v))) : 0;
+    }
+    if (g_mwx) fprintf(stderr, "[nv2] CPU lane waits with MWAITX (timer %u cycles)\n", g_mwx);
+    if (e.ctl_mwx) fprintf(stderr, "[nv2] controller waits with MWAITX (timer %u cycles)\n", e.ctl_mwx);
     std::vector<int> rc(reader_cpus.begin(), reader_cpus.end());
     e.wb_cpu = rc.empty() ? -1 : rc.back();
+    e.rd.pmask = e.pmask.data();
     e.rd.start(int(readers), rc);
     cudaStreamCreateWithFlags(&e.wb_stream, cudaStreamNonBlocking);
     e.vring_addr.assign(vring.data_ptr<int64_t>(), vring.data_ptr<int64_t>() + vring.numel());
@@ -1611,7 +1737,8 @@ std::vector<at::Tensor> dbg_host()
 {
     Engine& e = *G;
     auto T = [](std::vector<long long>& v) { return torch::from_blob(v.data(), { DBG }, torch::kInt64).clone(); };
-    return { T(e.dbg_seq), T(e.dbg_tn), T(e.dbg_tr), T(e.dbg_cs), T(e.dbg_ce), T(e.dbg_nr), T(e.dbg_npf), T(e.dbg_inf), T(e.dbg_lm) };
+    return { T(e.dbg_seq), T(e.dbg_tn), T(e.dbg_tr), T(e.dbg_cs), T(e.dbg_ce), T(e.dbg_nr), T(e.dbg_npf), T(e.dbg_inf), T(e.dbg_lm),
+             T(e.dbg_la), T(e.dbg_nc) };
 }
 
 void trace_set(int64_t on) { Engine& e = *G; std::lock_guard<std::mutex> lt(e.trace_mu); e.trace_on = on != 0; if (!on) e.trace.clear(); }

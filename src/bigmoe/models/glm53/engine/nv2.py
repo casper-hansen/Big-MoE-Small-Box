@@ -25,11 +25,17 @@ Env: GLM53_NV_RAM_GB (auto), GLM53_NV_MARGIN_GB (1), GLM53_NV_THREADS (16 reader
 2026-10-20 (nv2_host.cpp): GLM53_NV_TNZC (0.6 ms: GPU cost of a zero-copy NVMe pick after landing; < 0 legacy model),
      GLM53_NV_PARTIAL (1: an NVMe->CPU job binds at gate+up landing, down units wait), GLM53_NV_PRIO (1: reader classes
      demand > prefetch > bulk), GLM53_NV_HI_MB (12) / GLM53_NV_LO_MB (6) in-flight caps, GLM53_NV_PF_LIFO (1),
-     GLM53_NV_DPIECE_KB (1024: decode read pieces), GLM53_NV_WB_EARLY (1: write-backs drained at nv_copy completion),
+     GLM53_NV_DPIECE_KB (512: decode read pieces), GLM53_NV_WB_EARLY (1: write-backs drained at nv_copy completion),
      GLM53_NV_PF_MULTI (2 prefetch hints per verify-window token), GLM53_NV_RZC1 (1: verify windows do not admit RAM picks
      of one token), GLM53_NV_STG / GLM53_NV_STG_MAX (0 / 3: layer-ahead DMA staging pool, experimental, off) with
      GLM53_NV_STG_GATE (2: DMA after the copy kernel unless the MoE reads zero-copy, then after the MoE kernel),
      GLM53_NV_PF_RING_BORROW (1: the prefill ring borrows RAM-tier slots during a staged prefill).
+     Round 3: GLM53_NV_STREAM (1: an NVMe->CPU pick is bound when its read starts and each gate / up / down band of the
+     CPU lane waits only for the read pieces that hold it), GLM53_NV_TRACK_QD (0: pieces of one decode read in flight,
+     uncapped), GLM53_NV_CBT (planner: CPU time left for a streamed NVMe->CPU pick after its last byte lands, ms; < 0
+     legacy), GLM53_NV_CTL_MWX (20000) / GLM53_NV_LANE_MWX (0): MWAITX timer cycles for the controller's / CPU lane's waits
+     on AMD (0 = PAUSE spins). timeline() also reports the CPU tail after the last landing of any NVMe pick and the
+     lane's time per RAM expert in layers without NVMe picks.
      Diagnostics: timeline() (per-layer breakdown in summary()), ext().trace_set / trace_take (routing trace)
 N137 B70 expert tier (needs the CPU tier, GLM53_NV_CPU=1): GLM53_B70 (0), GLM53_B70_RING (/run/local-ai/shared/b70.ring,
      created by b70tier/b70srv.py on the B70), GLM53_B70_N (3000 experts), GLM53_B70_ORDER (score: warm-score order after the VRAM warm
@@ -647,12 +653,14 @@ class Nv2:
         Host: CPU job span, CPU end relative to combine start, demand-read landing relative to copy start."""
         d = ext().peek(self.dbg.data_ptr(), self.dbg.numel())
         d = np.asarray(d, np.int64).reshape(-1, self.DBGW)
-        hs, hn, hr, cs, ce, nr, npf, inf, lm = [t.numpy() for t in ext().dbg_host()]
+        hh = [t.numpy() for t in ext().dbg_host()]
+        hs, hn, hr, cs, ce, nr, npf, inf, lm = hh[:9]
+        la, nc = (hh[9], hh[10]) if len(hh) > 10 else (np.zeros_like(lm), np.zeros_like(lm))
         ok = (d[:, 0] > 0) & (hs == d[:, 0]) & (d[:, 6] > 0) & (d[:, 4] > 0) & (d[:, 9] >= d[:, 8]) & (d[:, 8] >= d[:, 6])
         if ok.sum() < 16:
             return {"n": int(ok.sum())}
         o = np.argsort(d[ok, 0])
-        d, hn, hr, cs, ce, nr, npf, inf, lm = [x[ok][o] for x in (d, hn, hr, cs, ce, nr, npf, inf, lm)]
+        d, hn, hr, cs, ce, nr, npf, inf, lm, la, nc = [x[ok][o] for x in (d, hn, hr, cs, ce, nr, npf, inf, lm, la, nc)]
         off = np.min(hn - d[:, 1])
         consec = np.diff(d[:, 0]) == 1
         i = np.nonzero(consec)[0]
@@ -682,6 +690,25 @@ class Nv2:
             out["layer_us_mean_with_demand"] = m(tot[dr]); out["layer_us_mean_without"] = m(tot[~dr]) if (~dr).any() else None
             out["parts_with_demand"] = {k: m(v[dr]) for k, v in parts.items()}
             out["parts_without"] = {k: m(v[~dr]) for k, v in parts.items()} if (~dr).any() else None
+        # any NVMe pick (demand read or in-flight prefetch hit): CPU end / combine go after the last landing
+        anyn = (nr[i] > 0) | (inf[i] > 0)
+        okla = anyn & (la[i] > 0) & has
+        out["frac_layers_any_nvme"] = round(float(anyn.mean()), 3)
+        if okla.any():
+            out["tail_cpu_end_minus_last_land_us_mean"] = m((ce[i] - la[i])[okla])
+            out["combine_go_minus_last_land_us_mean"] = m((D[:, 9] - (la[i] - off))[okla])
+            out["last_land_minus_copy_start_us_mean"] = m(((la[i] - off) - D[:, 5])[okla])
+            out["layer_us_mean_any_nvme"] = m(tot[okla])
+        ncr, ncn = nc[i] % 1000, nc[i] // 1000
+        pure = has & ~anyn & (ncr > 0) & (ncn == 0)
+        out["cpu_ram_per_call"] = round(float(ncr.mean()), 2)
+        out["cpu_nvc_per_call"] = round(float(ncn.mean()), 2)
+        if pure.any():
+            out["frac_layers_ram_only"] = round(float(pure.mean()), 3)
+            out["cpu_experts_ram_only_mean"] = round(float(ncr[pure].mean()), 2)
+            out["cpu_us_per_expert_ram_only"] = m(((ce[i] - cs[i]) / np.maximum(ncr, 1))[pure])
+            out["layer_us_mean_ram_only"] = m(tot[pure])
+            out["parts_ram_only"] = {k: m(v[pure]) for k, v in parts.items()}
         return out
 
     def summary(self):

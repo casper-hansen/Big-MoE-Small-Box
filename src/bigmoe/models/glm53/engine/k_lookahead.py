@@ -113,7 +113,10 @@ class _State:
         self.dev = dev
         self.ids = [torch.zeros((1, 1), dtype=torch.long, device=dev) for _ in range(2)]
         self.tok_pin = [torch.zeros((1, 1), dtype=torch.long, pin_memory=True) for _ in range(2)]
-        self.ev = [torch.cuda.Event() for _ in range(2)]
+        # GLM53_LA_BLOCK=1: the host sleeps in the driver while waiting for token k instead of spinning (cudaEventBlockingSync):
+        # the main thread's core idles through the ~90 ms forward, and the cores share one voltage rail
+        blocking = os.environ.get("GLM53_LA_BLOCK", "1") == "1"
+        self.ev = [torch.cuda.Event(blocking=blocking) for _ in range(2)]
         self.bi = {}          # (parity, width) -> pinned block index
         self.sl = [torch.zeros((1,), dtype=torch.int32, pin_memory=True) for _ in range(2)]
         self.par = 0

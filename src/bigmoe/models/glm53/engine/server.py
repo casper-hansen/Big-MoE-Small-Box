@@ -652,6 +652,82 @@ async def cpu_bench(n: int = 20, k: int = 2, m: int = 1, li: int = 10, mode: int
                          "out_norm": float(out.norm())})
 
 
+@app.get("/cpu_bench_dma")
+async def cpu_bench_dma(n: int = 40, k: int = 4, m: int = 1, li: int = 10, h2d: int = 1, d2h: int = 1, host_mb: int = 512):
+    """/cpu_bench while the GPU's copy engines stream host DRAM like a decode layer's copy phase does (H2D from a
+    host_mb pinned buffer, cycling 9 MB chunks so the reads miss the CPU caches; D2H back into it): the CPU lane's
+    per-expert time under PCIe DMA traffic to / from DRAM. Server must be idle. Diagnostics only."""
+    from . import nv2
+    while len(G["gen"].jobs):
+        await asyncio.sleep(0.05)
+    e = nv2.ext()
+    ks = e.state()[1].numpy()
+    E = nv2.NV.E
+    res = [x for x in range(E) if ks[li * E + x] == 2][:k]
+    x = (torch.randn(m, nv2.NV.H) * 0.35).float()
+    sel = torch.tensor([res] * m, dtype=torch.int32)
+    w = torch.full((m, len(res)), 0.25)
+    out = e.cpu_forward(li, x, sel, w, -1)
+    t0 = time.perf_counter()
+    for _ in range(n):
+        out = e.cpu_forward(li, x, sel, w, -1)
+    idle_ms = (time.perf_counter() - t0) / n * 1e3
+    chunk = 9 << 20
+    host = torch.empty(host_mb << 20, dtype=torch.uint8, pin_memory=True)
+    host.fill_(1)
+    dev = torch.empty(chunk, dtype=torch.uint8, device=torch.device("cuda", torch.cuda.current_device()))
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    nch = host.numel() // chunk
+    reps = max(64, int(n * len(res) * 0.4 / 0.38) + 64)   # ~0.38 ms per 9 MB chunk: outlast the bench
+    ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    with torch.cuda.stream(s1):
+        ev0.record(s1)
+        for i in range(reps if h2d else 0):
+            dev.copy_(host[(i % nch) * chunk:(i % nch + 1) * chunk], non_blocking=True)
+        ev1.record(s1)
+    with torch.cuda.stream(s2):
+        for i in range(reps if d2h else 0):
+            host[((i + nch // 2) % nch) * chunk:((i + nch // 2) % nch + 1) * chunk].copy_(dev, non_blocking=True)
+    await asyncio.sleep(0.005)
+    t0 = time.perf_counter()
+    for _ in range(n):
+        out = e.cpu_forward(li, x, sel, w, -1)
+    dma_ms = (time.perf_counter() - t0) / n * 1e3
+    busy = not ev1.query()
+    torch.cuda.synchronize()
+    h2d_gbs = reps * chunk / (ev0.elapsed_time(ev1) * 1e-3) / 1e9 if h2d else 0.0
+    del host, dev
+    return JSONResponse({"experts": len(res), "tokens": m, "idle_ms_per_expert": round(idle_ms / max(1, len(res)), 3),
+                         "dma_ms_per_expert": round(dma_ms / max(1, len(res)), 3), "dma_still_running_at_end": busy,
+                         "h2d_GBps": round(h2d_gbs, 2), "h2d": h2d, "d2h": d2h, "out_norm": float(out.norm())})
+
+
+@app.get("/gpu_prof")
+async def gpu_prof(secs: float = 3.0, path: str = "", top: int = 40):
+    """CUDA kernel profile (torch.profiler / CUPTI, process-wide) of whatever the GPU runs during the next `secs`
+    seconds: start a decode first. path: also write a Chrome trace there (per-kernel timeline). Diagnostics only:
+    CUPTI adds launch overhead, so use it for where the time goes, not for speed."""
+    from torch.profiler import profile, ProfilerActivity
+    prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+    prof.__enter__()
+    try:
+        await asyncio.sleep(secs)
+    finally:
+        prof.__exit__(None, None, None)
+    if path:
+        prof.export_chrome_trace(path)
+    dev = lambda ev, k: float(getattr(ev, k, None) if getattr(ev, k, None) is not None else 0.0)
+    rows = []
+    for ev in prof.key_averages():
+        t = dev(ev, "self_device_time_total") or dev(ev, "self_cuda_time_total")
+        if t > 0:
+            rows.append({"name": ev.key[:120], "count": int(ev.count), "self_dev_us": round(t, 1),
+                         "us_per_call": round(t / max(1, ev.count), 2)})
+    rows.sort(key=lambda r: -r["self_dev_us"])
+    tot = sum(r["self_dev_us"] for r in rows)
+    return JSONResponse({"secs": secs, "dev_us_total": round(tot, 1), "path": path, "top": rows[:top]})
+
+
 @app.get("/nv_verify")
 async def nv_verify(n: int = 64):
     if os.environ.get("GLM53_NV") == "2":

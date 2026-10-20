@@ -41,8 +41,9 @@ EXLLAMAV3 = SourceBuild("exllamav3", "1.5.1", "https://codeload.github.com/turbo
 TUNED_PLANNER = "0.17,0.023,0.38,0.145,0.40,0.10,0.40,0.25,1.45,0.75"
 # CPUs with AVX-512 VBMI + VNNI (Zen 4, Ice Lake and later) run the CPU lane's trellis decode with vpermt2b /
 # vpmultishiftqb (ft_n135.h): an expert takes 0.32 instead of 0.38 ms on the 7600X's 5 lane cores, so the lane takes
-# more experts (cb 0.40 -> 0.32). Used when planner_cost is left at TUNED_PLANNER.
-TUNED_PLANNER_VBMI = "0.17,0.023,0.38,0.145,0.32,0.10,0.40,0.25,1.45,0.75"
+# more experts (cb 0.40 -> 0.32). With the main thread and the controller no longer spinning on core 0 (blocking token
+# event, MWAITX) the lane cores clock 4.8 instead of 4.34 GHz: cb 0.29. Used when planner_cost is left at TUNED_PLANNER.
+TUNED_PLANNER_VBMI = "0.17,0.023,0.38,0.145,0.29,0.10,0.40,0.25,1.45,0.75"
 VBMI_FLAGS = {"avx512f", "avx512bw", "avx512vl", "avx512vbmi", "avx512_vnni"}
 MODES = ("nvme", "nvme-exact")
 # speculation: "ngram" drafts tokens from the context (prompt lookup) and verifies them with the target model (see README).

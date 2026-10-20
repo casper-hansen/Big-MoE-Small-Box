@@ -667,7 +667,20 @@ struct Fwd4
     std::vector<uint8_t> jlate;
     std::vector<Ctr> c_bind;            // 0 unbound, 1 binding, 2 bound, 3 failed (skipped)
     std::vector<Ctr> c_dlate;           // 0 unchecked, 1 checking, 2 landed
+    // streaming (engine GLM53_NV_STREAM): wait(e, lo, hi) blocks until bytes [lo, hi) of late expert e's record have
+    // landed (false: read failed, the job is skipped); off_u / off_d: record offsets of the up / down matrices
+    const std::function<bool(int, int64_t, int64_t)>* wait = nullptr;
+    int64_t off_u = 0, off_d = 0;
 };
+
+// streaming: the record bytes of tile rows [r0, r0 + R) of a native-layout matrix at record offset moff
+inline bool wait_rows(Fwd4& F, int j, const Mat& M, int64_t moff, int r0, int R)
+{
+    const int64_t rs = int64_t(M.n / 16) * TILE_BYTES;
+    if ((*F.wait)(F.jobs[j].e, moff + r0 * rs, moff + int64_t(r0 + R) * rs)) return true;
+    F.c_bind[j].v.store(3, std::memory_order_release);   // read failed: the out units skip this job
+    return false;
+}
 
 // true when job j's expert pointers are valid (late jobs: bind on first use; a failed bind skips the job)
 inline bool job_ready(Fwd4& F, int j)
@@ -684,12 +697,15 @@ inline bool job_ready(Fwd4& F, int j)
             st.store(ok ? 2 : 3, std::memory_order_release);
         }
         else
-            while (st.load(std::memory_order_acquire) < 2) _mm_pause();
+            while (st.load(std::memory_order_acquire) < 2) { if (g_mwx) mwx_while_lt32(&st, 2); else _mm_pause(); }
     }
     return st.load(std::memory_order_acquire) == 2;
 }
 
-inline void spin_until(const std::atomic<int>& c, int target) { while (c.load(std::memory_order_acquire) < target) _mm_pause(); }
+inline void spin_until(const std::atomic<int>& c, int target)
+{
+    while (c.load(std::memory_order_acquire) < target) { if (g_mwx) mwx_while_lt32(&c, target); else _mm_pause(); }
+}
 
 inline void fwd4_fn(void* vc, int, int)
 {
@@ -747,6 +763,7 @@ inline void fwd4_fn(void* vc, int, int)
                 qs[i] = (U.which ? F.qu : F.qg).data() + size_t(s0 + i) * BH;
             }
             const int tk = M.k / 16, R = F.rg, C = F.cg;
+            if (F.wait && F.jlate[U.j]) wait_rows(F, U.j, M, U.which ? F.off_u : 0, U.a * R, std::min(R, tk - U.a * R));
             // partials [band][slot][I]
             float* y = (U.which ? F.pu : F.pg).data() + (size_t(U.a) * F.ns + s0) * I + size_t(U.b) * C * 16;
             rect_m(F.kind, J.m, M, U.a * R, std::min(R, tk - U.a * R), U.b * C, C, xp, qs, y, I);
@@ -791,7 +808,9 @@ inline void fwd4_fn(void* vc, int, int)
         else if (U.kind == U_DOWN)
         {
             spin_until(F.c_act[U.j].v, BI);
-            if (F.down && F.jlate[U.j])
+            if (F.wait && F.jlate[U.j])
+                wait_rows(F, U.j, E.d, F.off_d, U.a * F.rd, std::min(F.rd, E.d.k / 16 - U.a * F.rd));
+            else if (F.down && F.jlate[U.j])
             {
                 std::atomic<int>& dv = F.c_dlate[U.j].v;
                 int z = 0;
@@ -800,7 +819,7 @@ inline void fwd4_fn(void* vc, int, int)
                     (*F.down)(F.jobs[U.j].e);
                     dv.store(2, std::memory_order_release);
                 }
-                else while (dv.load(std::memory_order_acquire) < 2) _mm_pause();
+                else while (dv.load(std::memory_order_acquire) < 2) { if (g_mwx) mwx_while_lt32(&dv, 2); else _mm_pause(); }
             }
             const void* xp[MAXM]; const float* qs[MAXM];
             for (int i = 0; i < J.m; ++i) { xp[i] = F.xd.data() + size_t(s0 + i) * XI; qs[i] = F.qd.data() + size_t(s0 + i) * BI; }
@@ -845,10 +864,12 @@ template <typename PoolT>
 // job and are bound by bind_late(e) (blocking until landed; false = skip) when a worker first reaches them.
 void moe_forward4(PoolT& pool, const Layer& L, const float* x, int ntok, const std::vector<std::vector<std::pair<int, float>>>& route, float* out, int mode,
                   const uint8_t* late_e = nullptr, const std::function<bool(int)>* bind_late = nullptr,
-                  const std::function<bool(int)>* down_late = nullptr)
+                  const std::function<bool(int)>* down_late = nullptr,
+                  const std::function<bool(int, int64_t, int64_t)>* wait_bytes = nullptr, int64_t off_u = 0, int64_t off_d = 0)
 {
     static Fwd4 F;
     F.L = &L; F.x = x; F.out = out; F.ntok = ntok; F.jobs.clear(); F.joff.clear(); F.jlate.clear(); F.bind = bind_late; F.down = down_late;
+    F.wait = late_e ? wait_bytes : nullptr; F.off_u = off_u; F.off_d = off_d;
     int nram = 0;
     for (int pass = 0; pass < (late_e ? 2 : 1); ++pass)
     {
@@ -889,8 +910,9 @@ void moe_forward4(PoolT& pool, const Layer& L, const float* x, int ntok, const s
     F.n_gu.assign(nj, 2 * F.nbg * F.ncg); F.n_down.assign(nj, F.nbd * F.ncd);
     for (int j = 0; j < nj; ++j) { F.c_prep[j].v.store(0, std::memory_order_relaxed); F.c_gu[j].v.store(0, std::memory_order_relaxed); F.c_act[j].v.store(0, std::memory_order_relaxed); F.c_down[j].v.store(0, std::memory_order_relaxed); F.c_bind[j].v.store(0, std::memory_order_relaxed); }
     F.units.clear();
-    // stage-major per job group: resident jobs [0, nram), then late jobs [nram, nj)
-    for (int grp = 0; grp < 2; ++grp)
+    // stage-major per job group: resident jobs [0, nram), then late jobs [nram, nj). Streaming: late jobs job-major in
+    // landing order (late_e[e] = 1 + rank), gate bands before up bands, so each unit's bytes land in the order taken
+    for (int grp = 0; grp < (F.wait ? 1 : 2); ++grp)
     {
         const int j0 = grp ? nram : 0, j1 = grp ? nj : nram;
         for (int j = j0; j < j1; ++j) for (int i = 0; i < F.jobs[j].m; ++i) for (int w = 0; w < 2; ++w) F.units.push_back({ U_PREP, uint8_t(w), uint16_t(j), uint16_t(i), 0 });
@@ -898,6 +920,19 @@ void moe_forward4(PoolT& pool, const Layer& L, const float* x, int ntok, const s
         for (int j = j0; j < j1; ++j) for (int b = 0; b < F.nbg; ++b) for (int c = 0; c < F.ncg; ++c) for (int w = 0; w < 2; ++w) F.units.push_back({ U_GU, uint8_t(w), uint16_t(j), uint16_t(b), uint16_t(c) });
         for (int j = j0; j < j1; ++j) for (int b = 0; b < BI; ++b) F.units.push_back({ U_ACT, 0, uint16_t(j), uint16_t(b), 0 });
         for (int j = j0; j < j1; ++j) for (int b = 0; b < F.nbd; ++b) for (int c = 0; c < F.ncd; ++c) F.units.push_back({ U_DOWN, 0, uint16_t(j), uint16_t(b), uint16_t(c) });
+    }
+    if (F.wait)
+    {
+        std::vector<int> lj;
+        for (int j = nram; j < nj; ++j) lj.push_back(j);
+        std::stable_sort(lj.begin(), lj.end(), [&](int a, int b) { return late_e[F.jobs[a].e] < late_e[F.jobs[b].e]; });
+        for (int j : lj)
+        {
+            for (int i = 0; i < F.jobs[j].m; ++i) for (int w = 0; w < 2; ++w) F.units.push_back({ U_PREP, uint8_t(w), uint16_t(j), uint16_t(i), 0 });
+            for (int w = 0; w < 2; ++w) for (int b = 0; b < F.nbg; ++b) for (int c = 0; c < F.ncg; ++c) F.units.push_back({ U_GU, uint8_t(w), uint16_t(j), uint16_t(b), uint16_t(c) });
+            for (int b = 0; b < BI; ++b) F.units.push_back({ U_ACT, 0, uint16_t(j), uint16_t(b), 0 });
+            for (int b = 0; b < F.nbd; ++b) for (int c = 0; c < F.ncd; ++c) F.units.push_back({ U_DOWN, 0, uint16_t(j), uint16_t(b), uint16_t(c) });
+        }
     }
     for (int b = 0; b < BH; ++b) F.units.push_back({ U_OUT, 0, 0, uint16_t(b), 0 });
     F.next.store(0, std::memory_order_relaxed);

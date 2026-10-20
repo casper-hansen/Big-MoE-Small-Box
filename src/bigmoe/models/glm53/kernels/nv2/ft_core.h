@@ -418,6 +418,31 @@ inline float quant_block_i16(const float* xt, int32_t* xq_blk /* 8 tile rows x 3
 // Thread pool (pinned, spinning; master = worker 0)
 // ------------------------------------------------------------------------------------------
 
+// AMD MONITORX / MWAITX waits (user mode): with g_mwx > 0 (GLM53_NV_LANE_MWX timer cycles) the CPU lane's spin-waits
+// sleep in C1 until the watched line is written (~0.1-0.4 us) or the timer expires, instead of spinning on PAUSE: the
+// lane cores share one voltage rail and power budget with each other, so waiting cores no longer cost the busy ones clock
+inline unsigned g_mwx = 0;
+__attribute__((target("mwaitx"))) inline void mwx_while_eq64(const void* p, uint64_t v)
+{
+    _mm_monitorx(const_cast<void*>(p), 0, 0);
+    if (__atomic_load_n(static_cast<const uint64_t*>(p), __ATOMIC_ACQUIRE) == v) _mm_mwaitx(2, 0, g_mwx);
+}
+__attribute__((target("mwaitx"))) inline void mwx_while_eq32(const void* p, int v)
+{
+    _mm_monitorx(const_cast<void*>(p), 0, 0);
+    if (__atomic_load_n(static_cast<const int*>(p), __ATOMIC_ACQUIRE) == v) _mm_mwaitx(2, 0, g_mwx);
+}
+__attribute__((target("mwaitx"))) inline void mwx_while_lt32(const void* p, int target)
+{
+    _mm_monitorx(const_cast<void*>(p), 0, 0);
+    if (__atomic_load_n(static_cast<const int*>(p), __ATOMIC_ACQUIRE) < target) _mm_mwaitx(2, 0, g_mwx);
+}
+__attribute__((target("mwaitx"))) inline void mwx_while_mask64(const void* p, uint64_t need)
+{
+    _mm_monitorx(const_cast<void*>(p), 0, 0);
+    if ((__atomic_load_n(static_cast<const uint64_t*>(p), __ATOMIC_ACQUIRE) & need) != need) _mm_mwaitx(2, 0, g_mwx);
+}
+
 struct Pool
 {
     int n = 1;
@@ -446,7 +471,8 @@ struct Pool
                     {
                         if (quit.load(std::memory_order_relaxed)) return;
                         // spin ~2 ms (covers the gap between MoE layers in decode), then nap
-                        if (++idle < 200000) _mm_pause(); else std::this_thread::sleep_for(std::chrono::microseconds(20));
+                        if (++idle < 200000) { if (g_mwx) mwx_while_eq64(&gen, seen); else _mm_pause(); }
+                        else std::this_thread::sleep_for(std::chrono::microseconds(20));
                     }
                     seen = g;
                     fn(ctx, w, n);
@@ -459,7 +485,8 @@ struct Pool
         fn = f; ctx = c; done.store(0, std::memory_order_relaxed);
         gen.fetch_add(1, std::memory_order_acq_rel);
         f(c, 0, n);
-        while (done.load(std::memory_order_acquire) != n - 1) _mm_pause();
+        int d;
+        while ((d = done.load(std::memory_order_acquire)) != n - 1) { if (g_mwx) mwx_while_eq32(&done, d); else _mm_pause(); }
     }
     void stop() { quit = true; for (auto& t : th) t.join(); }
 };

@@ -129,6 +129,24 @@ The prefill ring now takes its 128 slots from the RAM tier when a staged prefill
 
 With the AVX-512 VBMI CPU lane on top (last row of the decode-tuning table), `bigmoe verify` gives mode `nvme` 10.65 / 10.90 / 10.58 / 11.20 tok/s after 1k / 8k / 32k / 120k-token prompts (+33-36 % over the reference; prefill 118 / 811 / 875 / 870 tok/s) and byte-identical `nvme-exact` answers at 1k and 8k (7.67 / 7.79 tok/s).
 
+### Streaming NVMe experts into the CPU lane, and letting the lane clock up (2026-10-20)
+
+`nv2.timeline` now also times each layer against the last landing of any of its NVMe picks (demand reads and prefetches still in flight; the earlier demand-read split missed the latter) and counts the CPU lane's experts per call. 52-66 % of decode layers wait for at least one NVMe record and take 3.0-3.6 ms; the rest take ~1.35 ms. Two things stood out:
+
+- In the NVMe layers the CPU lane finished ~370 µs after the last record landed: the nine 1 MiB pieces of a record land almost together, and the lane then computed the whole expert.
+- The lane needed 441 µs per expert in place against 289 µs in `/cpu_bench`. Copy-engine DMA in both directions (`/cpu_bench_dma`) only slows the bench to 322 µs, but during decode the lane cores ran at 4.34 GHz instead of ~5.05: the main thread (spinning in the event wait for the next token) and the controller (polling the request ring) held core 0 at 5.4 GHz, and the cores share one voltage rail and power budget.
+
+| change | effect |
+|---|---|
+| streaming (`GLM53_NV_STREAM=1`): an NVMe pick for the CPU lane is bound when its read starts; each gate / up / down band of the lane waits only for the read pieces that hold its bytes (the reader keeps a landed-piece mask per record), and the late experts are processed one after another in landing order | the lane finishes 210-240 µs after the last landing instead of ~370; +2.5 % (four runs against two) |
+| 512 KiB decode read pieces instead of 1 MiB (`GLM53_NV_DPIECE_KB`) | finer streaming: 160-200 µs; ~+1 % |
+| the main thread sleeps on the token event (blocking CUDA event, `GLM53_LA_BLOCK`) and the controller waits for requests with MWAITX, AMD's user-mode monitor / wait (it wakes 0.13-0.4 µs after the write; `GLM53_NV_CTL_MWX`, timer 20,000 cycles, PAUSE spinning where the CPU lacks it) | lane cores 4.34 -> 4.82 GHz, 441 -> 414 µs per expert in place |
+| planner CPU cost per expert 0.32 -> 0.29 ms on VBMI CPUs (`TUNED_PLANNER_VBMI`) for the faster lane | the lane takes ~100 experts per token instead of ~89 (0.26: overloaded, slower) |
+
+All exact: they change when bytes are read and who waits how, not the math of any expert. One build, the old switches set back by environment, interleaved, three runs each (384 new tokens, greedy, five prompts): 52.13 / 53.13 / 52.12 -> 53.88 / 54.27 / 53.79 tok/s summed (+2.9 %); copy 8.54 -> 8.84, prose 10.90 -> 11.33, story 11.74 -> 12.00, code 9.79 -> 10.09, list 11.50 -> 11.72 tok/s. `bigmoe verify`: mode `nvme` decodes at 11.32 / 11.05 / 11.21 / 11.58 tok/s after 1k / 8k / 32k / 120k-token prompts (+38-43 % over the reference; prefill unchanged at 118 / 795 / 871 / 873 tok/s), and `nvme-exact` answers stay byte-identical at 1k and 8k.
+
+Tried and not kept: caps on the reader's bytes in flight (prefetch 2 / 3 / 9 MB, demand 4 / 6 MB: equal or worse); a cap on the pieces of one record in flight (`GLM53_NV_TRACK_QD`, off: 6 equal, 3 lands records 100-250 µs later); a planner cost for the streamed tail (`GLM53_NV_CBT`: within noise, the NVMe picks the GPU still gets are ones the planner sends there because the lane is busier); MWAITX in the CPU lane's own waits (`GLM53_NV_LANE_MWX`, off: no further clock gain); and deeper prefetch into the layer-ahead guess (the experts that end up as demand reads sit at median rank 13-16 of it, so catching them takes ~5 extra reads per layer at ~5 % precision). A GPU profile (`/gpu_prof`) puts the MoE kernels at ~214 µs per layer (68 of them the shared expert) and the attention GEMVs at ~77 % of DRAM bandwidth: little is left in the kernels. What remains is the SSD: the layers with an NVMe pick spend ~2.2-3.0 ms waiting for their records.
+
 ## How it works
 
 `AutoBox(model)` resolves the model to a backend: an alias, a Hugging Face repo id, or a local checkpoint directory, pinned to a commit. `prepare()` (and `from_pretrained`, `start`) runs every step that is not done yet. Each step remembers its result, so the check is instant once everything is in place:
@@ -212,7 +230,7 @@ The 11 sparse-attention (MLA/DSA) layers keep ~17 KB of KV cache per token in VR
 
 The three limits are within ~15 % of each other, so fixing one moves the bottleneck. Today's speed is about half of what they allow, because each of the 42 MoE layers waits for its slowest lane. A second NVMe in RAID0 or 128 GB of RAM would lift the ceiling to ~20 tok/s; more CPU cores help only together with one of those (estimates, not measured).
 
-Measured at 128k context on chat (2026-10-20): the useful NVMe reads per token are 45-50 on prose and 60-70 on code (prefetches included), so at 1.45 ms per record the SSD alone caps decode at ~14 tok/s on prose and ~10-11 on code, against 9.9-10.8 and 7.8-9.1 tok/s now. Offline simulation over decode traces puts the best practical replacement policy only 6 % below LRU in misses, so the remaining headroom is in overlapping the reads better and in RAM capacity (every +5 % of RAM-tier slots removes ~11 % of the misses in the LRU simulation).
+Measured at 128k context on chat (2026-10-20): the useful NVMe reads per token are 45-50 on prose and 60-70 on code (prefetches included), so at 1.45 ms per record the SSD alone caps decode at ~14 tok/s on prose and ~10-11 on code, against 9.9-10.8 and 7.8-9.1 tok/s then. With the RAM-tier, VBMI and streaming changes since, prose reads ~50 and code ~58 records per token (caps ~13.8 and ~11.9 tok/s) and decodes at ~11.3 and ~10.1 tok/s: 82-85 % of what the SSD allows. Offline simulation over decode traces puts the best practical replacement policy only 6 % below LRU in misses, so the remaining headroom is in overlapping the reads better and in RAM capacity (every +5 % of RAM-tier slots removes ~11 % of the misses in the LRU simulation).
 
 ## Adding a model
 
@@ -247,4 +265,4 @@ The shared components are model-agnostic: `hub` (pinned, verified downloads), `s
 
 License: Apache-2.0 (`LICENSE`). The engine code from glm-flash-lite keeps its MIT license (`LICENSE.glm-flash-lite`); the weights carry their own.
 
-Tests: `uv pip install -e ".[dev]" && .venv/bin/python -m pytest` (29 tests, ~6 s, no GPU).
+Tests: `uv pip install -e ".[dev]" && .venv/bin/python -m pytest` (31 tests, ~6 s, no GPU).
