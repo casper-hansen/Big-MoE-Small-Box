@@ -37,6 +37,8 @@ EXLLAMAV3 = SourceBuild("exllamav3", "1.5.1", "https://codeload.github.com/turbo
 # lane. Tuned on the RTX 3090 box (2026-10-19, C1 chat): cb 0.165 -> 9.5, 0.30 -> 10.1, 0.40 -> 10.1, 0.65 -> 9.7 tok/s.
 TUNED_PLANNER = "0.17,0.023,0.38,0.145,0.40,0.10,0.40,0.12,0.395,0.75"
 MODES = ("nvme", "nvme-exact")
+# speculation: "ngram" drafts tokens from the context (prompt lookup) and verifies them with the target model (see README).
+SPECULATION = ("none", "ngram")
 
 
 @dataclasses.dataclass
@@ -50,10 +52,17 @@ class GLM53Options:
     cpus: object = "auto"  # or a CpuLayout, or {"main", "controller", "lane", "readers"}
     slim: bool = True
     verify_weights: bool = True
+    speculation: str = "none"  # "ngram": n-gram drafts from the context, verified by the target (off by default)
+    ngram_min: int = 2          # speculation="ngram": shortest context match that yields a draft
+    draft_tokens: int = 5       # speculation="ngram": drafted tokens verified per step
 
     def validate(self):
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
+        if self.speculation not in SPECULATION:
+            raise ValueError(f"speculation must be one of {SPECULATION}, got {self.speculation!r}")
+        if self.ngram_min < 1 or self.draft_tokens < 1:
+            raise ValueError("ngram_min and draft_tokens must be at least 1")
         if self.cache_quant is not None and not 2 <= int(self.cache_quant) <= 8:
             raise ValueError(f"cache_quant must be 2..8 bits or None, got {self.cache_quant!r}")
         if int(self.chunk_size) <= 0 or int(self.max_batch_size) <= 0:
@@ -280,6 +289,8 @@ class GLM53(ModelBackend):
                 *mode_args, *small]
         if o.cache_quant:
             argv += ["-cq", str(o.cache_quant)]
+        if o.speculation == "ngram":   # n-gram drafts + exact verification; user extra args come after and can override
+            argv += ["-ngram", str(o.ngram_min), "-ndt", str(o.draft_tokens)]
         argv += ["--host", box.host, "--port", str(box.port), "--served-name", box.served_name, *box.extra_args]
         # ambient engine variables would silently change the configuration: only the ones set here reach the server
         unset = tuple(v for v in os.environ if v.startswith(("GLM53_", "EXL3_", "EXLLAMAV3_")) and v not in env)

@@ -68,3 +68,17 @@ def test_overrides_and_ambient_env(tmp_path, monkeypatch):
 def test_small_host_budget(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch, "nvme", memory_gb=20)
     assert spec.env["GLM53_NV_THREADS"] == "48" and spec.argv[spec.argv.index("-rcs") + 1] == "1"
+
+
+def test_speculation_option(tmp_path, monkeypatch):
+    monkeypatch.setattr(system, "meminfo", lambda: {"MemTotal": 60.9, "MemAvailable": 50.0})
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme")
+    assert "-ngram" not in spec.argv and "-ndt" not in spec.argv   # off by default
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram")
+    assert spec.argv[spec.argv.index("-ngram") + 1] == "2" and spec.argv[spec.argv.index("-ndt") + 1] == "5"
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram", ngram_min=3, draft_tokens=4)
+    assert spec.argv[spec.argv.index("-ngram") + 1] == "3" and spec.argv[spec.argv.index("-ndt") + 1] == "4"
+    with pytest.raises(ValueError):
+        spec_for(tmp_path, monkeypatch, "nvme", speculation="dflash")
+    with pytest.raises(ValueError):
+        spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram", draft_tokens=0)

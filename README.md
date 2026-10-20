@@ -107,7 +107,7 @@ These numbers were measured before the engine became this package. `bigmoe verif
 | `model` | | alias, Hugging Face repo id, or local checkpoint directory |
 | `revision` | `3.05bpw` | only the validated quant; the repo's 2.05 / 4.05 bpw and self-calibrated branches are refused |
 | `context` | 131072 | tokens; multiple of 256 |
-| `memory_gb` | 52 | cgroup cap of the server (hosts under 60 GiB: MemTotal - 8) |
+| `memory_gb` | 56 | cgroup cap of the server (60 GiB+ hosts: 56, the measured best with 4.8 GiB of host headroom at peak; smaller hosts: MemTotal - 8) |
 | `host`, `port` | 127.0.0.1, 30000 | no auth: keep it on localhost |
 | `home` | `~/.cache/bigmoe` | must support `O_DIRECT` |
 | `runtime` | `"managed"` | `"current"`, or the path of an interpreter that already has the packages |
@@ -115,8 +115,23 @@ These numbers were measured before the engine became this package. `bigmoe verif
 | `mode` | `"nvme"` | `"nvme-exact"`: every expert on the GPU, bit-exact with stock exllamav3, 15-20 % slower |
 | `cache_quant` | `None` | KV-cache bits; `8` for 512k context |
 | `chunk_size` | 8192 | prefill chunk; `4096` for 512k context |
-| `vram_expert_slots` | 1376 | leaves room for a desktop on the GPU; `None` uses all free VRAM (1,408) |
+| `vram_expert_slots` | `None` | all free VRAM (1,408 expert slots on a 24 GB card); an integer caps the cache, e.g. 1376 leaves room for a desktop on the GPU |
+| `speculation`, `ngram_min`, `draft_tokens` | `"none"`, 2, 5 | `speculation="ngram"` drafts tokens from the context and verifies them with the target model; off by default, see below |
 | `planner_cost`, `cpus`, `max_batch_size`, `slim`, `verify_weights` | | see `bigmoe models` |
+
+## Optional: n-gram speculation
+
+`bigmoe start -o speculation=ngram` drafts tokens by matching the last `ngram_min` tokens against the context (prompt lookup, no draft model) and verifies `draft_tokens` drafts per step with the target model. It is off by default, and we have not found a workload where it is faster on this box. Measured with single runs of 384 new tokens:
+
+| prompt | mode | `none` | `ngram` |
+|---|---|---|---|
+| copy a 178-line source file | `nvme` | 7.31 tok/s | 7.24 tok/s |
+| copy a 178-line source file | `nvme-exact` | 5.78 tok/s | 2.54 tok/s |
+| MoE explanation (prose) | `nvme-exact` | 7.37 tok/s | 4.58 tok/s |
+
+Verification touches more cold experts per accepted token than single-token steps (77 vs 54 NVMe picks per token on the copy prompt in `nvme` mode), so the extra accepted tokens do not translate into speed here.
+
+Outputs are not bit-identical to `none`. On the copy prompt the output matched byte for byte. On the prose prompt it matched for 370 characters and then differed at a near-tie token: verification runs the same weights in different GEMM shapes, and fp16 rounding can flip a near-tie. The `none` path reproduces its own output exactly across runs.
 
 ## Context length
 
