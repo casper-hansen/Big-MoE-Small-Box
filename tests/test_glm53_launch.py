@@ -20,8 +20,9 @@ class FakeRuntime:
         return {s.name: Path(f"/k/{s.name}-key") for s in specs}
 
 
-def spec_for(tmp_path, monkeypatch, mode, **kw):
+def spec_for(tmp_path, monkeypatch, mode, flags=frozenset({"avx2", "fma", "f16c"}), **kw):
     monkeypatch.setattr(system, "systemd_scope_available", lambda: True)
+    monkeypatch.setattr(system, "cpu_flags", lambda: set(flags))
     box = AutoBox("glm-5.3-flash", home=tmp_path, mode=mode,
                   cpus={"main": "0", "controller": 6, "lane": "1-5", "readers": "7-11"}, **kw)
     box.__dict__["runtime"] = FakeRuntime()
@@ -66,6 +67,16 @@ def test_overrides_and_ambient_env(tmp_path, monkeypatch):
     assert spec.env["GLM53_NV_POL"] == "1,2,3"
     assert "GLM53_EC_MAX_SLOTS" not in spec.env
     assert "GLM53_NV_THREADS" in spec.unset
+
+
+def test_vbmi_planner(tmp_path, monkeypatch):
+    # AVX-512 VBMI CPUs: the CPU lane is faster, so the default planner gives it more experts; explicit costs win
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", flags=glm53.VBMI_FLAGS | {"avx2", "fma", "f16c"})
+    assert spec.env["GLM53_NV_POL"] == glm53.TUNED_PLANNER_VBMI
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", flags=glm53.VBMI_FLAGS | {"avx2", "fma", "f16c"}, planner_cost="1,2,3")
+    assert spec.env["GLM53_NV_POL"] == "1,2,3"
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme")
+    assert spec.env["GLM53_NV_POL"] == glm53.TUNED_PLANNER
 
 
 def test_small_host_budget(tmp_path, monkeypatch):

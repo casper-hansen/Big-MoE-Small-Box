@@ -57,6 +57,13 @@ def _cpus(spec):
     return out
 
 
+def _vbmi_on():
+    try:
+        return bool(ext().cpu_knob("vbmi", -1))
+    except Exception:
+        return False
+
+
 def ext():
     global _EXT
     if _EXT is None:
@@ -507,6 +514,11 @@ class Nv2:
                     cpu = ext().cpu_forward(li, x.float(), sel, w, mode).double()
                     k = {1: "EXACT", 0: "AFFINE", 2: "I16"}[mode]
                     out[k] = max(out.get(k, 0.0), round(float((cpu - ref).norm() / ref.norm()), 6))
+                    if mode == 2 and _vbmi_on():   # the AVX-512 VBMI I16 kernel must match the AVX2 one bit for bit
+                        ext().cpu_knob("vbmi", 0)
+                        avx2 = ext().cpu_forward(li, x.float(), sel, w, mode).double()
+                        ext().cpu_knob("vbmi", 1)
+                        out["vbmi_diff"] = max(out.get("vbmi_diff", 0.0), float((cpu - avx2).abs().max()))
         self.bounce_t.zero_()
         torch.cuda.synchronize(self.dev)
         return out

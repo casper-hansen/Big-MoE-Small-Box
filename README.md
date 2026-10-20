@@ -96,6 +96,7 @@ Where a decode layer's time goes (`/stats` -> `nv2.timeline`, per-layer means ov
 | the CPU lane starts an NVMe expert once its gate and up bytes have landed; the down projection waits for the rest | +1.6 % |
 | NVMe reader priorities: demand reads first (FIFO, so a layer's records land one after another), prefetches newest first and only while no demand read is queued and less than 6 MB is in flight, prefill staging last; a queued prefetch that a layer demands is promoted | demand reads land ~10 % sooner, ~+1 % |
 | write-backs drained when each layer's copy kernel finishes and landing slots restocked from the write-back thread | neutral on plain decode, needed by verify windows |
+| CPU lane on AVX-512 VBMI CPUs (Zen 4, Ice Lake and later): the trellis tiles are decoded with `vpermt2b` + `vpmultishiftqb` and summed with `vpdpwssd` (`GLM53_NV_CPU_VBMI=0` turns it off). Integer sums are identical to the AVX2 path (0 mismatches over a real expert; selftest `vbmi_diff` 0). The decode is 1.4-1.5x faster per tile, 15 % per expert in place, so the planner's CPU cost per expert goes 0.40 -> 0.32 ms (`TUNED_PLANNER_VBMI`) | +1.6 % (two runs, five prompts) |
 
 Old switches vs the new defaults, same server build, same prompt order, 384 new tokens, greedy, thinking off, two runs each:
 
@@ -125,6 +126,8 @@ Every NVMe read that a RAM-tier hit avoids saves ~1.45 ms of the SSD, so RAM-tie
 | both | +469 | 51.39 (+7.0 %) | 60.4 |
 
 The prefill ring now takes its 128 slots from the RAM tier when a staged prefill starts (free slots first, else the least recently used experts, which that prefill then reads from NVMe like any other cold expert) and returns them when it ends. The recurrent prefix cache holds ~143 MB checkpoints for resuming a prompt that shares a prefix with an earlier one: 1 GiB keeps the 7 most recent (4 GiB kept 28). The end-of-turn tail checkpoints that resume a follow-up question live outside it and are now reserved for (0.6 GiB). `prefix_cache_gb=4` restores the old depth for workloads that branch from early points of long documents. `bigmoe verify` with both: mode `nvme` decodes at 10.46 / 10.55 / 10.64 / 10.73 tok/s after 1k / 8k / 32k / 120k-token prompts (+28-34 % over the reference; prefill 118 / 811 / 876 / 875 tok/s), mode `nvme-exact` at 7.61 / 7.74 tok/s with byte-identical answers. With both as defaults (RAM tier 5,655 slots after the tail reserve), two runs each against the scheduling-only defaults above: copy 7.81 -> 8.36, prose 9.96 -> 10.66, story 10.79 -> 11.55, code 9.03 -> 9.67, list 10.40 -> 11.00 tok/s (+6.8 %; +12.9 % over both steps). After 32k and 120k-token prompts the scope peaked at 54.8 of 56 GiB, and prefill got slightly faster (867-872 tok/s at 32k-120k, more experts already in RAM). Tried and dropped: moving a prefetch that its target layer did not pick to the cold end of the LRU (most of them are picked at later tokens: NVMe reads +7 %).
+
+With the AVX-512 VBMI CPU lane on top (last row of the decode-tuning table), `bigmoe verify` gives mode `nvme` 10.65 / 10.90 / 10.58 / 11.20 tok/s after 1k / 8k / 32k / 120k-token prompts (+33-36 % over the reference; prefill 118 / 811 / 875 / 870 tok/s) and byte-identical `nvme-exact` answers at 1k and 8k (7.67 / 7.79 tok/s).
 
 ## How it works
 
@@ -174,14 +177,14 @@ A verify window also dedupes experts across its tokens: on the copy prompt a tok
 
 | prompt | `none` | `ngram` | accepted tokens per step |
 |---|---|---|---|
-| copy a 178-line source file | 7.79 tok/s | 9.88 tok/s (+27 %) | 4.97 |
-| add docstrings to a 121-line module (output the whole file) | 6.92 | 7.83 (+13 %) | 2.14 |
-| CSV (30 rows) to JSON | 9.55 | 9.40 | 1.00 |
-| MoE explanation (prose) | 10.30 | 9.68 | 1.00 |
-| short story | 10.81 | 10.66 | 1.00 |
-| LRU cache module (code) | 8.96 | 8.90 | 1.00 |
+| copy a 178-line source file | 8.34 tok/s | 10.77 tok/s (+29 %) | 4.97 |
+| add docstrings to a 121-line module (output the whole file) | 7.52 | 8.54 (+14 %) | 2.14 |
+| CSV (30 rows) to JSON | 10.18 | 9.93 (-2 %) | 1.00 |
+| MoE explanation (prose) | 10.96 | 10.74 (-2 %) | 1.00 |
+| short story | 11.87 | 11.33 (-5 %) | 1.00 |
+| LRU cache module (code) | 9.69 | 9.49 (-2 %) | 1.00 |
 
-So turn it on for work that copies the context (editing files, quoting, reformatting); elsewhere it costs 0-6 % in these single runs (32 fewer cache slots, and the caches leave a verify-heavy answer in a slightly worse state for the next one).
+Single runs of 384 new tokens, one server per column, current defaults (commit 1812368); the table before that commit, with the smaller RAM tier, had copy 7.79 / 9.88 and prose 10.30 / 9.68. So turn it on for work that copies the context (editing files, quoting, reformatting); elsewhere it costs 2-5 % in these single runs (32 fewer cache slots, and the caches leave a verify-heavy answer in a slightly worse state for the next one).
 
 Outputs are not bit-identical to `none`. On the copy prompt the output matched byte for byte. On the prose prompt it matched for 370 characters and then differed at a near-tie token: verification runs the same weights in different GEMM shapes, and fp16 rounding can flip a near-tie. The `none` path reproduces its own output exactly across runs.
 

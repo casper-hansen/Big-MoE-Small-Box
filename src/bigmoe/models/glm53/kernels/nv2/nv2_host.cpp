@@ -31,8 +31,9 @@ static inline void cpu_kern_init()
     const char* s = getenv("GLM53_NV_CPU_KERN");
     g_cpu_kern = s && *s ? atoi(s) : 0;
     n135::configure_env(); n135::init_p16();
-    fprintf(stderr, "[nv2] CPU lane kernel: %s (rg %d cg %d rd %d cd %d bandmaxm %d pfr %d p16 %d rt %d merge %d)\n", g_cpu_kern == 1 ? "n135 v4" : "ft_core moe_forward",
-            n135::K_.rg, n135::K_.cg, n135::K_.rd, n135::K_.cd, n135::K_.bandmaxm, n135::K_.pfr, n135::K_.kern, n135::K_.rt, n135::K_.merge);
+    fprintf(stderr, "[nv2] CPU lane kernel: %s (rg %d cg %d rd %d cd %d bandmaxm %d pfr %d p16 %d rt %d merge %d vbmi %d)\n", g_cpu_kern == 1 ? "n135 v4" : "ft_core moe_forward",
+            n135::K_.rg, n135::K_.cg, n135::K_.rd, n135::K_.cd, n135::K_.bandmaxm, n135::K_.pfr, n135::K_.kern, n135::K_.rt, n135::K_.merge,
+            int(n135::vbmi_ok));
 }
 static inline void cpu_moe_forward(Pool& pool, const Layer& L, const float* x, int ntok, const std::vector<std::vector<std::pair<int, float>>>& route,
                                    float* out, int mode, PhaseTimes* pt = nullptr)
@@ -1827,6 +1828,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     });
     m.def("cpu_knob", [](std::string k, int v) {   // n135 CPU-lane knobs at runtime (bench / A-B); returns the old value
         cpu_kern_init();
+        if (k == "vbmi") { const int old = n135::vbmi_ok; if (v >= 0) n135::vbmi_ok = v && __builtin_cpu_supports("avx512vbmi"); return old; }
         int* p = k == "rt" ? &n135::K_.rt : k == "kern" ? &n135::K_.kern : k == "pfr" ? &n135::K_.pfr : k == "rg" ? &n135::K_.rg :
                  k == "cg" ? &n135::K_.cg : k == "rd" ? &n135::K_.rd : k == "cd" ? &n135::K_.cd : k == "bandmaxm" ? &n135::K_.bandmaxm :
                  k == "merge" ? &n135::K_.merge : nullptr;

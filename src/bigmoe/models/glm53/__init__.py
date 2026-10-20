@@ -39,6 +39,11 @@ EXLLAMAV3 = SourceBuild("exllamav3", "1.5.1", "https://codeload.github.com/turbo
 # behind each other (nvdeep 0.395 -> 1.45, nvlat 0.12 -> 0.25). With the engine's zero-copy cost for landed NVMe picks
 # (tnzc 0.6 ms in the MoE kernel vs ~0.39 ms on the CPU lane) the late NVMe picks go to the CPU: +3-5 % decode.
 TUNED_PLANNER = "0.17,0.023,0.38,0.145,0.40,0.10,0.40,0.25,1.45,0.75"
+# CPUs with AVX-512 VBMI + VNNI (Zen 4, Ice Lake and later) run the CPU lane's trellis decode with vpermt2b /
+# vpmultishiftqb (ft_n135.h): an expert takes 0.32 instead of 0.38 ms on the 7600X's 5 lane cores, so the lane takes
+# more experts (cb 0.40 -> 0.32). Used when planner_cost is left at TUNED_PLANNER.
+TUNED_PLANNER_VBMI = "0.17,0.023,0.38,0.145,0.32,0.10,0.40,0.25,1.45,0.75"
+VBMI_FLAGS = {"avx512f", "avx512bw", "avx512vl", "avx512vbmi", "avx512_vnni"}
 MODES = ("nvme", "nvme-exact")
 # speculation: "ngram" drafts tokens from the context (prompt lookup) and verifies them with the target model (see README).
 SPECULATION = ("none", "ngram")
@@ -252,6 +257,12 @@ class GLM53(ModelBackend):
         system.check_odirect(self.store(box).bin)
         return warnings
 
+    @staticmethod
+    def planner(o) -> str:
+        if o.planner_cost == TUNED_PLANNER and VBMI_FLAGS <= system.cpu_flags():
+            return TUNED_PLANNER_VBMI
+        return o.planner_cost
+
     def launch_spec(self, box) -> LaunchSpec:
         """Same environment and arguments as the measured serve.sh (glm-flash-lite's docker/entrypoint.sh, modes nvme /
         nvme-exact); tests/test_glm53_launch.py checks it against the reference runs."""
@@ -267,7 +278,7 @@ class GLM53(ModelBackend):
             reserve, k, mode_args = "1.5", "1", ["-ambs", "4"]
             env.update(GLM53_NV="2", GLM53_NV_CPU="1", GLM53_K_FTSPLIT="0", GLM53_K_OVL="0", GLM53_NV_VRING="24",
                        GLM53_NV_PREFETCH="1", GLM53_MAX_RQ_TOKENS="4096", GLM53_NV_CPU_KERN="1", GLM53_LA="1",
-                       GLM53_NV_PUBFAST="1", GLM53_NV_PFSIDE="1", GLM53_LA_BTTRIM="1", GLM53_NV_POL=o.planner_cost)
+                       GLM53_NV_PUBFAST="1", GLM53_NV_PFSIDE="1", GLM53_LA_BTTRIM="1", GLM53_NV_POL=self.planner(o))
         env["GLM53_EC_STAGE_MIN"] = "512"
         env["GLM53_NV_STORE"] = str(store.bin)
         for var in ("GLM53_K_HCFUSE", "GLM53_K_FTSPLIT", "GLM53_K_OVL"):

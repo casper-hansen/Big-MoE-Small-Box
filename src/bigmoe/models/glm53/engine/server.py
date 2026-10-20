@@ -621,13 +621,17 @@ async def router_bias(path: str):
 
 
 @app.get("/cpu_bench")
-async def cpu_bench(n: int = 20, k: int = 2, m: int = 1, li: int = 10, mode: int = -1, rt: int = -1):
-    """CPU-lane forward speed on RAM-resident experts of layer li (server must be idle): k experts x m tokens."""
+async def cpu_bench(n: int = 20, k: int = 2, m: int = 1, li: int = 10, mode: int = -1, rt: int = -1, vbmi: int = -1,
+                    knobs: str = ""):
+    """CPU-lane forward speed on RAM-resident experts of layer li (server must be idle): k experts x m tokens.
+    knobs: extra n135 knobs for this call only, e.g. "rg=16,rd=8"."""
     from . import nv2
     while len(G["gen"].jobs):
         await asyncio.sleep(0.05)
     e = nv2.ext()
     old_rt = e.cpu_knob("rt", rt)
+    old_vb = e.cpu_knob("vbmi", vbmi)
+    old_kn = {kv.split("=")[0]: e.cpu_knob(kv.split("=")[0], int(kv.split("=")[1])) for kv in knobs.split(",") if "=" in kv}
     ks = e.state()[1].numpy()
     E = nv2.NV.E
     res = [x for x in range(E) if ks[li * E + x] == 2][:k]
@@ -640,8 +644,11 @@ async def cpu_bench(n: int = 20, k: int = 2, m: int = 1, li: int = 10, mode: int
         out = e.cpu_forward(li, x, sel, w, mode)
     dt = (time.perf_counter() - t0) / n
     e.cpu_knob("rt", old_rt)
+    vb = e.cpu_knob("vbmi", old_vb)
+    for kk, vv in old_kn.items():
+        e.cpu_knob(kk, vv)
     return JSONResponse({"ms_per_call": round(dt * 1e3, 3), "ms_per_expert": round(dt * 1e3 / max(1, len(res)), 3),
-                         "experts": len(res), "tokens": m, "rt": e.cpu_knob("rt", -1) if rt < 0 else rt,
+                         "experts": len(res), "tokens": m, "rt": e.cpu_knob("rt", -1) if rt < 0 else rt, "vbmi": vb,
                          "out_norm": float(out.norm())})
 
 

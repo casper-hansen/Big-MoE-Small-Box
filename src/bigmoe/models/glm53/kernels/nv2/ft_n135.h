@@ -38,7 +38,9 @@ struct Knobs
     int i16max = 2;      // auto mode: I16 when every expert has <= i16max tokens, else AFFINE (ft_core rule: 2)
     int merge = 1;       // engine: 1 = RAM and NVMe->CPU picks of a job in ONE forward (late-bound NVC jobs)
     int bandmaxm = 1;    // use the rg/cg/rd/cd band shapes only when the call's max tokens per job <= bandmaxm
-    int rt = 0;          // 1: I16 units keep a tile's accumulators in registers over each 8-row scale block (rt2; p16: m = 1 only)
+    int rt = 0;          // 1: I16 units keep a tile's accumulators in registers over each 8-row scale block (rt2; p16: m = 1 only).
+                         // p16 ignores it when the VBMI decode is on (rt = 1 used to select the AVX2 register path
+                         // there: 0.345-0.373 ms per expert in place vs 0.317 with VBMI)
 };
 inline Knobs K_;
 
@@ -64,8 +66,41 @@ alignas(32) inline int32_t SHL[8];
 alignas(32) inline uint8_t CTRLP[32][32];
 constexpr int win_lo(int g) { return g == 0 ? -1 : (4 * ((3 * g - 2) / 4) < 80 ? 4 * ((3 * g - 2) / 4) : 80); }
 alignas(32) inline uint8_t CTRLS[32][32];   // shared windows: group g decoded from the window of group (g & ~1)
+// AVX-512 VBMI decode (Zen 4 / Ice Lake+): per 32 weights (4 trellis groups = one p16 C step) ONE vpermt2b gathers the
+// 8 source bytes of every 4-state qword from the 96-byte tile (big-endian bit order) and ONE vpmultishiftqb cuts the
+// 16-bit states out at their bit offsets, instead of 4 window loads + 4 pshufb + 2 srlv + 2 sllv + 2 blends. The states,
+// the hash and the int16 sums are identical to pair_sums; vpdpwssd accumulates both halves of the C step in 16 lanes,
+// folded (low + high 8, exact int32) before each 8-row scale flush, so the per-lane int32 sums equal the AVX2 path's.
+alignas(64) inline uint8_t VB_PIDX[8][64];   // per C: vpermt2b indices (tile memory bytes)
+alignas(64) inline uint8_t VB_MSH[8][64];    // per C: vpmultishiftqb bit offsets
+inline bool vbmi_ok = false;                 // the CPU has AVX512 VBMI + VNNI, unless GLM53_NV_CPU_VBMI=0
+inline void init_vbmi()
+{
+    for (int C = 0; C < 8; ++C)
+        for (int m = 0; m < 8; ++m)
+        {
+            // output qword m = 32-bit lanes 2m, 2m + 1: weights j0, j0 + 1 of groups gA (low halves) and gA + 1 (high)
+            const int gA = 4 * C + (m < 4 ? 0 : 2), j0 = 2 * (m & 3);
+            const int PA = 24 * gA + 3 * j0 - 13;                   // stream bit of the first state (state_scalar)
+            const int qs = PA >= 0 ? PA / 8 : -((-PA + 7) / 8);
+            for (int i = 0; i < 8; ++i) VB_PIDX[C][8 * m + i] = uint8_t(mem_of_stream(qs + 7 - i));
+            const int st[4][2] = { { gA, j0 }, { gA + 1, j0 }, { gA, j0 + 1 }, { gA + 1, j0 + 1 } };
+            for (int k = 0; k < 4; ++k)
+            {
+                const int r = 24 * st[k][0] + 3 * st[k][1] - 13 - 8 * qs;
+                if (r < 0 || r > 48) { fprintf(stderr, "n135 vbmi table error C=%d m=%d\n", C, m); exit(1); }
+                VB_MSH[C][8 * m + 2 * k] = uint8_t(48 - r);
+                VB_MSH[C][8 * m + 2 * k + 1] = uint8_t(56 - r);
+            }
+        }
+    const char* e = getenv("GLM53_NV_CPU_VBMI");
+    vbmi_ok = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl")
+              && __builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vnni") && !(e && atoi(e) == 0);
+}
+
 inline void init_p16()
 {
+    init_vbmi();
     for (int j = 0; j < 8; ++j) SHL[j] = (3 + 3 * j) % 8;
     for (int pass = 0; pass < 2; ++pass)
     for (int g = 0; g < 32; ++g)
@@ -208,6 +243,70 @@ inline void prep_block_v(const float* x, const uint16_t* suh, float* xt)
         _mm256_storeu_ps(xt + 8 * k, _mm256_cvtph_ps(_mm256_cvtps_ph(_mm256_mul_ps(r[k], had), _MM_FROUND_TO_NEAREST_INT)));
 }
 
+// VBMI rows of a KIND 3 rect: same rows, tiles, prefetch and 8-row flushes as the AVX2 loop in rect(), accumulators in
+// 16 lanes per (C step, token) (acc16), folded to the AVX2 lane sums at each flush.
+#define N135_VBMI_TARGET __attribute__((target("avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")))
+template <int M>
+N135_VBMI_TARGET void rect_rows_vbmi(const uint8_t* base, size_t row_stride, int r0, int R, int C, int kt,
+                                     const void* const* xin, const float* const* qs, float* accf, int32_t* acc16,
+                                     int lines, int pfr)
+{
+    const __m512i c1 = _mm512_set1_epi16(short(MUL1 & 0xffff)), c2 = _mm512_set1_epi16(short(MUL1 >> 16));
+    const __m512i one8 = _mm512_set1_epi8(1);
+    auto pf = [&](const uint8_t* q) {
+        const char* c = reinterpret_cast<const char*>(q);
+        if (K_.pfhint == 0) for (int l = 0; l < lines; ++l) _mm_prefetch(c + l * 64, _MM_HINT_T0);
+        else if (K_.pfhint == 1) for (int l = 0; l < lines; ++l) _mm_prefetch(c + l * 64, _MM_HINT_T1);
+        else for (int l = 0; l < lines; ++l) _mm_prefetch(c + l * 64, _MM_HINT_NTA);
+    };
+    if (pfr > 0 && K_.pfpro) for (int r = r0; r < std::min(r0 + pfr, r0 + R); ++r) pf(base + size_t(r) * row_stride);
+    for (int r = r0; r < r0 + R; ++r)
+    {
+        const uint8_t* p = base + size_t(r) * row_stride;
+        if (pfr > 0 && r + pfr < kt) pf(p + size_t(pfr) * row_stride);
+        __m512i x[M];
+        for (int i = 0; i < M; ++i) x[i] = _mm512_loadu_si512(static_cast<const int16_t*>(xin[i]) + size_t(r) * 32);
+        #pragma GCC unroll 1
+        for (int t = 0; t < C; ++t)
+        {
+            const uint8_t* tile = p + t * TILE_BYTES;
+            const __m512i ta = _mm512_loadu_si512(tile);
+            const __m512i tb = _mm512_maskz_loadu_epi8(0xFFFFFFFFull, tile + 64);   // bytes 64..95: never past the tile
+            int32_t* a16 = acc16 + size_t(t) * 128 * M;
+            #pragma GCC unroll 8
+            for (int c = 0; c < 8; ++c)
+            {
+                const __m512i src = _mm512_permutex2var_epi8(ta, _mm512_load_si512(VB_PIDX[c]), tb);
+                const __m512i st = _mm512_multishift_epi64_epi8(_mm512_load_si512(VB_MSH[c]), src);
+                const __m512i lo = _mm512_mullo_epi16(st, c1);
+                const __m512i hi = _mm512_add_epi16(_mm512_mulhi_epu16(st, c1), _mm512_mullo_epi16(st, c2));
+                const __m512i sm = _mm512_add_epi16(_mm512_maddubs_epi16(lo, one8), _mm512_maddubs_epi16(hi, one8));
+                #pragma GCC unroll 8
+                for (int i = 0; i < M; ++i)
+                {
+                    int32_t* q = a16 + (c * M + i) * 16;
+                    _mm512_store_si512(q, _mm512_dpwssd_epi32(_mm512_load_si512(q), sm, x[i]));
+                }
+            }
+        }
+        if ((r & 7) == 7)
+            for (int i = 0; i < M; ++i)
+            {
+                const __m256 sc = _mm256_set1_ps(qs[i][r >> 3]);
+                for (int t = 0; t < C; ++t)
+                    for (int c = 0; c < 8; ++c)
+                    {
+                        int32_t* q = acc16 + size_t(t) * 128 * M + (c * M + i) * 16;
+                        const __m512i v = _mm512_load_si512(q);
+                        const __m256i f = _mm256_add_epi32(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1));
+                        float* af = accf + size_t(t) * 64 * M + (c * M + i) * 8;
+                        _mm256_store_ps(af, _mm256_fmadd_ps(_mm256_cvtepi32_ps(f), sc, _mm256_load_ps(af)));
+                        _mm512_store_si512(q, _mm512_setzero_si512());
+                    }
+            }
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // rectangle unit: tile rows [r0, r0 + R) x tiles [t0, t0 + C) of `mat` (native layout, or swizzled with C = 8 at
 // t0 % 8 == 0), M tokens. Writes the lane-reduced raw dot products y[i * ldy + (t * 16 + c)], c in 0..15.
@@ -237,6 +336,25 @@ void rect(const Mat& mat, int r0, int R, int t0, int C, const void* const* xin, 
     const uint8_t* base = mat.swz ? mat.tr + size_t(t0 / 8) * (mat.k / 16) * 8 * TILE_BYTES : mat.tr + size_t(t0) * TILE_BYTES;
     const int lines = (C * TILE_BYTES + 63) / 64;
     const int pfr = K_.pfr;
+    if constexpr (KIND == 3)
+    {
+        if (vbmi_ok)
+        {
+            static thread_local int32_t* acc16 = nullptr;
+            if (!acc16) acc16 = static_cast<int32_t*>(std::aligned_alloc(64, size_t(MAXCT) * 128 * 8 * 4));
+            std::memset(acc16, 0, size_t(C) * 128 * M * 4);
+            rect_rows_vbmi<M>(base, row_stride, r0, R, C, mat.k / 16, xin, qs, accf, acc16, lines, pfr);
+            for (int i = 0; i < M; ++i)
+                for (int t = 0; t < C; ++t)
+                    for (int c = 0; c < 8; ++c)
+                    {
+                        const float* v = accf + size_t(t) * 64 * M + (c * M + i) * 8;
+                        y[i * ldy + t * 16 + c] = (v[0] + v[1]) + (v[2] + v[3]);
+                        y[i * ldy + t * 16 + c + 8] = (v[4] + v[5]) + (v[6] + v[7]);
+                    }
+            return;
+        }
+    }
     auto pf = [&](const uint8_t* q) {
         const char* c = reinterpret_cast<const char*>(q);
         if (K_.pfhint == 0) for (int l = 0; l < lines; ++l) _mm_prefetch(c + l * 64, _MM_HINT_T0);
@@ -513,7 +631,7 @@ void rect_rt1(const Mat& mat, int r0, int R, int t0, int C, const void* const* x
 inline void rect_m(int kind, int m, const Mat& mat, int r0, int R, int t0, int C, const void* const* x, const float* const* qs, float* y, size_t ldy)
 {
 #define N135_CASE(MM) case MM: \
-    if (kind == 3 && MM == 1 && K_.rt && !mat.swz) rect_rt1<3>(mat, r0, R, t0, C, x, qs, y, ldy); \
+    if (kind == 3 && MM == 1 && K_.rt && !mat.swz && !vbmi_ok) rect_rt1<3>(mat, r0, R, t0, C, x, qs, y, ldy); \
     else if (kind == 2 && K_.rt && !mat.swz) rect_rt2<MM>(mat, r0, R, t0, C, x, qs, y, ldy); \
     else if (kind == 3) rect<MM, 3>(mat, r0, R, t0, C, x, qs, y, ldy); \
     else if (kind == 2) rect<MM, 2>(mat, r0, R, t0, C, x, qs, y, ldy); \
