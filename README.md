@@ -113,6 +113,19 @@ NVMe reads and VRAM hits per token are unchanged (same placement policy); the ti
 
 Tried and not kept: smarter replacement policies (offline simulation over decode traces: LRU 39.6 misses per token, the best practical router-score policy 37.1, Belady's optimum 15.0, so -6 % at most), more prefetch (`GLM53_NV_PF_MAX=8`: -5 %, the SSD is already the bottleneck), DMA staging of the next layer's predicted experts into a VRAM pool (`GLM53_NV_STG`, off: the copy phase shrinks but the DMA contends with zero-copy experts on PCIe during the MoE kernel), a makespan-search split of RAM experts between the lanes, and the CPU lane's register-accumulator kernel (5-10 % faster per expert in place, but the lanes are already balanced).
 
+### More RAM for the expert tier (2026-10-20)
+
+Every NVMe read that a RAM-tier hit avoids saves ~1.45 ms of the SSD, so RAM-tier capacity is worth more than any scheduling change left: in an offline LRU simulation over decode traces, 5 % more slots remove ~11 % of the misses. Two reservations held back ~4 GiB (single runs, same five prompts in the same order):
+
+| change | RAM-tier slots | tok/s summed over 5 prompts | NVMe reads per token (copy) |
+|---|---|---|---|
+| before | 5,254 | 48.03 | 71.3 |
+| prefill ring borrowed from the RAM tier while a staged prefill runs (its own 1.12 GiB returned) | +128 | 48.99 (+2.0 %) | 67.9 |
+| exllamav3's recurrent prefix cache 4 -> 1 GiB (`prefix_cache_gb`) | +342 | 50.55 (+5.2 %) | 63.3 |
+| both | +469 | 51.39 (+7.0 %) | 60.4 |
+
+The prefill ring now takes its 128 slots from the RAM tier when a staged prefill starts (free slots first, else the least recently used experts, which that prefill then reads from NVMe like any other cold expert) and returns them when it ends. The recurrent prefix cache holds ~143 MB checkpoints for resuming a prompt that shares a prefix with an earlier one: 1 GiB keeps the 7 most recent (4 GiB kept 28). The end-of-turn tail checkpoints that resume a follow-up question live outside it and are now reserved for (0.6 GiB). `prefix_cache_gb=4` restores the old depth for workloads that branch from early points of long documents. `bigmoe verify` with both: mode `nvme` decodes at 10.46 / 10.55 / 10.64 / 10.73 tok/s after 1k / 8k / 32k / 120k-token prompts (+28-34 % over the reference; prefill 118 / 811 / 876 / 875 tok/s), mode `nvme-exact` at 7.61 / 7.74 tok/s with byte-identical answers. With both as defaults (RAM tier 5,655 slots after the tail reserve), two runs each against the scheduling-only defaults above: copy 7.81 -> 8.36, prose 9.96 -> 10.66, story 10.79 -> 11.55, code 9.03 -> 9.67, list 10.40 -> 11.00 tok/s (+6.8 %; +12.9 % over both steps). After 32k and 120k-token prompts the scope peaked at 54.8 of 56 GiB, and prefill got slightly faster (867-872 tok/s at 32k-120k, more experts already in RAM). Tried and dropped: moving a prefetch that its target layer did not pick to the cold end of the LRU (most of them are picked at later tokens: NVMe reads +7 %).
+
 ## How it works
 
 `AutoBox(model)` resolves the model to a backend: an alias, a Hugging Face repo id, or a local checkpoint directory, pinned to a commit. `prepare()` (and `from_pretrained`, `start`) runs every step that is not done yet. Each step remembers its result, so the check is instant once everything is in place:
@@ -144,6 +157,7 @@ Tried and not kept: smarter replacement policies (offline simulation over decode
 | `chunk_size` | 8192 | prefill chunk; `4096` for 512k context |
 | `vram_expert_slots` | `None` | all free VRAM (1,408 expert slots on a 24 GB card); an integer caps the cache, e.g. 1376 leaves room for a desktop on the GPU |
 | `speculation`, `ngram_min`, `draft_tokens` | `"none"`, 2, 5 | `speculation="ngram"` drafts tokens from the context and verifies them with the target model: +13-27 % when the answer copies the context, 0-6 % slower otherwise, one request at a time; see below |
+| `prefix_cache_gb` | 1.0 | host RAM for exllamav3's recurrent-state prefix cache (`-rcs`, ~143 MB per checkpoint); the rest goes to the RAM expert tier. 4 keeps 28 checkpoints instead of 7 and decodes ~5 % slower |
 | `planner_cost`, `cpus`, `max_batch_size`, `slim`, `verify_weights` | | see `bigmoe models` |
 
 ## Optional: n-gram speculation

@@ -27,7 +27,9 @@ Env: GLM53_NV_RAM_GB (auto), GLM53_NV_MARGIN_GB (1), GLM53_NV_THREADS (16 reader
      demand > prefetch > bulk), GLM53_NV_HI_MB (12) / GLM53_NV_LO_MB (6) in-flight caps, GLM53_NV_PF_LIFO (1),
      GLM53_NV_DPIECE_KB (1024: decode read pieces), GLM53_NV_WB_EARLY (1: write-backs drained at nv_copy completion),
      GLM53_NV_PF_MULTI (2 prefetch hints per verify-window token), GLM53_NV_RZC1 (1: verify windows do not admit RAM picks
-     of one token), GLM53_NV_STG / GLM53_NV_STG_MAX (0 / 3: layer-ahead DMA staging pool, experimental, off).
+     of one token), GLM53_NV_STG / GLM53_NV_STG_MAX (0 / 3: layer-ahead DMA staging pool, experimental, off) with
+     GLM53_NV_STG_GATE (2: DMA after the copy kernel unless the MoE reads zero-copy, then after the MoE kernel),
+     GLM53_NV_PF_RING_BORROW (1: the prefill ring borrows RAM-tier slots during a staged prefill).
      Diagnostics: timeline() (per-layer breakdown in summary()), ext().trace_set / trace_take (routing trace)
 N137 B70 expert tier (needs the CPU tier, GLM53_NV_CPU=1): GLM53_B70 (0), GLM53_B70_RING (/run/local-ai/shared/b70.ring,
      created by b70tier/b70srv.py on the B70), GLM53_B70_N (3000 experts), GLM53_B70_ORDER (score: warm-score order after the VRAM warm
@@ -160,20 +162,26 @@ class Nv2:
         self.res = self.ct[self.off["res"]: self.off["res"] + self.K * 4].view(torch.int32)
         # ---- RAM tier + prefill ring sizes
         ring_pf = int(g("GLM53_NV_PF_RING", "128"))
+        # the prefill ring borrows RAM-tier slots for the duration of a staged prefill instead of owning its own memory
+        self.ring_borrow = g("GLM53_NV_PF_RING_BORROW", "1") == "1"
+        ring_own = 1 if self.ring_borrow else ring_pf
         margin = float(g("GLM53_NV_MARGIN_GB", "1")) * GiB
         mem = NT.cgroup_mem()
         want = g("GLM53_NV_RAM_GB", "auto")
         if want == "auto":
             assert mem.get("max"), "GLM53_NV_RAM_GB=auto needs a memory-capped container"
-            avail = (mem["max"] - mem["current"]) * GiB - margin - ring_pf * self.slot - NT._rcs_bytes() - 0.3 * GiB
+            # exl3_patch's end-of-turn tail checkpoints live outside the -rcs budget: up to 4 x ~143 MB
+            tails = 0.6 * GiB if g("GLM53_EXL3_PATCHES", "1") == "1" else 0
+            avail = (mem["max"] - mem["current"]) * GiB - margin - ring_own * self.slot - NT._rcs_bytes() - tails - 0.3 * GiB
             nram = max(0, int(avail // self.slot))
         else:
             nram = int(float(want) * GiB // self.slot)
         NT._log(f"nv2: rcs reserve {NT._rcs_bytes() / GiB:.1f} GiB, margin {margin / GiB:.1f} GiB, prefill ring {ring_pf} "
-                f"slots ({ring_pf * self.slot / GiB:.2f} GiB) -> RAM tier {nram} slots ({nram * self.slot / GiB:.2f} GiB)")
+                f"slots ({'borrowed from the RAM tier' if self.ring_borrow else f'{ring_pf * self.slot / GiB:.2f} GiB'}) -> "
+                f"RAM tier {nram} slots ({nram * self.slot / GiB:.2f} GiB)")
         self.ram = NT.HostArena(nram, self.slot, 512, dev_idx, "ram")
         self.nram = nram
-        self.pf = NT.HostArena(ring_pf, self.slot, ring_pf, dev_idx, "pfring")
+        self.pf = NT.HostArena(ring_own, self.slot, ring_own, dev_idx, "pfring")
         NT._log(f"nv2: RAM arena + prefill ring registered")
         # VRAM victim ring (write-back source: nv_copy parks the victim's bytes here D2D, the host drains it D2H on a
         # copy engine; SM stores to host memory run at ~4 GB/s vs 25 GB/s for the DMA engine)
@@ -213,6 +221,8 @@ class Nv2:
                int(self.wb_on), int(g("GLM53_NV_LAND", "64")), int(g("GLM53_NV_FREE_LO", "96")),
                torch.tensor(self.vring_addr, dtype=torch.int64))
         e.set_stage_qd(int(g("GLM53_NV_PF_QD", "24")))
+        if self.ring_borrow:
+            e.set_ring_borrow(ring_pf)
         if self.stg_addr:
             e.stg_init(torch.tensor(self.stg_addr, dtype=torch.int64), int(g("GLM53_NV_STG_MAX", "3")))
         pol = [float(x) for x in g("GLM53_NV_POL", "0.17,0.023,0.38,0.145,0.165,0.040,0.40,0.12,0.395,0.75").split(",")]
@@ -261,7 +271,7 @@ class Nv2:
                  "alloc_fail", "land_pushed", "prefetch", "plan_ns", "ctl_busy_ns", "cpu_busy_ns", "cpu_wait_land_ns",
                  "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "pf_keys", "pf_skip", "pf_used", "pf_wasted", "lane_skip", "lossy_calls", "lossy_tok", "lossy_tok_skip", "lossy_cold_x1e6", "lossy_skip_x1e6", "lossy_coldu", "lossy_want", "lossy_bg_reads", "promoted", "stg_issued", "stg_ready", "stg_hit", "stg_late",
                  "stg_nofree", "stg_dup", "stg_waste", "wb_early", "partial_lands", "partial_binds", "wb_lat_us",
-                 "wb_lat_max_us", "ring_low", "ring_low_vfree",
+                 "wb_lat_max_us", "ring_low", "ring_low_vfree", "ring_borrowed",
                  "resident", "inflight", "free", "landing"]
         return dict(zip(names, ext().counters()))
 

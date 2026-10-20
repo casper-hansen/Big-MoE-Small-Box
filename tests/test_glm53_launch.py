@@ -52,7 +52,7 @@ def test_argv(tmp_path, monkeypatch):
     box, spec = spec_for(tmp_path, monkeypatch, "nvme")
     assert spec.argv[:3] == ["/envs/glm53/bin/python", "-m", "bigmoe.models.glm53.engine.server"]
     assert spec.argv[3:] == ["-m", str(box.backend.model_dir(box)), "-cs", "131072", "--max-batch-size", "8",
-                             "-chunk_size", "8192", "-ambs", "4", "--host", "127.0.0.1", "--port", "30000",
+                             "-chunk_size", "8192", "-ambs", "4", "-rcs", "1", "--host", "127.0.0.1", "--port", "30000",
                              "--served-name", "glm-5.3-flash"]
     assert spec.memory_gb == 56.0   # default on a 60 GiB+ box (measured best)
     _, spec = spec_for(tmp_path, monkeypatch, "nvme-exact", context=524288, cache_quant=8, chunk_size=4096)

@@ -13,7 +13,7 @@ constexpr int LR = 256;     // landing ring (fresh RAM slots for VRAM victims)
 constexpr int MAXB = 8;     // tokens per CPU job
 
 // host control words (mapped int64)
-enum { HC_PUB = 0, HC_ACK = 1, HC_ERR = 2, HC_WBN = 3, HC_ADMN = 4, HC_LANDT = 5, HC_CDONE = 6, HC_CPDONE = 7, HC_N = 64 };
+enum { HC_PUB = 0, HC_ACK = 1, HC_ERR = 2, HC_WBN = 3, HC_ADMN = 4, HC_LANDT = 5, HC_CDONE = 6, HC_CPDONE = 7, HC_MOEDONE = 8, HC_N = 64 };
 // HC_CPDONE: seq of the last request whose nv_copy finished (layer-ahead staging DMAs start after it: no PCIe contention
 // with that layer's own admission copies)
 // device control words (device int64)

@@ -486,6 +486,11 @@ __global__ void nv_combine_k(void* out, int is_half, int n, const long long* __r
     __shared__ int go;
     if (threadIdx.x == 0)
     {
+        if (blockIdx.x == 0 && dc)   // the MoE kernel before us on this stream is done: PCIe is free for staging DMA
+        {
+            hc[HC_MOEDONE] = dc[DC_SEQ];
+            __threadfence_system();
+        }
         const long long s = dflag[0];
         const unsigned long long ts = gtime();
         go = s != 0;

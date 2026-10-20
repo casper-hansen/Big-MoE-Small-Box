@@ -58,6 +58,9 @@ class GLM53Options:
     speculation: str = "none"  # "ngram": n-gram drafts from the context, verified by the target (off by default)
     ngram_min: int = 2          # speculation="ngram": shortest context match that yields a draft
     draft_tokens: int = 5       # speculation="ngram": drafted tokens verified per step
+    # exllamav3's recurrent-state prefix cache in host RAM (-rcs, GiB; ~143 MB per checkpoint). Every GiB left to the RAM
+    # expert tier instead is ~110 more cached experts: 4 -> 1 GiB measured +5 % decode (fewer NVMe reads)
+    prefix_cache_gb: float = 1.0
 
     def validate(self):
         if self.mode not in MODES:
@@ -70,6 +73,8 @@ class GLM53Options:
             raise ValueError(f"cache_quant must be 2..8 bits or None, got {self.cache_quant!r}")
         if int(self.chunk_size) <= 0 or int(self.max_batch_size) <= 0:
             raise ValueError("chunk_size and max_batch_size must be positive")
+        if not 0.25 <= float(self.prefix_cache_gb) <= 64:
+            raise ValueError(f"prefix_cache_gb must be 0.25..64, got {self.prefix_cache_gb!r}")
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
             raise ValueError("cpus must be 'auto', a CpuLayout or a dict(main=, controller=, lane=, readers=)")
 
@@ -279,10 +284,10 @@ class GLM53(ModelBackend):
                    GLM53_NV_READER_CPUS=format_cpus(lay.readers))
         if env["GLM53_NV_CPU"] == "1":
             env["GLM53_NV_CPU_CPUS"] = format_cpus(lay.lane)
-        small = []
+        small = ["-rcs", f"{float(o.prefix_cache_gb):g}"]
         if box.memory_gb < 24:  # upstream's small-host budget
             env.update(GLM53_NV_MARGIN_GB="1.5", GLM53_NV_PF_RING="128", GLM53_NV_THREADS="48", GLM53_NV_PIECE_KB="1024")
-            small = ["-rcs", "1"]
+            small = ["-rcs", f"{min(1.0, float(o.prefix_cache_gb)):g}"]
         for spec in self.kernel_specs(box):
             env[spec.env_var] = str(box.runtime.kernel_dirs([spec], box.arch)[spec.name])
         if not system.systemd_scope_available():  # no cgroup cap to size the RAM tier from: give it explicitly

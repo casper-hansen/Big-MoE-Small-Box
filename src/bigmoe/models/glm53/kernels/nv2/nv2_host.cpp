@@ -83,7 +83,7 @@ struct Track
     int fd = -1; int64_t off = 0, dst = 0, len = 0, piece = 0, next = 0; int cls = 0; int key = -1;
     std::atomic<uint64_t> done_mask{0}; uint64_t part_mask = 0; PartFn part = nullptr; std::atomic<int> part_fired{0};
 };
-struct Piece { int fd; int64_t off, dst, len; Track* tr; int cls; };
+struct Piece { int fd; int64_t off, dst, len; Track* tr; int cls; double vdone; };
 
 struct Reader
 {
@@ -96,6 +96,10 @@ struct Reader
     std::unordered_map<int, Track*> queued;     // key -> track that still has undispatched pieces (classes > 0)
     bool quit = false;
     std::atomic<long> recs{0}, pieces{0}, promoted{0};
+    // device emulation (set_read_rate, diagnostics): pieces complete no faster than a single device of rate_bps would
+    // serve them in dispatch order (0 = off)
+    double rate_bps = 0, vfin = 0;
+    static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     void start(int n, std::vector<int> cpus)
     {
         if (const char* v = getenv("GLM53_NV_HI_MB")) hi_cap = int64_t(atof(v) * 1048576.0);
@@ -166,7 +170,9 @@ struct Reader
                 auto& d = q[c];
                 Track* tr = (c == RC_PREFETCH && lifo) ? d.back() : d.front();
                 const int64_t n = std::min(tr->piece, tr->len - tr->next);
-                p = { tr->fd, tr->off + tr->next, tr->dst + tr->next, n, tr, c };
+                double vd = 0;
+                if (rate_bps > 0) { vfin = std::max(vfin, now_s()) + double(n) / rate_bps; vd = vfin; }
+                p = { tr->fd, tr->off + tr->next, tr->dst + tr->next, n, tr, c, vd };
                 tr->next += n;
                 if (tr->next >= tr->len)
                 {
@@ -182,6 +188,11 @@ struct Reader
                 if (r < 0) { if (errno == EINTR) continue; err = errno; break; }
                 if (r == 0) { err = -1; break; }
                 done += r;
+            }
+            if (p.vdone > 0)
+            {
+                const double w = p.vdone - now_s();
+                if (w > 0) std::this_thread::sleep_for(std::chrono::duration<double>(w));
             }
             {
                 std::lock_guard<std::mutex> lk(mu);
@@ -235,6 +246,7 @@ struct Counters
     std::atomic<long long> wb_early{0};   // write-backs drained by the wb thread at nv_copy completion
     std::atomic<long long> partial_lands{0}, partial_binds{0};
     std::atomic<long long> wb_lat_us{0}, wb_lat_max_us{0}, ring_low{0}, ring_low_vfree{0};
+    std::atomic<long long> ring_borrowed{0};   // RAM slots lent to the prefill ring (cumulative)
     std::atomic<long long> stg_issued{0}, stg_ready{0}, stg_hit{0}, stg_late{0}, stg_nofree{0}, stg_dup{0}, stg_waste{0};
     std::atomic<long long> lane_skip{0}, lossy_calls{0}, lossy_tok{0}, lossy_tok_skip{0}, lossy_cold_x1e6{0},
         lossy_skip_x1e6{0}, lossy_coldu{0}, lossy_want{0}, lossy_bg_reads{0};   // BCP
@@ -308,7 +320,11 @@ struct Engine
     // LN_STG and nv_copy admits it with a D2D copy from the pool instead of a PCIe gather. Expert bytes are immutable, so a
     // staged copy stays valid while its RAM copy is resident; it is dropped on admission or RAM eviction.
     int stg_n = 0, stg_max = 3;
-    std::vector<int64_t> stg_addr, stg_use, stg_after; std::vector<int> stg_key, stg_rslot; std::vector<int8_t> stg_st;
+    // GLM53_NV_STG_GATE: when the staging DMA for layer li + 1 may start. 0: after layer li's copy kernel (HC_CPDONE);
+    // 1: after its MoE kernel (HC_MOEDONE); 2 (default): after the copy kernel unless layer li's MoE reads an expert
+    // zero-copy over PCIe (NZC / RZC lanes), which the DMA would slow down, then after the MoE kernel
+    int stg_gate = 2;
+    std::vector<int64_t> stg_addr, stg_use, stg_after; std::vector<int> stg_key, stg_rslot; std::vector<int8_t> stg_st, stg_gt;
     std::vector<long long> stg_t; std::vector<int32_t> staged_of; std::vector<cudaEvent_t> stg_ev;
     cudaStream_t stg_stream = nullptr; std::thread stg_th; std::mutex stg_mu; std::condition_variable stg_cv;
     std::deque<int> stg_q; long long stg_clock = 0;
@@ -348,8 +364,10 @@ struct Engine
             {
                 std::unique_lock<std::mutex> lq(stg_mu);
                 if (stg_q.empty() && infl.empty()) stg_cv.wait_for(lq, std::chrono::milliseconds(20));
-                const int64_t cp = __atomic_load_n(&hc[HC_CPDONE], __ATOMIC_ACQUIRE);
-                while (!stg_q.empty() && stg_after[stg_q.front()] <= cp) { go.push_back(stg_q.front()); stg_q.pop_front(); }
+                const int64_t cpd = __atomic_load_n(&hc[HC_CPDONE], __ATOMIC_ACQUIRE);
+                const int64_t mod = __atomic_load_n(&hc[HC_MOEDONE], __ATOMIC_ACQUIRE);
+                while (!stg_q.empty() && stg_after[stg_q.front()] <= (stg_gt[stg_q.front()] ? mod : cpd))
+                { go.push_back(stg_q.front()); stg_q.pop_front(); }
             }
             for (int j : go)
             {
@@ -397,6 +415,11 @@ struct Engine
     // stage engine
     std::vector<int64_t> pf_ring_addr;
     std::vector<cudaEvent_t> pf_ev; std::vector<int> pf_ev_pending;
+    // prefill ring borrowed from the RAM tier (GLM53_NV_PF_RING_BORROW, set_ring_borrow): stage_begin takes ring_n RAM
+    // slots (free list first, else the LRU-oldest unpinned experts), stage_end returns them to the free list, so the
+    // ring's memory serves the RAM tier during decode
+    int ring_n = 0; std::vector<int> st_ring_slots; std::vector<int64_t> st_ring_addr;
+    const std::vector<int64_t>& ring_addr() const { return ring_n > 0 ? st_ring_addr : pf_ring_addr; }
     std::vector<std::vector<int64_t>> st_ram_src, st_ram_j;    // per layer: src addr, staging index
     std::vector<std::vector<int>> st_nv_idx;                    // per layer: indices into st_nv
     std::deque<StageEntry> st_nv;
@@ -901,6 +924,8 @@ struct Engine
         }
         if (stg_n && dec && r.ntok == 1)
         {
+            bool zc_moe = false;
+            for (int u = 0; u < r.nu; ++u) if (p.lane[u] == LN_NZC || p.lane[u] == LN_RZC) { zc_moe = true; break; }
             int ns = 0;
             for (int i = 0; i < std::min(r.npf, (int) MAXP) && ns < stg_max; ++i)
             {
@@ -912,6 +937,7 @@ struct Engine
                 const int rs = slot_of[key];
                 pinc[rs]++;
                 stg_key[j] = key; staged_of[key] = j; stg_st[j] = SG_QUEUED; stg_after[j] = cur_seq; stg_rslot[j] = rs;
+                stg_gt[j] = stg_gate == 2 ? (zc_moe ? 1 : 0) : int8_t(stg_gate);
                 stg_use[j] = -1; stg_t[j] = ++stg_clock;
                 { std::lock_guard<std::mutex> lq(stg_mu); stg_q.push_back(j); }
                 ns++; C.stg_issued++;
@@ -1197,7 +1223,9 @@ struct Engine
     void st_reader()
     {
         pin_self(wb_cpu);
-        const int R = (int) pf_ring_addr.size();
+        const std::vector<int64_t>& RA = ring_addr();
+        const int R = (int) RA.size();
+        if (R <= 0) { hc[HC_ERR] = 18; return; }
         for (size_t g = 0; g < st_nv.size(); ++g)
         {
             if (st_cancel.load()) break;
@@ -1218,7 +1246,7 @@ struct Engine
                 st_inflight++;
             }
             st_nv[g].ring = r;
-            rd.submit(fd, int64_t(st_nv[g].key) * rec_bytes, pf_ring_addr[r], slot_bytes, piece, RC_BULK, &Engine::on_stage, this, int64_t(g), -1);
+            rd.submit(fd, int64_t(st_nv[g].key) * rec_bytes, RA[r], slot_bytes, piece, RC_BULK, &Engine::on_stage, this, int64_t(g), -1);
             C.stage_reads++;
         }
     }
@@ -1236,7 +1264,9 @@ struct Engine
         {
             std::lock_guard<std::mutex> lk(mu);
             for (int s : st_pins) pinc[s]--;
+            for (int s : st_ring_slots) free_slot(s);
         }
+        st_ring_slots.clear(); st_ring_addr.clear();
         st_pins.clear(); st_nv.clear(); st_ram_src.clear(); st_ram_j.clear(); st_nv_idx.clear();
         std::fill(pf_ev_pending.begin(), pf_ev_pending.end(), 0);
         st_active = false;
@@ -1249,6 +1279,16 @@ struct Engine
         st_ram_src.assign(L, {}); st_ram_j.assign(L, {}); st_nv_idx.assign(L, {});
         {
             std::lock_guard<std::mutex> lk(mu);
+            // borrow the ring before classifying: a long prompt needs nearly every expert, so once its RAM-resident
+            // ones are pinned there is nothing left to evict. The LRU-oldest experts evicted here are staged from
+            // NVMe like any other non-resident one (free slots, e.g. a previous prefill's ring, are taken first)
+            for (int i = 0; i < ring_n; ++i)
+            {
+                const int s = take_slot();
+                if (s < 0) break;
+                owner[s] = SL_STAGE; st_ring_slots.push_back(s); st_ring_addr.push_back(ram_addr[s]);
+                C.ring_borrowed++;
+            }
             for (int li = li0; li < L; ++li)
             {
                 int j = 0;
@@ -1299,7 +1339,7 @@ struct Engine
                     waited += now_ms() - tw;
                     if (!se.ready.load()) { hc[HC_ERR] = 18; continue; }
                 }
-                cudaMemcpyAsync((void*) (base + se.j * slot_bytes), (const void*) pf_ring_addr[se.ring], size_t(slot_bytes), cudaMemcpyHostToDevice, st);
+                cudaMemcpyAsync((void*) (base + se.j * slot_bytes), (const void*) ring_addr()[se.ring], size_t(slot_bytes), cudaMemcpyHostToDevice, st);
                 cudaEventRecord(pf_ev[se.ring], st);
                 {
                     std::lock_guard<std::mutex> lk(st_mu);
@@ -1406,13 +1446,24 @@ void start()
     e.wb_th = std::thread([&e] { e.wb_loop(); });
 }
 
+void set_ring_borrow(int64_t n)
+{
+    Engine& e = *G;
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.ring_n = int(std::max<int64_t>(0, n));
+    const size_t R = std::max(e.pf_ring_addr.size(), size_t(e.ring_n));
+    while (e.pf_ev.size() < R) { cudaEvent_t ev; cudaEventCreateWithFlags(&ev, cudaEventDisableTiming); e.pf_ev.push_back(ev); }
+    e.pf_ev_pending.assign(R, 0);
+}
+
 void stg_init(at::Tensor addrs, int64_t per_layer)
 {
     Engine& e = *G;
     std::lock_guard<std::mutex> lk(e.mu);
     e.stg_n = int(addrs.numel()); e.stg_max = int(per_layer);
+    if (const char* sg = getenv("GLM53_NV_STG_GATE")) e.stg_gate = atoi(sg);
     e.stg_addr.assign(addrs.data_ptr<int64_t>(), addrs.data_ptr<int64_t>() + e.stg_n);
-    e.stg_key.assign(e.stg_n, -1); e.stg_rslot.assign(e.stg_n, -1); e.stg_st.assign(e.stg_n, 0);
+    e.stg_key.assign(e.stg_n, -1); e.stg_rslot.assign(e.stg_n, -1); e.stg_st.assign(e.stg_n, 0); e.stg_gt.assign(e.stg_n, 0);
     e.stg_use.assign(e.stg_n, -1); e.stg_after.assign(e.stg_n, 0); e.stg_t.assign(e.stg_n, 0); e.staged_of.assign(e.K, -1);
     e.stg_ev.resize(e.stg_n);
     for (auto& ev : e.stg_ev) cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
@@ -1548,7 +1599,7 @@ std::vector<int64_t> counters()
         c.lane_b70, c.b70_jobs, c.b70_rows, c.b70_wait_ns, c.b70_rtt_ns, c.b70_err, c.b70_rtt_max_ns, c.pf_keys, c.pf_skip, c.pf_used, c.pf_wasted, c.lane_skip, c.lossy_calls, c.lossy_tok, c.lossy_tok_skip,
         c.lossy_cold_x1e6, c.lossy_skip_x1e6, c.lossy_coldu, c.lossy_want, c.lossy_bg_reads, c.promoted,
         c.stg_issued, c.stg_ready, c.stg_hit, c.stg_late, c.stg_nofree, c.stg_dup, c.stg_waste, c.wb_early,
-        c.partial_lands, c.partial_binds, c.wb_lat_us, c.wb_lat_max_us, c.ring_low, c.ring_low_vfree };
+        c.partial_lands, c.partial_binds, c.wb_lat_us, c.wb_lat_max_us, c.ring_low, c.ring_low_vfree, c.ring_borrowed };
     std::lock_guard<std::mutex> lk(e.mu);
     int res = 0, inf = 0; for (int k = 0; k < e.K; ++k) { res += e.kst[k] == KS_RES; inf += e.kst[k] == KS_INFLIGHT; }
     v.push_back(res); v.push_back(inf); v.push_back((int64_t) e.freel.size()); v.push_back(e.land_tail - e.hc[HC_WBN]);
@@ -1760,6 +1811,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("start", &start);
     m.def("set_pol", &set_pol);
     m.def("stg_init", &stg_init);
+    m.def("set_ring_borrow", &set_ring_borrow);
     m.def("warm_read", &warm_read, py::call_guard<py::gil_scoped_release>());
     m.def("drop_keys", &drop_keys);
     m.def("wb_bulk", &wb_bulk, py::call_guard<py::gil_scoped_release>());
@@ -1770,6 +1822,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reset_counters", &reset_counters);
     m.def("dbg_host", &dbg_host);
     m.def("trace_set", &trace_set);
+    m.def("set_read_rate", [](double mbps) {   // emulate a slower NVMe device (MB/s, 0 = off): capacity planning
+        Engine& e = *G; std::lock_guard<std::mutex> lk(e.rd.mu); e.rd.rate_bps = std::max(0.0, mbps) * 1e6; e.rd.vfin = 0;
+    });
     m.def("cpu_knob", [](std::string k, int v) {   // n135 CPU-lane knobs at runtime (bench / A-B); returns the old value
         cpu_kern_init();
         int* p = k == "rt" ? &n135::K_.rt : k == "kern" ? &n135::K_.kern : k == "pfr" ? &n135::K_.pfr : k == "rg" ? &n135::K_.rg :

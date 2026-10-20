@@ -571,6 +571,35 @@ async def nv2_trace(on: int = -1, path: str = ""):
     return JSONResponse({"words": int(t.size), "path": path})
 
 
+@app.get("/nv2_rate")
+async def nv2_rate(mbps: float = 0.0):
+    """Emulate a slower NVMe device for capacity planning: reads complete no faster than mbps MB/s (0 = off)."""
+    from . import nv2
+    nv2.ext().set_read_rate(float(mbps))
+    return JSONResponse({"mbps": mbps})
+
+
+@app.get("/host_tensors")
+async def host_tensors(min_mb: float = 32.0):
+    """Large host-memory torch tensors alive in this process (diagnostic: where the non-arena RAM goes)."""
+    import gc
+    seen, rows = set(), []
+    for o in gc.get_objects():
+        try:
+            if isinstance(o, torch.Tensor) and o.device.type == "cpu":
+                st = o.untyped_storage()
+                key = st.data_ptr()
+                if key in seen or st.nbytes() < min_mb * 2**20:
+                    continue
+                seen.add(key)
+                rows.append({"mb": round(st.nbytes() / 2**20, 1), "shape": list(o.shape), "dtype": str(o.dtype),
+                             "pinned": bool(o.is_pinned())})
+        except Exception:
+            pass
+    rows.sort(key=lambda r: -r["mb"])
+    return JSONResponse({"total_mb": round(sum(r["mb"] for r in rows), 1), "tensors": rows[:40]})
+
+
 @app.get("/nv2_host")
 async def nv2_host():
     """Host-engine counters only (no device access, safe to poll during generation)."""
