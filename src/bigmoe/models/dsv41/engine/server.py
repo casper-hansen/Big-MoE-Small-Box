@@ -1,7 +1,6 @@
 """OpenAI-compatible server for DeepSeek-V4.1-Flash over stock exllamav3 1.6.6 (AsyncGenerator), configured through
-DSV41_* variables. The offload stack is a monkeypatch around stock exllamav3:
-  tiers.py   DSV41_NV_STORE   loader skips the routed-expert bytes; VRAM CLOCK cache + RAM tier + NVMe store per size
-                              class; every pick is made VRAM/RAM-resident before exllamav3's own expert kernels run
+DSV41_* variables. Expert offload: the shared engine (bigmoe.engine: VRAM cache, RAM tier, NVMe store, planner, CPU
+lane), enabled by DSV41_NV_STORE.
 No output caps: max_tokens defaults to the remaining context. /generate and /tokenize are SGLang-shaped (benchmark).
 Quality tooling: DSV41_KL_CAPTURE=1 records the top-256 logprobs of every forward step (/kl_capture); /kl_teacher runs
 one teacher-forced forward over given ids.
@@ -39,15 +38,12 @@ def load():
 
     tiers = None
     if os.environ.get("DSV41_NV_STORE"):
-        from . import tiers
+        from bigmoe.engine import tiers
         tiers.install()
     t_load = time.time()
     model, config, cache, tok, draft_model, _draft_config, draft_cache = model_init.init(args)
     if tiers is not None:
-        if os.environ.get("DSV41_NV", "1") == "2":
-            tiers.attach_nv2(model)
-        else:
-            tiers.attach(model)
+        tiers.attach(model)
     t_load = time.time() - t_load
     print(f" -- loaded in {t_load:.1f} s", flush=True)
 
@@ -392,19 +388,9 @@ async def server_info():
 async def stats():
     st = dict(G["stats"])
     if os.environ.get("DSV41_NV_STORE"):
-        from . import tiers
+        from bigmoe.engine import tiers
         st["tiers"] = tiers.summary()
     return JSONResponse(st)
-
-
-@app.get("/expert_counts")
-async def expert_counts(phase: str = "dec", path: str = ""):
-    from . import tiers
-    c = tiers.expert_counts(phase)
-    if path:
-        json.dump(c, open(path, "w"))
-        return JSONResponse({"path": path, "layers": len(c)})
-    return JSONResponse(c)
 
 
 @app.get("/gpu_prof")
@@ -436,7 +422,7 @@ async def gpu_prof(secs: float = 3.0, path: str = "", top: int = 40):
 async def nv2_rate(mbps: float = 0.0):
     """NVMe emulation (diagnostics): reads complete no faster than a single device of `mbps` MB/s would serve them
     (0 = off, the real drive). Only slower than the real drive can be emulated."""
-    from . import nv2
+    from bigmoe.engine import nv2
     nv2.ext().set_read_rate(float(mbps))
     return JSONResponse({"read_rate_mbps": mbps})
 
@@ -444,7 +430,7 @@ async def nv2_rate(mbps: float = 0.0):
 @app.get("/cpu")
 async def cpu_switch(on: int = 1):
     """Runtime CPU-lane switch (mode nvme): on=0 puts every pick on the GPU path (bit-exact), for same-server A/B."""
-    from . import nv2
+    from bigmoe.engine import nv2
     if nv2.NV is None:
         return JSONResponse({"error": "nv2 off"})
     nv2.NV.set_cpu(bool(on))
@@ -453,7 +439,7 @@ async def cpu_switch(on: int = 1):
 
 @app.get("/nv_verify")
 async def nv_verify(n: int = 32):
-    from . import tiers
+    from bigmoe.engine import tiers
     return JSONResponse(tiers.verify(n))
 
 

@@ -363,7 +363,7 @@ __global__ void nv_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
     const long long* __restrict__ cbase, int spc, long long rec, long long vg, long long vu, long long vd, long long off_u,
     long long off_d, const long long* __restrict__ ram_addr, const long long* dc, const int* uexp, const int* ulane,
     const int* slotof_all, const int64_t* tabs, long long ph, volatile long long* hc, long long timeout_ns,
-    unsigned long long* stats, long long* dbg, long long* dcw, const long long* __restrict__ jobsrc)
+    unsigned long long* stats, long long* dbg, long long* dcw, const long long* __restrict__ jobsrc, int wb_inline)
 {
     const int t = threadIdx.x;
     const long long sqd = dc[DC_SEQ];
@@ -435,7 +435,9 @@ __global__ void nv_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
             const long long js = jobsrc ? jobsrc[j] : 0;
             if (js) { s_h[0] = js; s_h[1] = js + off_u; s_h[2] = js + off_d; }   // staged: D2D from the pool slot
             else { s_h[0] = home_all[key * 3]; s_h[1] = home_all[key * 3 + 1]; s_h[2] = home_all[key * 3 + 2]; }
-            s_wb = jobx[j] >= 0 ? ram_addr[jobx[j]] : 0;
+            // uniform slot geometry: the victim's bytes go to its landing slot in this pass (same offsets as the admitted
+            // expert); mixed geometry (store v2): nv_wb_k parked the whole slot before this kernel ran
+            s_wb = (wb_inline && jobx[j] >= 0) ? ram_addr[jobx[j]] : 0;
             s_job = j;
         }
         __syncthreads();
@@ -477,6 +479,26 @@ __global__ void nv_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
             __threadfence_system();
             hc[HC_CPDONE] = sqd;
         }
+    }
+}
+
+// store v2 (, mixed record sizes): a victim's slot holds an expert of ANY layer, whose compact layout (gate | up |
+// down at that layer's offsets) need not match the admitted expert's. Park the whole slot (rec bytes, raw) in its
+// landing slot before nv_copy overwrites it (same stream: nv_copy starts after this kernel has finished).
+__global__ void nv_wb_k(const int* __restrict__ ctl, const int* __restrict__ jobs, const int* __restrict__ jobx,
+    const long long* __restrict__ cbase, int spc, long long rec, const long long* __restrict__ ram_addr)
+{
+    const long long nj = ctl[2];
+    const long long v16 = rec / 16;
+    for (long long j = 0; j < nj; ++j)
+    {
+        const int x = jobx[j];
+        if (x < 0) continue;
+        const int s = jobs[2 * j + 1];
+        const int4* src = (const int4*) (cbase[s / spc] + (long long) (s % spc) * rec);
+        int4* dst = (int4*) ram_addr[x];
+        for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < v16; i += (long long) gridDim.x * blockDim.x)
+            dst[i] = src[i];
     }
 }
 
@@ -560,8 +582,8 @@ void nv_pub(at::Tensor sel, at::Tensor w, int64_t z, int64_t n, int64_t bsz, int
     c10::cuda::CUDAGuard g(sel.device());
     TORCH_CHECK(sel.dtype() == at::kLong && sel.is_contiguous() && w.dtype() == at::kHalf && w.is_contiguous());
     TORCH_CHECK(E <= MAXU);
-    static const int pub_fast = getenv("GLM53_NV_PUBFAST") && atoi(getenv("GLM53_NV_PUBFAST")) == 1 && MAXU <= PUBF_T;
-    if (pub_fast)
+    static const int pub_fast = penv("NV_PUBFAST") && atoi(penv("NV_PUBFAST")) == 1;
+    if (pub_fast && E <= PUBF_T)
     {
         nv_pub_fast_k<<<1, PUBF_T, 0, cur(sel)>>>(sel.data_ptr<int64_t>(), (const __half*) w.data_ptr(), (const __half*) z,
             (int) n, (int) bsz, (int) H, (int) li, (int) E, (int) first, slotof_row.data_ptr<int>(), (int) kind,
@@ -600,16 +622,19 @@ void nv_copy(at::Tensor ctl, at::Tensor jobs, at::Tensor jobx, at::Tensor jobnv,
              int64_t ram_res, int64_t arena, int64_t spc, int64_t rec, int64_t sg, int64_t su, int64_t sd, int64_t off_u,
              int64_t off_d, at::Tensor ram_addr, at::Tensor dc, at::Tensor uexp, at::Tensor ulane, at::Tensor slotof,
              at::Tensor tabs, int64_t ph, int64_t hc, int64_t timeout_ns, at::Tensor stats, int64_t grid, at::Tensor dbg,
-             at::Tensor jobsrc)
+             at::Tensor jobsrc, int64_t wb_inline)
 {
     c10::cuda::CUDAGuard g(ctl.device());
+    if (!wb_inline)
+        nv_wb_k<<<(int) grid, 256, 0, cur(ctl)>>>(ctl.data_ptr<int>(), jobs.data_ptr<int>(), jobx.data_ptr<int>(),
+            (const long long*) arena, (int) spc, rec, (const long long*) ram_addr.data_ptr<int64_t>());
     nv_copy_k<<<(int) grid, 256, 0, cur(ctl)>>>(ctl.data_ptr<int>(), jobs.data_ptr<int>(), jobx.data_ptr<int>(),
         jobnv.data_ptr<int>(), (int) li, (int) E, (const volatile long long*) home, (const volatile int*) ram_res,
         (const long long*) arena, (int) spc, rec, sg / 16, su / 16, sd / 16, off_u, off_d,
         (const long long*) ram_addr.data_ptr<int64_t>(), (const long long*) dc.data_ptr<int64_t>(), uexp.data_ptr<int>(),
         ulane.data_ptr<int>(), slotof.data_ptr<int>(), tabs.data_ptr<int64_t>(), ph, (volatile long long*) hc, timeout_ns,
         (unsigned long long*) stats.data_ptr<int64_t>(), dbg.numel() ? (long long*) dbg.data_ptr<int64_t>() : nullptr,
-        (long long*) dc.data_ptr<int64_t>(), (const long long*) jobsrc.data_ptr<int64_t>());
+        (long long*) dc.data_ptr<int64_t>(), (const long long*) jobsrc.data_ptr<int64_t>(), (int) wb_inline);
 }
 
 void nv_combine(at::Tensor out, at::Tensor dflag, int64_t done, int64_t hout, at::Tensor stats, int64_t hc, int64_t timeout_ns,

@@ -1,5 +1,6 @@
 // FreeToken CPU tier core (AVX2 mul1 K=3 expert kernels, pool, reference). See ft_mul1_avx2.cpp for notes.
 #pragma once
+#include "penv.h"
 #include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
@@ -259,7 +260,7 @@ __attribute__((always_inline)) inline void tile_accum(const uint8_t* tile, const
 }
 
 // swz = 1: block-contiguous copy ([n/128][k/16][8 tiles]) so each work unit streams one contiguous run
-// tb / tf (DSV41): tile bytes (32 * K) and trellis format (n135 TF_*: 0 = K 2, 1 = K 2.5, 2 = K 3). Only the n135 p16
+// tb / tf (store v2): tile bytes (32 * K) and trellis format (n135 TF_*: 0 = K 2, 1 = K 2.5, 2 = K 3). Only the n135 p16
 // VBMI kernel decodes formats other than K 3 (the AVX2 / ft_core kernels are K 3 only).
 struct Mat { const uint8_t* tr; const uint16_t* suh; const uint16_t* svh; int k, n; int swz = 0; int tb = TILE_BYTES; int tf = 2; };
 
@@ -420,7 +421,7 @@ inline float quant_block_i16(const float* xt, int32_t* xq_blk /* 8 tile rows x 3
 // Thread pool (pinned, spinning; master = worker 0)
 // ------------------------------------------------------------------------------------------
 
-// AMD MONITORX / MWAITX waits (user mode): with g_mwx > 0 (DSV41_NV_LANE_MWX timer cycles) the CPU lane's spin-waits
+// AMD MONITORX / MWAITX waits (user mode): with g_mwx > 0 (NV_LANE_MWX timer cycles) the CPU lane's spin-waits
 // sleep in C1 until the watched line is written (~0.1-0.4 us) or the timer expires, instead of spinning on PAUSE: the
 // lane cores share one voltage rail and power budget with each other, so waiting cores no longer cost the busy ones clock
 inline unsigned g_mwx = 0;

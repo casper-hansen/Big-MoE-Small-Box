@@ -1,8 +1,7 @@
 """OpenAI-compatible server over stock exllamav3 1.5.1 (AsyncGenerator), configured through GLM53_* variables. Each
 piece of the offload stack is a monkeypatch around stock exllamav3:
-  nv_tier.py       GLM53_NV=1|2         loader skips the routed-expert bytes (served from the NVMe expert store)
-  nv2.py           GLM53_NV=2           RAM tier + NVMe reads + planner (+ AVX2 CPU lane with GLM53_NV_CPU=1)
-  expert_cache.py  GLM53_EC=1           elastic CLOCK cache of experts in all free VRAM + prefill staging
+  bigmoe.engine    GLM53_NV=2           shared expert-offload engine: loader skips the routed-expert bytes, elastic
+                                        VRAM cache + staged prefill, RAM tier, NVMe store, planner, CPU lane
   triton_pin.py    GLM53_TRITON_PIN     fixed Triton autotune picks for the KDA (linear attention) kernels
   k_hcfuse.py      GLM53_K_HCFUSE=1     fused hyper-connection decode sites (bit-exact)
   k_lookahead.py   GLM53_LA=1           C1 decode lookahead: next step enqueued on the device token (bit-exact)
@@ -46,12 +45,13 @@ def load():
     for var, mod in _NOT_INCLUDED.items():
         if os.environ.get(var) not in (None, "", "0"):
             sys.exit(f"{var}={os.environ[var]} needs upstream glm-flash-lite's {mod}, which bigmoe does not include")
-    if os.environ.get("GLM53_NV") in ("1", "2"):   # N116/N119 NVMe tier: loader skips the routed-expert bytes
-        from . import nv_tier
-        nv_tier.install()
-    if os.environ.get("GLM53_EC"):
-        from . import expert_cache
-        expert_cache.install()
+    engine = None
+    if os.environ.get("GLM53_NV") == "2":   # shared engine: loader skips the routed-expert bytes (NVMe expert store)
+        assert os.environ.get("GLM53_EC"), "GLM53_NV=2 needs GLM53_EC=1 (the VRAM expert cache)"
+        from bigmoe.engine import tiers as engine
+        engine.install()
+    elif os.environ.get("GLM53_NV") not in (None, "", "0") or os.environ.get("GLM53_EC"):
+        sys.exit("GLM53_NV must be 2 (the shared engine) when the expert cache is on")
     if os.environ.get("GLM53_TRITON_PIN"):
         from . import triton_pin
         triton_pin.install()
@@ -61,13 +61,8 @@ def load():
     if os.environ.get("GLM53_LA") == "1":   # N136: embedding table host-mapped (device-side lookup for lookahead)
         from . import k_lookahead
         k_lookahead.prep_model(model)
-    if os.environ.get("GLM53_EC"):
-        expert_cache.attach(model)
-    if os.environ.get("GLM53_NV") == "1":
-        nv_tier.finish(model)
-    if os.environ.get("GLM53_NV") == "2":
-        from . import nv2
-        nv2.finish(model)
+    if engine is not None:
+        engine.attach(model)   # pool + nv2 + routing hooks + bounce proxies + startup verify
     if os.environ.get("GLM53_K_HCFUSE") == "1":   # fused hyper-connection sites, bit-exact (k_hcfuse.py)
         from . import k_hcfuse
         k_hcfuse.install(model)
@@ -188,7 +183,7 @@ def _bcp_install():
     if BCP["installed"]:
         return
     BCP["installed"] = True
-    from . import nv2 as _nv2
+    from bigmoe.engine import nv2 as _nv2
     orig = model.forward
 
     def fwd(*a, **kw):
@@ -530,20 +525,17 @@ async def server_info():
 @app.get("/stats")
 async def stats():
     st = dict(G["stats"])
-    if os.environ.get("GLM53_EC"):
-        from . import expert_cache
-        st["expert_cache"] = expert_cache.summary()
+    if os.environ.get("GLM53_NV") == "2":
+        from bigmoe.engine import tiers as engine
+        st["expert_cache"] = engine.POOLS[0].summary() if engine.POOLS else None
     if os.environ.get("GLM53_K_HCFUSE") == "1":
         from . import k_hcfuse
         st["k_hcfuse"] = dict(k_hcfuse.STATS)
     if os.environ.get("GLM53_LA") == "1":
         from . import k_lookahead
         st["k_lookahead"] = k_lookahead.summary()
-    if os.environ.get("GLM53_NV") == "1":
-        from . import nv_tier
-        st["nv_tier"] = nv_tier.summary()
     if os.environ.get("GLM53_NV") == "2":
-        from . import nv2
+        from bigmoe.engine import nv2
         st["nv2"] = nv2.summary()
     if args.ngram_match_min:
         from . import ngram_policy
@@ -551,16 +543,10 @@ async def stats():
     return JSONResponse(st)
 
 
-@app.get("/nv_trace")
-async def nv_trace():
-    from . import nv_tier
-    return JSONResponse(nv_tier.save_trace())
-
-
 @app.get("/nv2_trace")
 async def nv2_trace(on: int = -1, path: str = ""):
     """Routing trace of decode-class layer calls (host engine): on=1 starts, on=0 stops + clears; path= saves (npy)."""
-    from . import nv2
+    from bigmoe.engine import nv2
     if on >= 0:
         nv2.ext().trace_set(int(on))
         return JSONResponse({"on": on})
@@ -574,7 +560,7 @@ async def nv2_trace(on: int = -1, path: str = ""):
 @app.get("/nv2_rate")
 async def nv2_rate(mbps: float = 0.0):
     """Emulate a slower NVMe device for capacity planning: reads complete no faster than mbps MB/s (0 = off)."""
-    from . import nv2
+    from bigmoe.engine import nv2
     nv2.ext().set_read_rate(float(mbps))
     return JSONResponse({"mbps": mbps})
 
@@ -603,14 +589,14 @@ async def host_tensors(min_mb: float = 32.0):
 @app.get("/nv2_host")
 async def nv2_host():
     """Host-engine counters only (no device access, safe to poll during generation)."""
-    from . import nv2
+    from bigmoe.engine import nv2
     return JSONResponse(nv2.NV.counters())
 
 
 @app.get("/router_bias")
 async def router_bias(path: str):
     """Selection biases of the routed layers in nv2 layer order, [L, E] float32 (.npy)."""
-    from . import nv2
+    from bigmoe.engine import nv2
     import numpy as np
     rows = []
     for m in nv2.NV.pool.mods:
@@ -625,7 +611,7 @@ async def cpu_bench(n: int = 20, k: int = 2, m: int = 1, li: int = 10, mode: int
                     knobs: str = ""):
     """CPU-lane forward speed on RAM-resident experts of layer li (server must be idle): k experts x m tokens.
     knobs: extra n135 knobs for this call only, e.g. "rg=16,rd=8"."""
-    from . import nv2
+    from bigmoe.engine import nv2
     while len(G["gen"].jobs):
         await asyncio.sleep(0.05)
     e = nv2.ext()
@@ -657,7 +643,7 @@ async def cpu_bench_dma(n: int = 40, k: int = 4, m: int = 1, li: int = 10, h2d: 
     """/cpu_bench while the GPU's copy engines stream host DRAM like a decode layer's copy phase does (H2D from a
     host_mb pinned buffer, cycling 9 MB chunks so the reads miss the CPU caches; D2H back into it): the CPU lane's
     per-expert time under PCIe DMA traffic to / from DRAM. Server must be idle. Diagnostics only."""
-    from . import nv2
+    from bigmoe.engine import nv2
     while len(G["gen"].jobs):
         await asyncio.sleep(0.05)
     e = nv2.ext()
@@ -730,11 +716,8 @@ async def gpu_prof(secs: float = 3.0, path: str = "", top: int = 40):
 
 @app.get("/nv_verify")
 async def nv_verify(n: int = 64):
-    if os.environ.get("GLM53_NV") == "2":
-        from . import nv2
-        return JSONResponse(nv2.NV.verify(n))
-    from . import nv_tier
-    return JSONResponse(nv_tier.NV.verify(n) if nv_tier.NV is not None else {"error": "GLM53_NV off"})
+    from bigmoe.engine import nv2
+    return JSONResponse(nv2.NV.verify(n) if nv2.NV is not None else {"error": "GLM53_NV off"})
 
 
 @app.get("/la")
@@ -749,7 +732,7 @@ async def la(on: int = 1):
 @app.post("/bcp")
 async def bcp_set(req: Request):
     b = await req.json()
-    from . import nv2 as _nv2
+    from bigmoe.engine import nv2 as _nv2
     _nv2.ext().set_lossy(int(b.get("on", 0)), float(b.get("eps", 0.0)), float(b.get("whi", 2.0)),
                          int(b.get("renorm", 0)), int(b.get("pf", 0)), int(b.get("bg", 0)), int(b.get("lo", 0)),
                          int(b.get("hi", 1 << 30)))
@@ -806,7 +789,7 @@ def main():
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     load()
     if os.environ.get("GLM53_MAIN_CPUS"):   # N119: GPU-feeding thread off the CPU-tier cores
-        from . import nv2
+        from bigmoe.engine import nv2
         os.sched_setaffinity(0, set(nv2._cpus(os.environ["GLM53_MAIN_CPUS"])))
         torch.set_num_threads(int(os.environ.get("GLM53_TORCH_THREADS", "1")))   # no spinning OpenMP pool on the tier cores
         print(f" -- main thread on cpus {sorted(os.sched_getaffinity(0))}", flush=True)

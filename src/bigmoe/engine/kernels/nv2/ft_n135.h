@@ -21,7 +21,7 @@ namespace {
 namespace n135 {
 
 // ------------------------------------------------------------------------------------------
-// knobs (bench: key=value; engine: env GLM53_NV_CPU_*)
+// knobs (bench: key=value; engine: env NV_CPU_*)
 // ------------------------------------------------------------------------------------------
 struct Knobs
 {
@@ -51,9 +51,9 @@ inline void configure(const std::map<std::string, std::string>& A)
 }
 inline void configure_env()
 {
-    auto g = [](const char* k, int& v) { const char* s = getenv(k); if (s && *s) v = atoi(s); };
-    g("GLM53_NV_CPU_KERN_P16", K_.kern); g("GLM53_NV_CPU_RG", K_.rg); g("GLM53_NV_CPU_CG", K_.cg); g("GLM53_NV_CPU_RD", K_.rd);
-    g("GLM53_NV_CPU_CD", K_.cd); g("GLM53_NV_CPU_PFR", K_.pfr); g("GLM53_NV_CPU_PFHINT", K_.pfhint); g("GLM53_NV_CPU_PFPRO", K_.pfpro); g("GLM53_NV_CPU_RT", K_.rt); g("GLM53_NV_CPU_BANDMAXM", K_.bandmaxm); g("GLM53_NV_CPU_MERGE", K_.merge); g("GLM53_NV_CPU_I16MAX", K_.i16max);
+    auto g = [](const char* k, int& v) { const char* s = penv(k); if (s && *s) v = atoi(s); };
+    g("NV_CPU_KERN_P16", K_.kern); g("NV_CPU_RG", K_.rg); g("NV_CPU_CG", K_.cg); g("NV_CPU_RD", K_.rd);
+    g("NV_CPU_CD", K_.cd); g("NV_CPU_PFR", K_.pfr); g("NV_CPU_PFHINT", K_.pfhint); g("NV_CPU_PFPRO", K_.pfpro); g("NV_CPU_RT", K_.rt); g("NV_CPU_BANDMAXM", K_.bandmaxm); g("NV_CPU_MERGE", K_.merge); g("NV_CPU_I16MAX", K_.i16max);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -71,29 +71,49 @@ alignas(32) inline uint8_t CTRLS[32][32];   // shared windows: group g decoded f
 // 16-bit states out at their bit offsets, instead of 4 window loads + 4 pshufb + 2 srlv + 2 sllv + 2 blends. The states,
 // the hash and the int16 sums are identical to pair_sums; vpdpwssd accumulates both halves of the C step in 16 lanes,
 // folded (low + high 8, exact int32) before each 8-row scale flush, so the per-lane int32 sums equal the AVX2 path's.
-alignas(64) inline uint8_t VB_PIDX[8][64];   // per C: vpermt2b indices (tile memory bytes)
-alignas(64) inline uint8_t VB_MSH[8][64];    // per C: vpmultishiftqb bit offsets
-inline bool vbmi_ok = false;                 // the CPU has AVX512 VBMI + VNNI, unless GLM53_NV_CPU_VBMI=0
+// Trellis formats (store v2): the VBMI tables are generated per format from the ring layout of exllamav3's trellis tiles
+// (quant/frac.cu): weight i of a 256-weight tile adds d(i) = KA + bit (i & 15) of MASK bits to a ring of 16 * K bits,
+// its 16-bit state is ring bits [S(i) - 16, S(i)) with S(i) the prefix sum of d, stored MSB-first in 32-bit words.
+// Integer K is KA = K, MASK = 0 (S(i) = K * (i + 1): the K = 3 formula 24 g + 3 j - 13 below is S(i) - 16).
+enum { TF_K2 = 0, TF_K25 = 1, TF_K3 = 2, TF_N = 3 };
+constexpr int TF_KA[TF_N] = { 2, 2, 3 };
+constexpr uint32_t TF_MASK[TF_N] = { 0, 0xAAAA, 0 };
+constexpr int TF_TB[TF_N] = { 64, 80, 96 };          // tile bytes = 32 * K
+inline int tf_of(double K) { return K == 2.0 ? TF_K2 : K == 2.5 ? TF_K25 : K == 3.0 ? TF_K3 : -1; }
+inline int tf_s(int f, int i)                          // S(i)
+{
+    int s = (i >> 4) * (16 * TF_KA[f] + __builtin_popcount(TF_MASK[f]));
+    for (int j = 0; j <= (i & 15); ++j) s += TF_KA[f] + ((TF_MASK[f] >> j) & 1);
+    return s;
+}
+inline int mem_of_stream_tb(int q, int tb) { q = ((q % tb) + tb) % tb; return 4 * (q / 4) + 3 - q % 4; }
+alignas(64) inline uint8_t VB_PIDX_F[TF_N][8][64];   // per format, per C: vpermt2b indices (tile memory bytes)
+alignas(64) inline uint8_t VB_MSH_F[TF_N][8][64];    // per format, per C: vpmultishiftqb bit offsets
+#define VB_PIDX VB_PIDX_F[TF_K3]
+#define VB_MSH VB_MSH_F[TF_K3]
+inline bool vbmi_ok = false;                 // the CPU has AVX512 VBMI + VNNI, unless NV_CPU_VBMI=0
 inline void init_vbmi()
 {
+    for (int f = 0; f < TF_N; ++f)
     for (int C = 0; C < 8; ++C)
         for (int m = 0; m < 8; ++m)
         {
-            // output qword m = 32-bit lanes 2m, 2m + 1: weights j0, j0 + 1 of groups gA (low halves) and gA + 1 (high)
+            // output qword m = 32-bit lanes 2m, 2m + 1: weights j0, j0 + 1 of groups gA (low halves) and gA + 1 (high);
+            // group g = ring positions 8g .. 8g + 7 (tensor-core thread g: column g / 4 and + 8, rows by g % 4)
             const int gA = 4 * C + (m < 4 ? 0 : 2), j0 = 2 * (m & 3);
-            const int PA = 24 * gA + 3 * j0 - 13;                   // stream bit of the first state (state_scalar)
+            const int PA = tf_s(f, 8 * gA + j0) - 16;              // ring bit of the first state's window
             const int qs = PA >= 0 ? PA / 8 : -((-PA + 7) / 8);
-            for (int i = 0; i < 8; ++i) VB_PIDX[C][8 * m + i] = uint8_t(mem_of_stream(qs + 7 - i));
+            for (int i = 0; i < 8; ++i) VB_PIDX_F[f][C][8 * m + i] = uint8_t(mem_of_stream_tb(qs + 7 - i, TF_TB[f]));
             const int st[4][2] = { { gA, j0 }, { gA + 1, j0 }, { gA, j0 + 1 }, { gA + 1, j0 + 1 } };
             for (int k = 0; k < 4; ++k)
             {
-                const int r = 24 * st[k][0] + 3 * st[k][1] - 13 - 8 * qs;
-                if (r < 0 || r > 48) { fprintf(stderr, "n135 vbmi table error C=%d m=%d\n", C, m); exit(1); }
-                VB_MSH[C][8 * m + 2 * k] = uint8_t(48 - r);
-                VB_MSH[C][8 * m + 2 * k + 1] = uint8_t(56 - r);
+                const int r = tf_s(f, 8 * st[k][0] + st[k][1]) - 16 - 8 * qs;
+                if (r < 0 || r > 48) { fprintf(stderr, "n135 vbmi table error f=%d C=%d m=%d r=%d\n", f, C, m, r); exit(1); }
+                VB_MSH_F[f][C][8 * m + 2 * k] = uint8_t(48 - r);
+                VB_MSH_F[f][C][8 * m + 2 * k + 1] = uint8_t(56 - r);
             }
         }
-    const char* e = getenv("GLM53_NV_CPU_VBMI");
+    const char* e = penv("NV_CPU_VBMI");
     vbmi_ok = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl")
               && __builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vnni") && !(e && atoi(e) == 0);
 }
@@ -246,11 +266,16 @@ inline void prep_block_v(const float* x, const uint16_t* suh, float* xt)
 // VBMI rows of a KIND 3 rect: same rows, tiles, prefetch and 8-row flushes as the AVX2 loop in rect(), accumulators in
 // 16 lanes per (C step, token) (acc16), folded to the AVX2 lane sums at each flush.
 #define N135_VBMI_TARGET __attribute__((target("avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")))
-template <int M>
+// F (trellis format) is a template parameter: tile size, load mask and tables are compile-time constants per format
+// (the K 3 instantiation is the original GLM-5.3 loop)
+template <int M, int F = TF_K3>
 N135_VBMI_TARGET void rect_rows_vbmi(const uint8_t* base, size_t row_stride, int r0, int R, int C, int kt,
                                      const void* const* xin, const float* const* qs, float* accf, int32_t* acc16,
                                      int lines, int pfr)
 {
+    constexpr int f = F;
+    constexpr int tb = TF_TB[F];
+    constexpr __mmask64 hmask = tb > 64 ? ((tb - 64 >= 64) ? ~0ull : ((1ull << (tb - 64)) - 1)) : 0ull;   // bytes 64..tb-1
     const __m512i c1 = _mm512_set1_epi16(short(MUL1 & 0xffff)), c2 = _mm512_set1_epi16(short(MUL1 >> 16));
     const __m512i one8 = _mm512_set1_epi8(1);
     auto pf = [&](const uint8_t* q) {
@@ -269,15 +294,15 @@ N135_VBMI_TARGET void rect_rows_vbmi(const uint8_t* base, size_t row_stride, int
         #pragma GCC unroll 1
         for (int t = 0; t < C; ++t)
         {
-            const uint8_t* tile = p + t * TILE_BYTES;
+            const uint8_t* tile = p + size_t(t) * tb;
             const __m512i ta = _mm512_loadu_si512(tile);
-            const __m512i tb = _mm512_maskz_loadu_epi8(0xFFFFFFFFull, tile + 64);   // bytes 64..95: never past the tile
+            const __m512i tbv = _mm512_maskz_loadu_epi8(hmask, tile + 64);   // bytes 64..tb-1: never past the tile
             int32_t* a16 = acc16 + size_t(t) * 128 * M;
             #pragma GCC unroll 8
             for (int c = 0; c < 8; ++c)
             {
-                const __m512i src = _mm512_permutex2var_epi8(ta, _mm512_load_si512(VB_PIDX[c]), tb);
-                const __m512i st = _mm512_multishift_epi64_epi8(_mm512_load_si512(VB_MSH[c]), src);
+                const __m512i src = _mm512_permutex2var_epi8(ta, _mm512_load_si512(VB_PIDX_F[f][c]), tbv);
+                const __m512i st = _mm512_multishift_epi64_epi8(_mm512_load_si512(VB_MSH_F[f][c]), src);
                 const __m512i lo = _mm512_mullo_epi16(st, c1);
                 const __m512i hi = _mm512_add_epi16(_mm512_mulhi_epu16(st, c1), _mm512_mullo_epi16(st, c2));
                 const __m512i sm = _mm512_add_epi16(_mm512_maddubs_epi16(lo, one8), _mm512_maddubs_epi16(hi, one8));
@@ -332,10 +357,16 @@ void rect(const Mat& mat, int r0, int R, int t0, int C, const void* const* xin, 
     const Consts K = consts();
     const KP P = kp();
     const int tiles_n = mat.n / 16;
-    const size_t row_stride = mat.swz ? size_t(8) * TILE_BYTES : size_t(tiles_n) * TILE_BYTES;
-    const uint8_t* base = mat.swz ? mat.tr + size_t(t0 / 8) * (mat.k / 16) * 8 * TILE_BYTES : mat.tr + size_t(t0) * TILE_BYTES;
-    const int lines = (C * TILE_BYTES + 63) / 64;
+    const int TBm = mat.tb;
+    const size_t row_stride = mat.swz ? size_t(8) * TBm : size_t(tiles_n) * TBm;
+    const uint8_t* base = mat.swz ? mat.tr + size_t(t0 / 8) * (mat.k / 16) * 8 * TBm : mat.tr + size_t(t0) * TBm;
+    const int lines = (C * TBm + 63) / 64;
     const int pfr = K_.pfr;
+    if (mat.tf != TF_K3 && !(KIND == 3 && vbmi_ok))
+    {
+        fprintf(stderr, "n135: trellis format %d needs the p16 VBMI kernel (kind %d, vbmi %d)\n", mat.tf, KIND, int(vbmi_ok));
+        std::abort();
+    }
     if constexpr (KIND == 3)
     {
         if (vbmi_ok)
@@ -343,7 +374,12 @@ void rect(const Mat& mat, int r0, int R, int t0, int C, const void* const* xin, 
             static thread_local int32_t* acc16 = nullptr;
             if (!acc16) acc16 = static_cast<int32_t*>(std::aligned_alloc(64, size_t(MAXCT) * 128 * 8 * 4));
             std::memset(acc16, 0, size_t(C) * 128 * M * 4);
-            rect_rows_vbmi<M>(base, row_stride, r0, R, C, mat.k / 16, xin, qs, accf, acc16, lines, pfr);
+            switch (mat.tf)
+            {
+            case TF_K2: rect_rows_vbmi<M, TF_K2>(base, row_stride, r0, R, C, mat.k / 16, xin, qs, accf, acc16, lines, pfr); break;
+            case TF_K25: rect_rows_vbmi<M, TF_K25>(base, row_stride, r0, R, C, mat.k / 16, xin, qs, accf, acc16, lines, pfr); break;
+            default: rect_rows_vbmi<M, TF_K3>(base, row_stride, r0, R, C, mat.k / 16, xin, qs, accf, acc16, lines, pfr); break;
+            }
             for (int i = 0; i < M; ++i)
                 for (int t = 0; t < C; ++t)
                     for (int c = 0; c < 8; ++c)
@@ -667,7 +703,7 @@ struct Fwd4
     std::vector<uint8_t> jlate;
     std::vector<Ctr> c_bind;            // 0 unbound, 1 binding, 2 bound, 3 failed (skipped)
     std::vector<Ctr> c_dlate;           // 0 unchecked, 1 checking, 2 landed
-    // streaming (engine GLM53_NV_STREAM): wait(e, lo, hi) blocks until bytes [lo, hi) of late expert e's record have
+    // streaming (engine NV_STREAM): wait(e, lo, hi) blocks until bytes [lo, hi) of late expert e's record have
     // landed (false: read failed, the job is skipped); off_u / off_d: record offsets of the up / down matrices
     const std::function<bool(int, int64_t, int64_t)>* wait = nullptr;
     int64_t off_u = 0, off_d = 0;
@@ -676,7 +712,7 @@ struct Fwd4
 // streaming: the record bytes of tile rows [r0, r0 + R) of a native-layout matrix at record offset moff
 inline bool wait_rows(Fwd4& F, int j, const Mat& M, int64_t moff, int r0, int R)
 {
-    const int64_t rs = int64_t(M.n / 16) * TILE_BYTES;
+    const int64_t rs = int64_t(M.n / 16) * M.tb;
     if ((*F.wait)(F.jobs[j].e, moff + r0 * rs, moff + int64_t(r0 + R) * rs)) return true;
     F.c_bind[j].v.store(3, std::memory_order_release);   // read failed: the out units skip this job
     return false;
@@ -762,11 +798,12 @@ inline void fwd4_fn(void* vc, int, int)
                 xp[i] = (U.which ? F.xu : F.xg).data() + size_t(s0 + i) * XH;
                 qs[i] = (U.which ? F.qu : F.qg).data() + size_t(s0 + i) * BH;
             }
-            const int tk = M.k / 16, R = F.rg, C = F.cg;
+            // store v2: the last column band of a row is clipped (DeepSeek: I / 16 = 144 tiles = 128 + 16)
+            const int tk = M.k / 16, R = F.rg, C = std::min(F.cg, M.n / 16 - U.b * F.cg);
             if (F.wait && F.jlate[U.j]) wait_rows(F, U.j, M, U.which ? F.off_u : 0, U.a * R, std::min(R, tk - U.a * R));
             // partials [band][slot][I]
-            float* y = (U.which ? F.pu : F.pg).data() + (size_t(U.a) * F.ns + s0) * I + size_t(U.b) * C * 16;
-            rect_m(F.kind, J.m, M, U.a * R, std::min(R, tk - U.a * R), U.b * C, C, xp, qs, y, I);
+            float* y = (U.which ? F.pu : F.pg).data() + (size_t(U.a) * F.ns + s0) * I + size_t(U.b) * F.cg * 16;
+            rect_m(F.kind, J.m, M, U.a * R, std::min(R, tk - U.a * R), U.b * F.cg, C, xp, qs, y, I);
             F.c_gu[U.j].v.fetch_add(1, std::memory_order_release);
         }
         else if (U.kind == U_ACT)
@@ -823,9 +860,10 @@ inline void fwd4_fn(void* vc, int, int)
             }
             const void* xp[MAXM]; const float* qs[MAXM];
             for (int i = 0; i < J.m; ++i) { xp[i] = F.xd.data() + size_t(s0 + i) * XI; qs[i] = F.qd.data() + size_t(s0 + i) * BI; }
-            const int tk = E.d.k / 16, R = F.rd, C = F.cd;
-            float* y = F.pd.data() + (size_t(U.a) * F.ns + s0) * H + size_t(U.b) * C * 16;
-            rect_m(F.kind, J.m, E.d, U.a * R, std::min(R, tk - U.a * R), U.b * C, C, xp, qs, y, H);
+            // store v2: the last column band is clipped (DeepSeek: H / 16 = 320 tiles = 128 + 128 + 64)
+            const int tk = E.d.k / 16, R = F.rd, C = std::min(F.cd, E.d.n / 16 - U.b * F.cd);
+            float* y = F.pd.data() + (size_t(U.a) * F.ns + s0) * H + size_t(U.b) * F.cd * 16;
+            rect_m(F.kind, J.m, E.d, U.a * R, std::min(R, tk - U.a * R), U.b * F.cd, C, xp, qs, y, H);
             F.c_down[U.j].v.fetch_add(1, std::memory_order_release);
         }
         else
@@ -892,6 +930,10 @@ void moe_forward4(PoolT& pool, const Layer& L, const float* x, int ntok, const s
     F.ns = ns;
     F.mode = mode >= 0 ? mode : (maxm <= K_.i16max ? 2 : 0);
     F.kind = F.mode == 2 ? (K_.kern ? 3 : 2) : F.mode;
+    {   // store v2: formats other than K 3 decode in the p16 VBMI kernel only (I16 activations, any tokens per expert)
+        const Expert& E0 = L.ex[F.jobs[0].e];
+        if (E0.g.tf != TF_K3 || E0.u.tf != TF_K3 || E0.d.tf != TF_K3) { F.mode = 2; F.kind = 3; }
+    }
     const int tkg = H / 16, tng = I / 16, tkd = I / 16, tnd = H / 16;
     const bool band = maxm <= K_.bandmaxm;
     F.rg = band && K_.rg > 0 ? std::min(K_.rg, tkg) : tkg; F.cg = band ? std::min(K_.cg, tng) : 8;

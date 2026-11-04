@@ -1,8 +1,8 @@
-"""N119 nv2: S2 (exact, device-side stall) and S3 (+ AVX2 CPU tier on RAM-resident experts) NVMe expert tier for the
-G067 stack (GLM53_NV=2; GLM53_MODE=nvme2 / nvme3 in the entrypoint). Builds on nv_tier.py's loader (expert trellis
--> one VRAM bounce slot, nothing read) and expert_cache.py's VRAM CLOCK pool.
+"""nv2: RAM tier, NVMe reads, planner and CPU lane of the shared engine (exact mode: every pick on the GPU path with a
+device-side stall; mode nvme: + CPU lane on RAM-resident / streamed experts). Builds on tiers.py's loader (expert
+trellis -> one VRAM bounce slot, nothing read) and VRAM CLOCK pool. Knobs below are <prefix>NAME (env.py).
 
-Per MoE layer call with <= GLM53_EC_STAGE_MIN picks (decode, small forwards), no host sync:
+Per MoE layer call with <= EC_STAGE_MIN picks (decode, small forwards), no host sync:
   nv_pub   device publishes the layer's unique picks (+ the MoE input rows for a CPU job) to a mapped request ring
   host     controller thread (nv2_host.cpp) drains the device's write-back / admission logs, runs plan_layer (moetier
            semantics: lanes gpu | zerocopy (= GPU-admitted RAM expert) | cpu | nvme->gpu | nvme->cpu, greedy min-max,
@@ -15,37 +15,39 @@ Per MoE layer call with <= GLM53_EC_STAGE_MIN picks (decode, small forwards), no
   MoE      exllamav3's kernels, unchanged, on the live pointer tables
   combine  waits for the CPU job (bounded), adds its fp32 partial
 Prefill (>= stage_min picks): staging buffers filled on the copy stream from RAM slots (pinned for the forward) and,
-for NVMe-only experts, from a pinned FIFO ring that a reader fills several layers ahead (GLM53_NV_PF_RING slots).
-Env: GLM53_NV_RAM_GB (auto), GLM53_NV_MARGIN_GB (1), GLM53_NV_THREADS (16 readers), GLM53_NV_PIECE_KB (2304),
-     GLM53_NV_PF_RING (128), GLM53_NV_PF_QD (24), GLM53_NV_EXCL (1), GLM53_NV_ELASTIC_WB (1), GLM53_NV_LAND (64),
-     GLM53_NV_FREE_LO (96), GLM53_NV_CPU (0: S2; 1: S3 CPU tier), GLM53_NV_NVCPU (0), GLM53_NV_CPU_CPUS (2-23),
-     GLM53_NV_CPU_MODE (-1 auto), GLM53_NV_CLAMP (1: swiglu clamp on the CPU share, B004 fix), GLM53_NV_POL (cost model
-     "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone"), GLM53_NV_MAXCPU (32), GLM53_NV_CTL_CPU (25),
-     GLM53_NV_READER_CPUS (26-39), GLM53_NV_TIMEOUT_S (20), GLM53_NV_COPY_GRID (48)
-2026-10-20 (nv2_host.cpp): GLM53_NV_TNZC (0.6 ms: GPU cost of a zero-copy NVMe pick after landing; < 0 legacy model),
-     GLM53_NV_PARTIAL (1: an NVMe->CPU job binds at gate+up landing, down units wait), GLM53_NV_PRIO (1: reader classes
-     demand > prefetch > bulk), GLM53_NV_HI_MB (12) / GLM53_NV_LO_MB (6) in-flight caps, GLM53_NV_PF_LIFO (1),
-     GLM53_NV_DPIECE_KB (512: decode read pieces), GLM53_NV_WB_EARLY (1: write-backs drained at nv_copy completion),
-     GLM53_NV_PF_MULTI (2 prefetch hints per verify-window token), GLM53_NV_RZC1 (1: verify windows do not admit RAM picks
-     of one token), GLM53_NV_STG / GLM53_NV_STG_MAX (0 / 3: layer-ahead DMA staging pool, experimental, off) with
-     GLM53_NV_STG_GATE (2: DMA after the copy kernel unless the MoE reads zero-copy, then after the MoE kernel),
-     GLM53_NV_PF_RING_BORROW (1: the prefill ring borrows RAM-tier slots during a staged prefill).
-     Round 3: GLM53_NV_STREAM (1: an NVMe->CPU pick is bound when its read starts and each gate / up / down band of the
-     CPU lane waits only for the read pieces that hold it), GLM53_NV_TRACK_QD (0: pieces of one decode read in flight,
-     uncapped), GLM53_NV_CBT (planner: CPU time left for a streamed NVMe->CPU pick after its last byte lands, ms; < 0
-     legacy), GLM53_NV_CTL_MWX (20000) / GLM53_NV_LANE_MWX (0): MWAITX timer cycles for the controller's / CPU lane's waits
+for NVMe-only experts, from a pinned FIFO ring that a reader fills several layers ahead (NV_PF_RING slots).
+Env: NV_RAM_GB (auto), NV_MARGIN_GB (1), NV_THREADS (16 readers), NV_PIECE_KB (2304),
+     NV_PF_RING (128), NV_PF_QD (24), NV_EXCL (1), NV_ELASTIC_WB (1), NV_LAND (64),
+     NV_FREE_LO (96), NV_CPU (0: S2; 1: S3 CPU tier), NV_NVCPU (0), NV_CPU_CPUS (2-23),
+     NV_CPU_MODE (-1 auto), NV_CLAMP (1: swiglu clamp on the CPU share, B004 fix), NV_POL (cost model
+     "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone"), NV_MAXCPU (32), NV_CTL_CPU (25),
+     NV_READER_CPUS (26-39), NV_TIMEOUT_S (20), NV_COPY_GRID (48)
+2026-10-20 (nv2_host.cpp): NV_TNZC (0.6 ms: GPU cost of a zero-copy NVMe pick after landing; < 0 legacy model),
+     NV_PARTIAL (1: an NVMe->CPU job binds at gate+up landing, down units wait), NV_PRIO (1: reader classes
+     demand > prefetch > bulk), NV_HI_MB (12) / NV_LO_MB (6) in-flight caps, NV_PF_LIFO (1),
+     NV_DPIECE_KB (512: decode read pieces), NV_WB_EARLY (1: write-backs drained at nv_copy completion),
+     NV_PF_MULTI (2 prefetch hints per verify-window token), NV_RZC1 (1: verify windows do not admit RAM picks
+     of one token), NV_STG / NV_STG_MAX (0 / 3: layer-ahead DMA staging pool, experimental, off) with
+     NV_STG_GATE (2: DMA after the copy kernel unless the MoE reads zero-copy, then after the MoE kernel),
+     NV_PF_RING_BORROW (1: the prefill ring borrows RAM-tier slots during a staged prefill).
+     Round 3: NV_STREAM (1: an NVMe->CPU pick is bound when its read starts and each gate / up / down band of the
+     CPU lane waits only for the read pieces that hold it), NV_TRACK_QD (0: pieces of one decode read in flight,
+     uncapped), NV_CBT (planner: CPU time left for a streamed NVMe->CPU pick after its last byte lands, ms; < 0
+     legacy), NV_CTL_MWX (20000) / NV_LANE_MWX (0): MWAITX timer cycles for the controller's / CPU lane's waits
      on AMD (0 = PAUSE spins). timeline() also reports the CPU tail after the last landing of any NVMe pick and the
      lane's time per RAM expert in layers without NVMe picks.
      Diagnostics: timeline() (per-layer breakdown in summary()), ext().trace_set / trace_take (routing trace)
-N137 B70 expert tier (needs the CPU tier, GLM53_NV_CPU=1): GLM53_B70 (0), GLM53_B70_RING (/run/local-ai/shared/b70.ring,
-     created by b70tier/b70srv.py on the B70), GLM53_B70_N (3000 experts), GLM53_B70_ORDER (score: warm-score order after the VRAM warm
-     set | rr: the RAM tier's round-robin rank), GLM53_B70_TIMEOUT_S (2). Decode picks of B70-resident experts are masked
+N137 B70 expert tier (needs the CPU tier, NV_CPU=1): B70 (0), B70_RING (/run/local-ai/shared/b70.ring,
+     created by b70tier/b70srv.py on the B70), B70_N (3000 experts), B70_ORDER (score: warm-score order after the VRAM warm
+     set | rr: the RAM tier's round-robin rank), B70_TIMEOUT_S (2). Decode picks of B70-resident experts are masked
      on the 3090 and computed on the B70; their RAM copies are dropped (exclusive) and RAM refills with colder experts.
 """
 import collections, concurrent.futures as cf, ctypes, json, mmap, os, signal, threading, time
 import numpy as np
 import torch
-from . import nv_tier as NT
+
+from .env import env, build_dir
+from . import tiers as NT
 
 GiB = 1024 ** 3
 _EXT = None
@@ -74,11 +76,11 @@ def ext():
     global _EXT
     if _EXT is None:
         from torch.utils.cpp_extension import load
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        here = os.path.join(root, "kernels", "nv2")   # nv2_host.cpp, nv2_dev.cu, nv2_shared.h, ft_core.h
-        d = os.environ.get("GLM53_NV2_BUILD", os.path.join(root, "build", "nv2"))
+        root = os.path.dirname(os.path.abspath(__file__))
+        here = os.path.join(root, "kernels", "nv2")   # nv2_host.cpp, nv2_dev.cu, nv2_shared.h, ft_core.h, ft_n135.h
+        d = build_dir("NV2", os.path.join(root, "build", "nv2"))
         os.makedirs(d, exist_ok=True)
-        _EXT = load(name="glm53_nv2", sources=[os.path.join(here, "nv2_host.cpp"), os.path.join(here, "nv2_dev.cu")],
+        _EXT = load(name="bigmoe_nv2", sources=[os.path.join(here, "nv2_host.cpp"), os.path.join(here, "nv2_dev.cu")],
                     build_directory=d, extra_cflags=["-O3", "-mavx2", "-mfma", "-mf16c", "-mtune=znver3", "-std=c++17",
                                                      "-I" + here],
                     extra_cuda_cflags=["-O3", "-I" + here], extra_ldflags=["-lpthread"], verbose=False)
@@ -100,6 +102,21 @@ def _mapped(nbytes, dev_idx, tag):
     return mm, a, t
 
 
+class _Arenas:
+    """Several HostArenas as one slot id space (RAM slot classes): addr[s], view(s, n)."""
+
+    def __init__(self, arenas):
+        self.arenas = arenas
+        self.addr = np.concatenate([a.addr for a in arenas]) if arenas else np.zeros(0, np.int64)
+        self.n = len(self.addr)
+        self.base = np.cumsum([0] + [a.n for a in arenas])
+
+    def view(self, s, n=None):
+        i = int(np.searchsorted(self.base, s, side="right") - 1)
+        a = self.arenas[i]
+        return a.view(s - int(self.base[i]), n or a.slot)
+
+
 class Nv2:
     def __init__(self, pool):
         e = ext()
@@ -109,34 +126,45 @@ class Nv2:
         self.pool = pool
         self.dev = pool.device
         dev_idx = self.dev.index or 0
-        self.store, man = NT._manifest()
-        self.rec_bytes = man["record_bytes"]
-        self.slot = man["vram_slot"]["slot_bytes"]
-        assert (pool.sg, pool.su, pool.sd) == (3145728, 3145728, 3145728) and pool.rec == self.slot
-        assert pool.off_u == man["vram_slot"]["off_u"] and pool.off_d == man["vram_slot"]["off_d"]
+        man = NT.manifest()
+        self.store = man["_store"]
+        self.slot = pool.rec                      # uniform slot: the largest layer's trellis (store v2)
         assert pool.first == 0 and pool.E == man["experts_per_layer"]
-        li_of = {L["key"]: L["li"] for L in man["layers"]}
-        assert [li_of[m.key] for m in pool.mods] == list(range(len(pool.mods))), "pool layer order != store layer order"
+        li_of = {L["key"]: L for L in man["layers"]}
+        assert [li_of[m.key]["li"] for m in pool.mods] == list(range(len(pool.mods))), "pool layer order != store order"
+        geom = []
+        for li, m in enumerate(pool.mods):
+            Ly = li_of[m.key]
+            sg, su, sd, ou, od = pool.geom(li)
+            assert (Ly["trellis_bytes"], Ly["off_u"], Ly["off_d"]) == (sg + su + sd, ou, od), (m.key, Ly, pool.geom(li))
+            geom.append([Ly["base"], Ly["rec_bytes"], Ly["trellis_bytes"], ou, od])
+        self.geomt = torch.tensor(geom, dtype=torch.int64)
+        self.klen = np.repeat(self.geomt[:, 2].numpy(), pool.E)
         self.L, self.E = len(pool.mods), pool.E
         self.K = self.L * self.E
         m0 = pool.mods[0]
         self.H, self.I = m0.hidden_size, m0.intermediate_size
         self.act_limit = float(getattr(m0, "act_limit", 0.0) or 0.0)
-        g = lambda k, d: os.environ.get(k, d)
-        self.cpu_on = g("GLM53_NV_CPU", "0") == "1"
-        self.b70 = g("GLM53_B70", "0") == "1"
-        assert not self.b70 or self.cpu_on, "GLM53_B70=1 needs the CPU tier (GLM53_NV_CPU=1): the CPU worker runs the B70 lane"
-        self.b70_ring = g("GLM53_B70_RING", "/run/local-ai/shared/b70.ring")
-        self.b70_timeout = float(g("GLM53_B70_TIMEOUT_S", "2"))
+        self.topk = int(m0.num_experts_per_tok)
+        # predictor activation per layer, from the routing function exllamav3 picked (before the engine hooks it)
+        from exllamav3.modules import block_sparse_mlp_routing as R
+        self.route_act = [getattr(R, "ROUTING_ACT_SQRTSP", 1) if "sqrtsp" in getattr(m.routing_fn, "__name__", "") else
+                          R.ROUTING_ACT_SIGMOID for m in pool.mods]
+        g = env
+        self.cpu_on = g("NV_CPU", "0") == "1"
+        self.b70 = g("B70", "0") == "1"
+        assert not self.b70 or self.cpu_on, "B70=1 needs the CPU tier (NV_CPU=1): the CPU worker runs the B70 lane"
+        self.b70_ring = g("B70_RING", "/run/local-ai/shared/b70.ring")
+        self.b70_timeout = float(g("B70_TIMEOUT_S", "2"))
         self.b70_keys = []
-        self.timeout_ns = int(float(g("GLM53_NV_TIMEOUT_S", "5")) * 1e9)
-        self.grid = int(g("GLM53_NV_COPY_GRID", "48"))
-        self.wb_on = g("GLM53_NV_EXCL", "1") == "1"
-        self.prefetch = g("GLM53_NV_PREFETCH", "0") == "1"
+        self.timeout_ns = int(float(g("NV_TIMEOUT_S", "5")) * 1e9)
+        self.grid = int(g("NV_COPY_GRID", "48"))
+        self.wb_on = g("NV_EXCL", "1") == "1"
+        self.prefetch = g("NV_PREFETCH", "0") == "1"
         # N136: the layer-ahead routing guess runs on a side stream concurrently with this layer's router (both read the
-        # same MoE input; 36-block GEMVs on an 82-SM card), instead of after it on the compute stream (GLM53_NV_PFSIDE=1;
+        # same MoE input; 36-block GEMVs on an 82-SM card), instead of after it on the compute stream (NV_PFSIDE=1;
         # single-row decode only, see predict_early)
-        self.pfside = self.prefetch and g("GLM53_NV_PFSIDE", "0") == "1"
+        self.pfside = self.prefetch and g("NV_PFSIDE", "0") == "1"
         self._pfe = None
         if self.pfside:
             self.side = torch.cuda.Stream(self.dev)
@@ -144,7 +172,7 @@ class Nv2:
             self._pfev_i = 0
         self._pfb = {}
         self._pfb = {}
-        self.elastic_wb = self.wb_on and g("GLM53_NV_ELASTIC_WB", "1") == "1"
+        self.elastic_wb = self.wb_on and g("NV_ELASTIC_WB", "1") == "1"
         self.fd = os.open(self.store, os.O_RDONLY | os.O_DIRECT)
         self.ph_t = torch.zeros(self.slot, dtype=torch.uint8, device=self.dev)
         self.ph = self.ph_t.data_ptr()
@@ -174,36 +202,50 @@ class Nv2:
         self.home = self.ct[self.off["home"]: self.off["home"] + self.K * 24].view(torch.int64)
         self.res = self.ct[self.off["res"]: self.off["res"] + self.K * 4].view(torch.int32)
         # ---- RAM tier + prefill ring sizes
-        ring_pf = int(g("GLM53_NV_PF_RING", "128"))
+        ring_pf = int(g("NV_PF_RING", "128"))
         # the prefill ring borrows RAM-tier slots for the duration of a staged prefill instead of owning its own memory
-        self.ring_borrow = g("GLM53_NV_PF_RING_BORROW", "1") == "1"
+        self.ring_borrow = g("NV_PF_RING_BORROW", "1") == "1"
         ring_own = 1 if self.ring_borrow else ring_pf
-        margin = float(g("GLM53_NV_MARGIN_GB", "1")) * GiB
+        margin = float(g("NV_MARGIN_GB", "1")) * GiB
         mem = NT.cgroup_mem()
-        want = g("GLM53_NV_RAM_GB", "auto")
+        want = g("NV_RAM_GB", "auto")
         if want == "auto":
-            assert mem.get("max"), "GLM53_NV_RAM_GB=auto needs a memory-capped container"
+            assert mem.get("max"), "NV_RAM_GB=auto needs a memory-capped container"
             # exl3_patch's end-of-turn tail checkpoints live outside the -rcs budget: up to 4 x ~143 MB
-            tails = 0.6 * GiB if g("GLM53_EXL3_PATCHES", "1") == "1" else 0
+            tails = 0.6 * GiB if g("EXL3_PATCHES", "1") == "1" else 0
             avail = (mem["max"] - mem["current"]) * GiB - margin - ring_own * self.slot - NT._rcs_bytes() - tails - 0.3 * GiB
-            nram = max(0, int(avail // self.slot))
         else:
-            nram = int(float(want) * GiB // self.slot)
+            avail = float(want) * GiB
+        avail = max(0, avail)
+        # RAM slot classes (NV_RAMCLS=1): full slots for the large-record layers, small slots for the layers whose
+        # trellis fits the smallest layer size, the same number of slots per layer either way
+        lens = self.geomt[:, 2].tolist()
+        self.small_bytes = int(min(lens))
+        n_small_layers = sum(1 for x in lens if x <= self.small_bytes)
+        if g("NV_RAMCLS", "1") == "1" and self.small_bytes < self.slot and n_small_layers < len(lens):
+            per_layer = avail / (self.slot * (len(lens) - n_small_layers) + self.small_bytes * n_small_layers)
+            n_full, n_small = int(per_layer * (len(lens) - n_small_layers)), int(per_layer * n_small_layers)
+        else:
+            n_full, n_small, self.small_bytes = int(avail // self.slot), 0, 0
+        nram = n_full + n_small
         NT._log(f"nv2: rcs reserve {NT._rcs_bytes() / GiB:.1f} GiB, margin {margin / GiB:.1f} GiB, prefill ring {ring_pf} "
                 f"slots ({'borrowed from the RAM tier' if self.ring_borrow else f'{ring_pf * self.slot / GiB:.2f} GiB'}) -> "
-                f"RAM tier {nram} slots ({nram * self.slot / GiB:.2f} GiB)")
-        self.ram = NT.HostArena(nram, self.slot, 512, dev_idx, "ram")
+                f"RAM tier {nram} slots ({n_full} x {self.slot / 1e6:.2f} MB + {n_small} x {self.small_bytes / 1e6:.2f} MB = "
+                f"{(n_full * self.slot + n_small * self.small_bytes) / GiB:.2f} GiB)")
+        self.ram = _Arenas([NT.HostArena(n_full, self.slot, 512, dev_idx, "ram")] +
+                           ([NT.HostArena(n_small, self.small_bytes, 512, dev_idx, "ram_small")] if n_small else []))
+        self.slot_cls = torch.tensor([0] * n_full + [1] * n_small, dtype=torch.int8)
         self.nram = nram
         self.pf = NT.HostArena(ring_own, self.slot, ring_own, dev_idx, "pfring")
         NT._log(f"nv2: RAM arena + prefill ring registered")
         # VRAM victim ring (write-back source: nv_copy parks the victim's bytes here D2D, the host drains it D2H on a
         # copy engine; SM stores to host memory run at ~4 GB/s vs 25 GB/s for the DMA engine)
-        nvr = int(g("GLM53_NV_VRING", "32")) if self.wb_on else 0
+        nvr = int(g("NV_VRING", "32")) if self.wb_on else 0
         self.vring = torch.empty((max(nvr, 1), self.slot), dtype=torch.uint8, device=self.dev) if nvr else None
         self.vring_addr = [self.vring[i].data_ptr() for i in range(nvr)] if nvr else []
         self.ram_addr_dev = torch.tensor(self.vring_addr or [0], dtype=torch.int64, device=self.dev)
-        # layer-ahead VRAM staging pool (GLM53_NV_STG slots, GLM53_NV_STG_MAX per layer; 0 = off)
-        nstg = int(g("GLM53_NV_STG", "0"))
+        # layer-ahead VRAM staging pool (NV_STG slots, NV_STG_MAX per layer; 0 = off)
+        nstg = int(g("NV_STG", "0"))
         self.stg = torch.empty((max(nstg, 1), self.slot), dtype=torch.uint8, device=self.dev) if nstg else None
         self.stg_addr = [self.stg[i].data_ptr() for i in range(nstg)] if nstg else []
         self.stg_addr_dev = torch.tensor(self.stg_addr or [0], dtype=torch.int64, device=self.dev)
@@ -217,7 +259,7 @@ class Nv2:
         self.sel_out = torch.empty(16384, dtype=torch.int64, device=self.dev)
         self.w_out = torch.empty(16384, dtype=torch.half, device=self.dev)
         # ---- scores (tie-break: colder first to the CPU)
-        sp = g("GLM53_EC_WARM", "")
+        sp = g("EC_WARM", "")
         self.scores = json.load(open(sp)) if sp else {}
         sc = np.zeros(self.K, np.float32)
         for li, m in enumerate(pool.mods):
@@ -225,22 +267,22 @@ class Nv2:
             if s is not None:
                 sc[li * self.E:(li + 1) * self.E] = np.asarray(s[:self.E], np.float32)
         # ---- host engine
-        rcpus = _cpus(g("GLM53_NV_READER_CPUS", "26-39"))
-        e.init(self.L, self.E, H, self.I, self.rec_bytes, self.slot, int(g("GLM53_NV_PIECE_KB", "2304")) * 1024,
+        rcpus = _cpus(g("NV_READER_CPUS", "26-39"))
+        e.init(self.L, self.E, H, self.I, self.geomt, self.slot, int(g("NV_PIECE_KB", "2304")) * 1024,
                pool.off_u, pool.off_d, self.fd, self.ph, self.a["hc"], self.a["req"], self.a["rep"], self.a["wbl"],
                self.a["adml"], self.a["land"], self.a["home"], self.a["res"], self.a["hx"], self.a["hout"],
                torch.tensor(self.ram.addr.tolist(), dtype=torch.int64), torch.tensor(self.pf.addr.tolist(), dtype=torch.int64),
-               torch.from_numpy(sc), int(g("GLM53_NV_THREADS", "16")), rcpus, int(g("GLM53_NV_CTL_CPU", "25")),
-               int(self.wb_on), int(g("GLM53_NV_LAND", "64")), int(g("GLM53_NV_FREE_LO", "96")),
-               torch.tensor(self.vring_addr, dtype=torch.int64))
-        e.set_stage_qd(int(g("GLM53_NV_PF_QD", "24")))
+               torch.from_numpy(sc), int(g("NV_THREADS", "16")), rcpus, int(g("NV_CTL_CPU", "25")),
+               int(self.wb_on), int(g("NV_LAND", "64")), int(g("NV_FREE_LO", "96")),
+               torch.tensor(self.vring_addr, dtype=torch.int64), self.slot_cls, int(self.small_bytes))
+        e.set_stage_qd(int(g("NV_PF_QD", "24")))
         if self.ring_borrow:
             e.set_ring_borrow(ring_pf)
         if self.stg_addr:
-            e.stg_init(torch.tensor(self.stg_addr, dtype=torch.int64), int(g("GLM53_NV_STG_MAX", "3")))
-        pol = [float(x) for x in g("GLM53_NV_POL", "0.17,0.023,0.38,0.145,0.165,0.040,0.40,0.12,0.395,0.75").split(",")]
-        self.pol = pol + [1.0 if self.cpu_on else 0.0, 1.0 if g("GLM53_NV_NVCPU", "1" if self.cpu_on else "0") == "1" else 0.0,
-                          float(g("GLM53_NV_MAXCPU", "32")), 1.0 if g("GLM53_NV_NOADMIT", "1" if self.cpu_on else "0") == "1" else 0.0]
+            e.stg_init(torch.tensor(self.stg_addr, dtype=torch.int64), int(g("NV_STG_MAX", "3")))
+        pol = [float(x) for x in g("NV_POL", "0.17,0.023,0.38,0.145,0.165,0.040,0.40,0.12,0.395,0.75").split(",")]
+        self.pol = pol + [1.0 if self.cpu_on else 0.0, 1.0 if g("NV_NVCPU", "1" if self.cpu_on else "0") == "1" else 0.0,
+                          float(g("NV_MAXCPU", "32")), 1.0 if g("NV_NOADMIT", "1" if self.cpu_on else "0") == "1" else 0.0]
         e.set_pol(self.pol)
         # ---- the pool reads homes from the mapped table from now on (ec_step / ec_copy / ec_evict take its address)
         pool.home = self.home.view(self.L, self.E, 3)
@@ -255,7 +297,7 @@ class Nv2:
         e.start()
         self._wd = threading.Thread(target=self._watchdog, daemon=True)
         self._wd.start()
-        NT._log(f"nv2 engine up: {self.L} layers x {self.E}, readers {g('GLM53_NV_THREADS', '16')} on {rcpus[:3]}.., "
+        NT._log(f"nv2 engine up: {self.L} layers x {self.E}, readers {g('NV_THREADS', '16')} on {rcpus[:3]}.., "
                 f"exclusive {self.wb_on}, CPU tier {self.cpu_on}")
 
     # ------------------------------------------------------------------------------------------------------------
@@ -299,8 +341,17 @@ class Nv2:
         rank = []    # round-robin by rank across layers (top-1 of every layer first)
         for r in range(self.E):
             rank += [order[li][r] for li in range(self.L)]
+        # per RAM slot class: at most that class's slot count (a class never evicts its own warm reads)
+        lens = self.geomt[:, 2].numpy()
+        ncls = [int((self.slot_cls == 0).sum()), int((self.slot_cls == 1).sum())]
+        cls_of = lambda k: 1 if (ncls[1] and lens[k // self.E] <= self.small_bytes) else 0
+        take, used = [], [0, 0]
+        for k in rank:
+            c = cls_of(k)
+            if used[c] < ncls[c]:
+                take.append(k); used[c] += 1
         t = time.perf_counter()
-        n1 = ext().warm_read(torch.tensor(rank[:self.nram], dtype=torch.int64))
+        n1 = ext().warm_read(torch.tensor(take, dtype=torch.int64))
         ext().nv_rows_all(self.L, self.E, p.slotof, self.a["home"], p.tabs)
         torch.cuda.synchronize(self.dev)
         NT._log(f"nv2 RAM warm: {n1} experts in {time.perf_counter() - t:.1f} s")
@@ -337,8 +388,8 @@ class Nv2:
 
     def _b70_pick(self, so):
         """B70 key set: the next experts after the 3090's VRAM warm set, by warm score (or the RAM tier's rank order)."""
-        n = int(os.environ.get("GLM53_B70_N", "3000"))
-        if os.environ.get("GLM53_B70_ORDER", "score") == "rr":
+        n = int(env("B70_N", "3000"))
+        if env("B70_ORDER", "score") == "rr":
             order = self._rank
         else:
             sc = np.full(self.K, -1.0)
@@ -393,21 +444,23 @@ class Nv2:
                 self.st["pf_side"] += 1
             else:
                 pf = self._predict(li + 1, z, bsz)
-            npf = bsz * 8
+            npf = bsz * self.topk
             son = p.slotof[li + 1]
         lgp = self._lg_ptr(li) if (dec and bsz == 1) else 0
         plgp = self._pfb[1][0].data_ptr() if (pf and bsz == 1 and 1 in self._pfb) else 0
         e.nv_pub(s, ww, zp, n, bsz, self.H, li, self.E, p.first, p.slotof[li], (2 if VERIFY[0] else 0) if dec else 1, int(send_x),
                  self.a["hc"], self.a["req"], self.a["hx"], self.dc, self.uidx, self.uexp, self.timeout_ns, pf, npf, son, lgp, plgp)
         so, wo = self.sel_out[:n], self.w_out[:n]
+        sg_, su_, sd_, ou_, od_ = p.geom(li)
         e.nv_step(s, ww, so, wo, n, p.first, li, self.E, p.S, int(dec), p.slotof, self.a["home"], self.a["res"], p.tabs,
                   p.owner, p.refb, p.pin, p.ctl, p.jobs, self.jobx, self.jobnv, self.dstats, p.cbase.data_ptr(), p.spc,
-                  p.rec, p.off_u, p.off_d, self.a["hc"], self.a["rep"], self.dc, self.uidx, self.ulane, self.a["wbl"],
+                  p.rec, ou_, od_, self.a["hc"], self.a["rep"], self.dc, self.uidx, self.ulane, self.a["wbl"],
                   self.a["adml"], self.a["land"], self.dflag, self.timeout_ns, int(self.wb_on), self.dbg,
                   self.stg_addr_dev.data_ptr() if self.stg_addr else 0, self.jobsrc)
         e.nv_copy(p.ctl, p.jobs, self.jobx, self.jobnv, li, self.E, self.a["home"], self.a["res"], p.cbase.data_ptr(), p.spc,
-                  p.rec, p.sg, p.su, p.sd, p.off_u, p.off_d, self.ram_addr_dev, self.dc, self.uexp, self.ulane, p.slotof,
-                  p.tabs, self.ph, self.a["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg, self.jobsrc)
+                  p.rec, sg_, su_, sd_, ou_, od_, self.ram_addr_dev, self.dc, self.uexp, self.ulane, p.slotof,
+                  p.tabs, self.ph, self.a["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg, self.jobsrc,
+                  int(p.uniform))
         self.st["dec_calls" if dec else "small_calls"] += 1
         return so.view(sel.shape), wo.view(w.shape), send_x
 
@@ -450,14 +503,14 @@ class Nv2:
         b = self._pfb.get(bsz)
         if b is None:
             b = self._pfb[bsz] = (torch.empty((bsz, self.E), dtype=torch.half, device=self.dev),
-                                  torch.empty((bsz, 8), dtype=torch.long, device=self.dev),
-                                  torch.empty((bsz, 8), dtype=torch.half, device=self.dev))
+                                  torch.empty((bsz, self.topk), dtype=torch.long, device=self.dev),
+                                  torch.empty((bsz, self.topk), dtype=torch.half, device=self.dev))
         zz = z.view(bsz, -1)
         if zz.dtype != torch.half or not zz.is_contiguous():
             zz = zz.half().contiguous()
         R._gate_t(cfg)
         R.ext.routing_ds3_nogroup(zz, cfg.gate_tensor, b[0], R._esb_h(cfg), b[1], b[2], cfg.routed_scaling_factor,
-                                  cfg.gate_tensor_t, R.ROUTING_ACT_SIGMOID, cfg.gate_i8, cfg.gate_sb)
+                                  cfg.gate_tensor_t, self.route_act[lj], cfg.gate_i8, cfg.gate_sb)
         self._pfz = zz
         return b[1].data_ptr()
 
@@ -472,13 +525,14 @@ class Nv2:
         if not self.cpu_on:
             return
         e = ext()
-        cpus = _cpus(os.environ.get("GLM53_NV_CPU_CPUS", "2-23"))
-        threads = int(os.environ.get("GLM53_NV_CPU_THREADS", "0")) or len(cpus)
-        mode = int(os.environ.get("GLM53_NV_CPU_MODE", "-1"))
-        lim = self.act_limit if os.environ.get("GLM53_NV_CLAMP", "1") == "1" else 0.0
+        cpus = _cpus(env("NV_CPU_CPUS", "2-23"))
+        threads = int(env("NV_CPU_THREADS", "0")) or len(cpus)
+        mode = int(env("NV_CPU_MODE", "-1"))
+        lim = self.act_limit if env("NV_CLAMP", "1") == "1" else 0.0
         e.cpu_init(threads, cpus, mode, lim)
         for li, s in enumerate(self.scales):
-            e.cpu_add_layer(li, *s)
+            m = self.pool.mods[li]
+            e.cpu_add_layer(li, *s, [float(m.multi_gate.K), float(m.multi_up.K), float(m.multi_down.K)])
         self.selftest = self._selftest(lim)
         NT._log(f"nv2 CPU tier: {threads} threads on {cpus[0]}-{cpus[-1]}, mode {mode}, swiglu clamp {lim}, selftest "
                 f"{self.selftest}")
@@ -505,7 +559,8 @@ class Nv2:
                 xd = x.double()
                 for ex in res:
                     sl = int(st[0][li * self.E + ex])
-                    self.bounce_t[: self.slot].copy_(self.ram.view(sl).to(self.dev))
+                    rv = self.ram.view(sl)
+                    self.bounce_t[: rv.numel()].copy_(rv.to(self.dev))  # selftest (CPU lane)
                     torch.cuda.synchronize(self.dev)
                     Wg = m.gates[ex].inner.get_weight_tensor().cpu().double(); Wu = m.ups[ex].inner.get_weight_tensor().cpu().double()
                     a1, a2 = torch.nn.functional.silu(xd @ Wg), xd @ Wu
@@ -520,7 +575,8 @@ class Nv2:
                     cpu = ext().cpu_forward(li, x.float(), sel, w, mode).double()
                     k = {1: "EXACT", 0: "AFFINE", 2: "I16"}[mode]
                     out[k] = max(out.get(k, 0.0), round(float((cpu - ref).norm() / ref.norm()), 6))
-                    if mode == 2 and _vbmi_on():   # the AVX-512 VBMI I16 kernel must match the AVX2 one bit for bit
+                    k3 = float(m.multi_gate.K) == 3 and float(m.multi_up.K) == 3 and float(m.multi_down.K) == 3
+                    if mode == 2 and _vbmi_on() and k3:   # the VBMI I16 kernel must match the AVX2 one bit for bit (K 3 only: no AVX2 decoder for K 2 / 2.5)
                         ext().cpu_knob("vbmi", 0)
                         avx2 = ext().cpu_forward(li, x.float(), sel, w, mode).double()
                         ext().cpu_knob("vbmi", 1)
@@ -592,10 +648,12 @@ class Nv2:
         bad_v = bad_r = 0
         for s in rnd.sample(vs, min(n, len(vs))):
             ext().read_sync(int(owner[s]), int(tmp.addr[0]))
-            bad_v += int(not torch.equal(p.chunks[s // p.spc][s % p.spc][: self.slot].cpu(), tmp.view(0)))
+            kl = int(self.klen[int(owner[s])])
+            bad_v += int(not torch.equal(p.chunks[s // p.spc][s % p.spc][:kl].cpu(), tmp.view(0, kl)))
         for k in rnd.sample(rk, min(n, len(rk))):
             ext().read_sync(k, int(tmp.addr[0]))
-            bad_r += int(not torch.equal(self.ram.view(int(so_k[k])), tmp.view(0)))
+            kl = int(self.klen[k])
+            bad_r += int(not torch.equal(self.ram.view(int(so_k[k]), kl), tmp.view(0, kl)))
         cb = p.cbase.cpu().tolist()
         slotof = p.slotof.flatten().cpu().numpy()
         home = self.home.view(-1, 3).numpy()
@@ -759,22 +817,15 @@ def attach_pool(pool):
     return NV
 
 
-class _BCNv:
-    """nv_tier.BCProxy needs .pool, .bounce, .st"""
-    def __init__(self, nv):
-        self.pool, self.bounce, self.st = nv.pool, nv.bounce, nv.st
-
-
 def finish(model):
     nv = NV
-    shim = _BCNv(nv)
     for li, m in enumerate(nv.pool.mods):
         assert m.bc is not None and m.support_quant_paths, m.key
-        m.bc = NT.BCProxy(m.bc, li, shim)
+        m.bc = NT.BCProxy(m.bc, li, nv.pool)
     nd = NT._drop_checkpoint_cache()
     NT._log(f"nv2 ready: {NT._LOAD['marked_linears']} expert linears on the bounce slot, "
             f"{NT._LOAD['skipped_bytes'] / 1e9:.1f} GB of checkpoint expert bytes never read, DONTNEED on {nd} files")
-    if os.environ.get("GLM53_NV_VERIFY_START", "1") == "1":
+    if env("NV_VERIFY_START", "1") == "1":
         print(f" -- nv2 startup verify: {nv.verify(32)}", flush=True)
 
 

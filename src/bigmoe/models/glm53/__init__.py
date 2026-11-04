@@ -149,12 +149,10 @@ class GLM53(ModelBackend):
             smoke_test="import torch, exllamav3; from exllamav3.ext import exllamav3_ext")
 
     def kernel_specs(self, box) -> list:
+        from ... import engine
         e = "bigmoe.models.glm53.engine."
-        nv2_src = tuple(sorted((PKG / "kernels" / "nv2").iterdir()))
-        return [KernelSpec("glm53_ec", "GLM53_EC_BUILD", e + "expert_cache", "_ext", (ENGINE / "expert_cache.py",)),
-                KernelSpec("glm53_k101", "GLM53_K_BUILD", e + "k_hcfuse", "ext", (ENGINE / "k_hcfuse.py",)),
-                KernelSpec("glm53_nv", "GLM53_NV_BUILD", e + "nv_tier", "_ext", (ENGINE / "nv_tier.py",)),
-                KernelSpec("glm53_nv2", "GLM53_NV2_BUILD", e + "nv2", "ext", (ENGINE / "nv2.py",) + nv2_src)]
+        return engine.kernel_specs() + [KernelSpec("glm53_k101", "GLM53_K_BUILD", e + "k_hcfuse", "ext",
+                                                   (ENGINE / "k_hcfuse.py",))]
 
     def steps(self, box) -> list:
         o, rt = box.options, box.runtime
@@ -169,8 +167,8 @@ class GLM53(ModelBackend):
         steps = [
             Step("runtime", "create the server's Python environment (torch 2.13 + CUDA 13; exllamav3 1.5.1 built from "
                  "source)", rt.is_ready, lambda: rt.ensure(box.arch), detail=lambda: str(rt.path)),
-            Step("kernels", "compile the engine's 4 torch extensions (expert cache, hyper-connections, NVMe tier, "
-                 "nv2 + CPU lane)", kernels_done, lambda: rt.build_kernels(specs, box.arch),
+            Step("kernels", "compile the torch extensions (shared engine: expert pool, nv2 + CPU lane; GLM: "
+                 "hyper-connections)", kernels_done, lambda: rt.build_kernels(specs, box.arch),
                  detail=lambda: str(box.home.kernels)),
         ]
         if ck is not None:
@@ -269,7 +267,7 @@ class GLM53(ModelBackend):
         nvme-exact); tests/test_glm53_launch.py checks it against the reference runs."""
         o, store = box.options, self.store(box)
         tune = box.server.run_dir / "coop_autotune_1gpu.bin"  # exllamav3 appends to its tune cache: fresh copy per start
-        env = {}
+        env = {"BIGMOE_ENGINE_PREFIX": "GLM53_"}   # shared engine (bigmoe.engine), knobs under GLM53_
         if o.mode == "nvme-exact":
             reserve, k, mode_args = "1.0", "0", []
             # stock exllamav3 prefill: the single-pass prompt checkpoint (exl3_patch) prefills the last page boundary in
@@ -317,7 +315,7 @@ class GLM53(ModelBackend):
             argv += ["-ngram", str(o.ngram_min), "-ndt", str(o.draft_tokens), "-ambs", "1"]
         argv += ["--host", box.host, "--port", str(box.port), "--served-name", box.served_name, *box.extra_args]
         # ambient engine variables would silently change the configuration: only the ones set here reach the server
-        unset = tuple(v for v in os.environ if v.startswith(("GLM53_", "EXL3_", "EXLLAMAV3_")) and v not in env)
+        unset = tuple(v for v in os.environ if v.startswith(("GLM53_", "BIGMOE_", "EXL3_", "EXLLAMAV3_")) and v not in env)
         unset += ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
         return LaunchSpec(argv=argv, env=env, host=box.host, port=box.port, memory_gb=box.memory_gb, unset=unset,
                           served_name=box.served_name, files={str(tune): str(DATA / "coop_autotune_1gpu.bin")},

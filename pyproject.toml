@@ -25,8 +25,9 @@ bigmoe = "bigmoe.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"bigmoe.models.glm53" = ["requirements/*.txt", "kernels/nv2/*", "data/*", "baselines/*.json"]
-"bigmoe.models.dsv41" = ["kernels/nv2/*", "data/*", "baselines/*.json"]
+"bigmoe.engine" = ["kernels/nv2/*"]
+"bigmoe.models.glm53" = ["requirements/*.txt", "data/*", "baselines/*.json"]
+"bigmoe.models.dsv41" = ["data/*", "baselines/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

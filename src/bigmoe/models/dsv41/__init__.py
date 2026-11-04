@@ -140,10 +140,8 @@ class DSV41(ModelBackend):
                        "from exllamav3.architecture.deepseek_v41 import DeepseekV41Config")
 
     def kernel_specs(self, box) -> list:
-        e = "bigmoe.models.dsv41.engine."
-        nv2_src = tuple(sorted((PKG / "kernels" / "nv2").iterdir()))
-        return [KernelSpec("dsv41_tiers", "DSV41_TIERS_BUILD", e + "tiers", "_ext", (ENGINE / "tiers.py",)),
-                KernelSpec("dsv41_nv2", "DSV41_NV2_BUILD", e + "nv2", "ext", (ENGINE / "nv2.py",) + nv2_src)]
+        from ... import engine
+        return engine.kernel_specs()
 
     def steps(self, box) -> list:
         o, rt = box.options, box.runtime
@@ -158,7 +156,7 @@ class DSV41(ModelBackend):
         steps = [
             Step("runtime", "create the server's Python environment (torch 2.13 + CUDA 13; exllamav3 1.6.6 built from "
                  "source)", rt.is_ready, lambda: rt.ensure(box.arch), detail=lambda: str(rt.path)),
-            Step("kernels", "compile the engine's torch extensions (expert tiers, nv2 + CPU lane)", kernels_done,
+            Step("kernels", "compile the shared engine's torch extensions (expert pool, nv2 + CPU lane)", kernels_done,
                  lambda: rt.build_kernels(specs, box.arch), detail=lambda: str(box.home.kernels)),
         ]
         if ck is not None:
@@ -239,9 +237,12 @@ class DSV41(ModelBackend):
 
     def launch_spec(self, box) -> LaunchSpec:
         o, store = box.options, self.store(box)
-        env = {"DSV41_NV": "2", "DSV41_NV_STORE": str(store.bin), "DSV41_NV_CPU": "1" if o.mode == "nvme" else "0",
-               "DSV41_NV_POL": o.planner_cost, "DSV41_NV_STAGE": "1", "DSV41_EC_ELASTIC_GB": "11",
-               "DSV41_MAX_RQ_TOKENS": "4096",
+        # shared engine (bigmoe.engine), knobs under DSV41_: staged prefill stages a whole layer (384 experts) per
+        # buffer from 11 GB of elastic VRAM; 3 GB of VRAM stay with torch
+        env = {"BIGMOE_ENGINE_PREFIX": "DSV41_", "DSV41_NV": "2", "DSV41_NV_STORE": str(store.bin),
+               "DSV41_NV_CPU": "1" if o.mode == "nvme" else "0", "DSV41_NV_POL": o.planner_cost,
+               "DSV41_EC_RESERVE_GB": "3.0", "DSV41_EC_STAGE_SLOTS": "384", "DSV41_EC_STAGE_MIN": "512",
+               "DSV41_EC_ELASTIC_GB": "11", "DSV41_MAX_RQ_TOKENS": "4096",
                "TRITON_CACHE_DIR": str(box.home.triton), "PYTHONUNBUFFERED": "1"}
         warm = DATA / "stats_dec.json"
         if warm.is_file():
@@ -268,7 +269,7 @@ class DSV41(ModelBackend):
             argv += ["-mtp"]
             env.setdefault("EXL3_DSPARK_CONF", f"{float(o.dspark_conf):g}")   # an explicit env override wins
         argv += ["--host", box.host, "--port", str(box.port), "--served-name", box.served_name, *box.extra_args]
-        unset = tuple(v for v in os.environ if v.startswith(("DSV41_", "EXL3_", "EXLLAMAV3_")) and v not in env)
+        unset = tuple(v for v in os.environ if v.startswith(("DSV41_", "BIGMOE_", "EXL3_", "EXLLAMAV3_")) and v not in env)
         unset += ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
         return LaunchSpec(argv=argv, env=env, host=box.host, port=box.port, memory_gb=box.memory_gb, unset=unset,
                           served_name=box.served_name,

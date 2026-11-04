@@ -42,8 +42,9 @@ def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
             assert Path(ours[k]).name == Path(v).name, k
         else:
             assert ours[k] == v, k
-    assert {spec.env[f"GLM53_{x}_BUILD"] for x in ("EC", "K", "NV", "NV2")} == \
-        {"/k/glm53_ec-key", "/k/glm53_k101-key", "/k/glm53_nv-key", "/k/glm53_nv2-key"}
+    assert spec.env["BIGMOE_ENGINE_PREFIX"] == "GLM53_"
+    assert {spec.env[v] for v in ("BIGMOE_EC_BUILD", "GLM53_K_BUILD", "BIGMOE_NV2_BUILD")} == \
+        {"/k/bigmoe_ec-key", "/k/glm53_k101-key", "/k/bigmoe_nv2-key"}
     assert spec.files == {spec.env["EXLLAMAV3_TUNE_CACHE"]: str(glm53.DATA / "coop_autotune_1gpu.bin")}
     assert not Path(spec.env["EXLLAMAV3_TUNE_CACHE"]).exists()
 

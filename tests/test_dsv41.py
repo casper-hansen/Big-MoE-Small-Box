@@ -41,10 +41,12 @@ def test_alias_and_commit(tmp_path):
 def test_launch_exact(tmp_path, monkeypatch):
     box, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
     e = spec.env
-    assert e["DSV41_NV"] == "2" and e["DSV41_NV_CPU"] == "0" and e["DSV41_NV_STAGE"] == "1"
+    assert e["DSV41_NV"] == "2" and e["DSV41_NV_CPU"] == "0" and e["DSV41_EC_STAGE_SLOTS"] == "384"
+    assert (e["DSV41_EC_STAGE_MIN"], e["DSV41_EC_ELASTIC_GB"], e["DSV41_EC_RESERVE_GB"]) == ("512", "11", "3.0")
     assert "DSV41_NV_CPU_CPUS" not in e and e["DSV41_NV_READER_CPUS"] == "7-11" and e["DSV41_NV_CTL_CPU"] == "6"
     assert e["DSV41_NV_STORE"].endswith(dsv41.STORE_NAME + ".bin")
-    assert {e["DSV41_TIERS_BUILD"], e["DSV41_NV2_BUILD"]} == {"/k/dsv41_tiers-key", "/k/dsv41_nv2-key"}
+    assert e["BIGMOE_ENGINE_PREFIX"] == "DSV41_"
+    assert {e["BIGMOE_EC_BUILD"], e["BIGMOE_NV2_BUILD"]} == {"/k/bigmoe_ec-key", "/k/bigmoe_nv2-key"}
     assert spec.argv[:3] == ["/envs/dsv41/bin/python", "-m", "bigmoe.models.dsv41.engine.server"]
     assert spec.argv[spec.argv.index("-chunk_size") + 1] == "8192" and spec.argv[spec.argv.index("-cs") + 1] == "65536"
     assert "-ccs" in spec.argv and spec.memory_gb == 56.0

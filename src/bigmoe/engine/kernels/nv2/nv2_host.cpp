@@ -23,13 +23,13 @@
 #include <signal.h>
 #include "ft_core.h"
 #include "ft_n135.h"
-// N135 CPU-lane forward switch: DSV41_NV_CPU_KERN=1 -> n135::moe_forward4 (ft_n135.h), default 0 -> ft_core moe_forward
+// N135 CPU-lane forward switch: NV_CPU_KERN=1 -> n135::moe_forward4 (ft_n135.h), default 0 -> ft_core moe_forward
 static int g_cpu_kern = -1;
 static inline void cpu_kern_init()
 {
     if (g_cpu_kern >= 0) return;
-    const char* s = getenv("DSV41_NV_CPU_KERN");
-    g_cpu_kern = s && *s ? atoi(s) : 1;   // DSV41: n135 by default (the only kernel that decodes K 2 / 2.5 trellises)
+    const char* s = penv("NV_CPU_KERN");
+    g_cpu_kern = s && *s ? atoi(s) : 1;   // store v2: n135 by default (the only kernel that decodes K 2 / 2.5 trellises)
     n135::configure_env(); n135::init_p16();
     fprintf(stderr, "[nv2] CPU lane kernel: %s (rg %d cg %d rd %d cd %d bandmaxm %d pfr %d p16 %d rt %d merge %d vbmi %d)\n", g_cpu_kern == 1 ? "n135 v4" : "ft_core moe_forward",
             n135::K_.rg, n135::K_.cg, n135::K_.rd, n135::K_.cd, n135::K_.bandmaxm, n135::K_.pfr, n135::K_.kern, n135::K_.rt, n135::K_.merge,
@@ -108,7 +108,7 @@ struct Reader
     int64_t infl[RC_N] = { 0, 0, 0 };          // bytes in flight per class
     int64_t hi_cap = int64_t(12) << 20, lo_cap = int64_t(6) << 20;
     bool lifo = true, prio = true;
-    // DSV41_NV_TRACK_QD: at most this many pieces of one decode read (demand / prefetch) in flight, 0 = unlimited. The
+    // NV_TRACK_QD: at most this many pieces of one decode read (demand / prefetch) in flight, 0 = unlimited. The
     // SSD serves concurrent pieces in parallel, so a record's 9 pieces otherwise land together at its end; capped, they
     // land in order (gate, up, down) while other records' pieces keep the queue deep, and the CPU lane streams them
     int tqd = 0;
@@ -119,16 +119,16 @@ struct Reader
     // serve them in dispatch order (0 = off)
     double rate_bps = 0, vfin = 0;
     // per-key landed-piece bitmask (engine-owned, reset by the engine before submit): bit i = piece i of the key's read
-    // has landed (pieces of up to 64 per read). Streams NVMe->CPU experts into the CPU lane (DSV41_NV_STREAM)
+    // has landed (pieces of up to 64 per read). Streams NVMe->CPU experts into the CPU lane (NV_STREAM)
     uint64_t* pmask = nullptr;
     static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     void start(int n, std::vector<int> cpus)
     {
-        if (const char* v = getenv("DSV41_NV_HI_MB")) hi_cap = int64_t(atof(v) * 1048576.0);
-        if (const char* v = getenv("DSV41_NV_LO_MB")) lo_cap = int64_t(atof(v) * 1048576.0);
-        if (const char* v = getenv("DSV41_NV_PF_LIFO")) lifo = atoi(v) != 0;
-        if (const char* v = getenv("DSV41_NV_PRIO")) prio = atoi(v) != 0;
-        if (const char* v = getenv("DSV41_NV_TRACK_QD")) tqd = std::max(0, atoi(v));
+        if (const char* v = penv("NV_HI_MB")) hi_cap = int64_t(atof(v) * 1048576.0);
+        if (const char* v = penv("NV_LO_MB")) lo_cap = int64_t(atof(v) * 1048576.0);
+        if (const char* v = penv("NV_PF_LIFO")) lifo = atoi(v) != 0;
+        if (const char* v = penv("NV_PRIO")) prio = atoi(v) != 0;
+        if (const char* v = penv("NV_TRACK_QD")) tqd = std::max(0, atoi(v));
         fprintf(stderr, "[nv2] reader: %d threads, priority %d, demand cap %.1f MB, prefetch cap %.1f MB, prefetch lifo %d, track qd %d\n",
                 n, int(prio), hi_cap / 1048576.0, lo_cap / 1048576.0, int(lifo), tqd);
         for (int i = 0; i < n; ++i) th.emplace_back([this, cpus] { pin_self_set(cpus); loop(); });
@@ -274,8 +274,8 @@ struct Pol
 {
     double g0 = 0.17, thit = 0.023, tzc = 0.38, ca = 0.145, cb = 0.165, ctok = 0.040, push = 0.40;
     double nvlat = 0.12, nvdeep = 0.395, nvone = 0.75;
-    double tnzc = 0.6;    // GPU cost of a zero-copy NVMe pick after landing, ms (DSV41_NV_TNZC; < 0 = legacy model)
-    // streaming (DSV41_NV_STREAM): CPU-lane time left for an NVMe->CPU pick after its last byte lands, ms (DSV41_NV_CBT;
+    double tnzc = 0.6;    // GPU cost of a zero-copy NVMe pick after landing, ms (NV_TNZC; < 0 = legacy model)
+    // streaming (NV_STREAM): CPU-lane time left for an NVMe->CPU pick after its last byte lands, ms (NV_CBT;
     // < 0 = legacy model: the lane starts the pick at its arrival). The lane computes the bands as they land, so it is
     // done at max(lane free + cb, arrival + cbt) instead of max(lane free, arrival) + cb
     double cbt = -1;
@@ -311,7 +311,7 @@ struct Engine
 {
     // geometry
     int L = 0, E = 0, K = 0, H = 4096, I = 2048;
-    int64_t rec_bytes = 0, slot_bytes = 0, piece = 0, dpiece = 0, off_u = 0, off_d = 0;   // dpiece: decode reads (DSV41_NV_DPIECE_KB)
+    int64_t rec_bytes = 0, slot_bytes = 0, piece = 0, dpiece = 0, off_u = 0, off_d = 0;   // dpiece: decode reads (NV_DPIECE_KB)
     // per-layer geometry (expert store v2: layers of different bitrates have different record sizes). Every RAM / VRAM
     // slot is slot_bytes (the largest layer's trellis); an expert of layer li fills its first l_len[li] bytes in the
     // compact layout gate | up @ l_offu[li] | down @ l_offd[li]; its store record is at l_base[li] + e * l_rec[li]
@@ -328,7 +328,7 @@ struct Engine
     int nram = 0; std::vector<int64_t> ram_addr;
     std::vector<int32_t> slot_of; std::vector<int8_t> kst; std::vector<double> karr;
     std::vector<int32_t> owner, pinc, lprev, lnext;
-    // RAM slot classes (DSV41): slot s holds experts of class slot_cls[s] only (0: full slots of slot_bytes, 1: small
+    // RAM slot classes (store v2): slot s holds experts of class slot_cls[s] only (0: full slots of slot_bytes, 1: small
     // slots for layers whose trellis fits small_bytes); key class kcls[key]. One free list and one LRU chain per class
     static constexpr int NSC = 2;
     int lru_old_c[NSC] = { -1, -1 }, lru_new_c[NSC] = { -1, -1 };
@@ -337,13 +337,13 @@ struct Engine
     int64_t small_bytes = 0; int nslot_c[NSC] = { 0, 0 };
     std::vector<int32_t> freel;   // unused (legacy diagnostics: size of class 0 + 1 lists is reported)
     std::vector<uint8_t> prot; std::vector<int32_t> protl;
-    // BCP lossy verify (DSV41_NV_LOSSY=1 or ext().set_lossy; approximate, not lossless): see lossy_plan
+    // BCP lossy verify (NV_LOSSY=1 or ext().set_lossy; approximate, not lossless): see lossy_plan
     bool lossy_on = false; float lossy_eps = 0.0f, lossy_whi = 2.0f; int lossy_renorm = 0, lossy_pf = 0, lossy_bg = 0;
     int lossy_lo = 0, lossy_hi = 1 << 30;
     int tail_r = 0, tail_scope = 0;   // Strata tail skip (patch_tail.py); tail_r 0 = off
     std::vector<uint8_t> lwant; std::vector<int16_t> luix;
-    std::vector<uint8_t> pfs; int pf_max = 4;   // prefetched and not yet demanded; DSV41_NV_PF_MAX (4 = best measured)
-    int pf_multi = 2;                           // DSV41_NV_PF_MULTI: prefetch hints per token of a verify window
+    std::vector<uint8_t> pfs; int pf_max = 4;   // prefetched and not yet demanded; NV_PF_MAX (4 = best measured)
+    int pf_multi = 2;                           // NV_PF_MULTI: prefetch hints per token of a verify window
     std::vector<float> score;
     std::mutex mu; std::condition_variable land_cv;
     int64_t land_tail = 0;
@@ -353,9 +353,9 @@ struct Engine
     std::vector<int32_t> kvr;   // key -> VRAM ring slot backing it (write-back D2H pending) or -1
     std::vector<int> vfree; std::vector<int64_t> vring_addr; std::vector<cudaEvent_t> vr_ev;
     int land_target = 64, free_lo = 96;
-    bool wb_early = true;   // DSV41_NV_WB_EARLY: drain parked victims at nv_copy completion (HC_CPDONE), restock at once
-    bool rzc1 = true;       // DSV41_NV_RZC1: verify windows zero-copy (do not admit) RAM picks used by one token only
-    // DSV41_NV_RZC_ALL: decode-class GPU-lane RAM picks are read zero-copy from their RAM slot, never admitted (no
+    bool wb_early = true;   // NV_WB_EARLY: drain parked victims at nv_copy completion (HC_CPDONE), restock at once
+    bool rzc1 = true;       // NV_RZC1: verify windows zero-copy (do not admit) RAM picks used by one token only
+    // NV_RZC_ALL: decode-class GPU-lane RAM picks are read zero-copy from their RAM slot, never admitted (no
     // VRAM churn: no admission copy, no victim, no write-back); the VRAM cache keeps its warm set. Same bytes: exact
     bool rzc_all = false;
     bool exclusive = true;
@@ -379,9 +379,9 @@ struct Engine
     std::vector<int64_t> kseq;      // key -> seq of the request that issued its read (> 0 demand, < 0 prefetch)
     std::vector<int64_t> kreq;      // key -> seq of the latest request that picked it while its read was in flight
     int cur_ncr = 0, cur_ncn = 0;
-    // partial landing (DSV41_NV_PARTIAL): gu_res[key] = 1 once the gate+up bytes of an in-flight read have landed
+    // partial landing (NV_PARTIAL): gu_res[key] = 1 once the gate+up bytes of an in-flight read have landed
     bool partial = true; std::vector<uint8_t> gu_res;
-    // streaming (DSV41_NV_STREAM): an NVMe->CPU pick is bound as soon as its read starts and each gate / up / down band
+    // streaming (NV_STREAM): an NVMe->CPU pick is bound as soon as its read starts and each gate / up / down band
     // unit of the CPU lane waits only for the read pieces that hold its bytes (pmask), instead of gate+up / whole record
     bool stream = true; std::vector<uint64_t> pmask; std::vector<int64_t> kpiece;
     static void on_partial(void* ctx, int64_t tag)
@@ -390,12 +390,12 @@ struct Engine
         { std::lock_guard<std::mutex> lk(e->mu); e->gu_res[int(tag)] = 1; e->C.partial_lands++; }
         e->land_cv.notify_all();
     }
-    // layer-ahead VRAM staging (DSV41_NV_STG pool slots): at plan(li) the predicted RAM-resident experts of li+1 are DMA'd
+    // layer-ahead VRAM staging (NV_STG pool slots): at plan(li) the predicted RAM-resident experts of li+1 are DMA'd
     // into a host-managed VRAM pool once layer li's own copy is done (HC_CPDONE); at plan(li+1) a staged pick takes lane
     // LN_STG and nv_copy admits it with a D2D copy from the pool instead of a PCIe gather. Expert bytes are immutable, so a
     // staged copy stays valid while its RAM copy is resident; it is dropped on admission or RAM eviction.
     int stg_n = 0, stg_max = 3;
-    // DSV41_NV_STG_GATE: when the staging DMA for layer li + 1 may start. 0: after layer li's copy kernel (HC_CPDONE);
+    // NV_STG_GATE: when the staging DMA for layer li + 1 may start. 0: after layer li's copy kernel (HC_CPDONE);
     // 1: after its MoE kernel (HC_MOEDONE); 2 (default): after the copy kernel unless layer li's MoE reads an expert
     // zero-copy over PCIe (NZC / RZC lanes), which the DMA would slow down, then after the MoE kernel
     int stg_gate = 2;
@@ -475,7 +475,7 @@ struct Engine
     bool trace_on = false; std::vector<int32_t> trace; std::mutex trace_mu;
     int64_t wb_read = 0, adm_read = 0;
     int ctl_cpu = -1, dev_index = 0, wb_cpu = -1;
-    // DSV41_NV_CTL_MWX: the controller waits for the next request with MWAITX (timer cycles; 0 = PAUSE spin) instead of
+    // NV_CTL_MWX: the controller waits for the next request with MWAITX (timer cycles; 0 = PAUSE spin) instead of
     // spinning, so the main thread's core can idle while the GPU works (all cores share one voltage rail)
     unsigned ctl_mwx = 0;
     Pol pol;
@@ -494,7 +494,7 @@ struct Engine
     // stage engine
     std::vector<int64_t> pf_ring_addr;
     std::vector<cudaEvent_t> pf_ev; std::vector<int> pf_ev_pending;
-    // prefill ring borrowed from the RAM tier (DSV41_NV_PF_RING_BORROW, set_ring_borrow): stage_begin takes ring_n RAM
+    // prefill ring borrowed from the RAM tier (NV_PF_RING_BORROW, set_ring_borrow): stage_begin takes ring_n RAM
     // slots (free list first, else the LRU-oldest unpinned experts), stage_end returns them to the free list, so the
     // ring's memory serves the RAM tier during decode
     int ring_n = 0; std::vector<int> st_ring_slots; std::vector<int64_t> st_ring_addr;
@@ -859,7 +859,7 @@ struct Engine
         for (int u = 0; u < r.nu; ++u) nw += lwant[u];
         C.lossy_coldu += ncu; C.lossy_want += nw; C.lossy_calls++;
     }
-    // Strata tail skip (set_tail / DSV41_NV_TAIL): a pick is skipped only when every token of the call routes it at
+    // Strata tail skip (set_tail / NV_TAIL): a pick is skipped only when every token of the call routes it at
     // rank >= tail_r of its top-k (rank by routing weight, 0 = best); scope 1 also covers RAM-tier picks. No renormalisation.
     void lossy_tail_plan(const Req& r, Rep& p)
     {
@@ -1010,7 +1010,7 @@ struct Engine
             // cold: zero-copy, keep VRAM. A verify window admits NVMe picks shared by several of its tokens instead (the
             // fused decode kernel reads a zero-copy expert once per token that picked it)
             const bool nzc = dec && pol.nv_noadmit && (r.ntok == 1 || k.cnt == 1);
-            // GPU cost after landing: zero-copy in the MoE kernel (tnzc, DSV41_NV_TNZC; < 0: legacy push + thit model)
+            // GPU cost after landing: zero-copy in the MoE kernel (tnzc, NV_TNZC; < 0: legacy push + thit model)
             const double ge = (nzc && pol.tnzc >= 0) ? std::max(g, a) + pol.tnzc : std::max(g, a + pol.push) + pol.thit;
             if (cpu && pol.nvcpu_on && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_NVC; ncpu++; cur_ncn++; C.lane_nvc++; }
             else if (nzc) { g = pol.tnzc >= 0 ? ge : std::max(g, a) + pol.tzc; p.lane[k.u] = LN_NZC; C.lane_nvg++; }
@@ -1476,7 +1476,7 @@ struct Engine
         double waited = 0;
         if (st_active && li < L)
         {
-            const size_t ln = size_t(l_len[li]);   // DSV41: the layer's record image (RAM slots may be small-class slots)
+            const size_t ln = size_t(l_len[li]);   // store v2: the layer's record image (RAM slots may be small-class slots)
             for (size_t i = 0; i < st_ram_src[li].size(); ++i)
                 cudaMemcpyAsync((void*) (base + st_ram_j[li][i] * slot_bytes), (const void*) st_ram_src[li][i], ln, cudaMemcpyDefault, st);
             for (int g : st_nv_idx[li])
@@ -1549,7 +1549,7 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
         }
     }
     e.rec_bytes = e.l_rec[0]; e.slot_bytes = slot_bytes; e.piece = piece;
-    { const char* v = getenv("DSV41_NV_DPIECE_KB"); e.dpiece = (v && *v ? atoll(v) : 512) * 1024; e.dpiece = std::max<int64_t>(4096, e.dpiece / 4096 * 4096); } e.off_u = off_u; e.off_d = off_d; e.fd = int(fd); e.ph = ph;
+    { const char* v = penv("NV_DPIECE_KB"); e.dpiece = (v && *v ? atoll(v) : 512) * 1024; e.dpiece = std::max<int64_t>(4096, e.dpiece / 4096 * 4096); } e.off_u = off_u; e.off_d = off_d; e.fd = int(fd); e.ph = ph;
     e.hc = (volatile int64_t*) hc; e.req = (Req*) req; e.rep = (Rep*) rep; e.wbl = (LogE*) wbl; e.adml = (LogE*) adml;
     e.land = (int32_t*) land; e.home = (volatile int64_t*) home; e.ram_res = (volatile int32_t*) ram_res;
     e.hx = (uint16_t*) hx; e.hout = (float*) hout;
@@ -1561,28 +1561,28 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
     e.score.assign(score.data_ptr<float>(), score.data_ptr<float>() + e.K);
     e.slot_of.assign(e.K, -1); e.kvr.assign(e.K, -1); e.kst.assign(e.K, KS_NONE); e.karr.assign(e.K, 0); e.prot.assign(e.K, 0);
     e.pfs.assign(e.K, 0); e.kseq.assign(e.K, 0); e.kreq.assign(e.K, 0); e.gu_res.assign(e.K, 0);
-    if (const char* pm = getenv("DSV41_NV_PARTIAL")) e.partial = atoi(pm) != 0;
-    if (const char* pm = getenv("DSV41_NV_STREAM")) e.stream = atoi(pm) != 0;
+    if (const char* pm = penv("NV_PARTIAL")) e.partial = atoi(pm) != 0;
+    if (const char* pm = penv("NV_STREAM")) e.stream = atoi(pm) != 0;
     e.pmask.assign(e.K, 0); e.kpiece.assign(e.K, 0);
-    if (const char* pm = getenv("DSV41_NV_PF_MAX")) e.pf_max = std::max(0, atoi(pm));
-    if (const char* pm = getenv("DSV41_NV_PF_MULTI")) e.pf_multi = std::max(0, atoi(pm));
-    if (const char* pm = getenv("DSV41_NV_TNZC")) e.pol.tnzc = atof(pm);
-    if (const char* pm = getenv("DSV41_NV_CBT")) e.pol.cbt = atof(pm);
-    if (const char* pm = getenv("DSV41_NV_WB_EARLY")) e.wb_early = atoi(pm) != 0;
-    if (const char* pm = getenv("DSV41_NV_RZC1")) e.rzc1 = atoi(pm) != 0;
-    if (const char* pm = getenv("DSV41_NV_RZC_ALL")) e.rzc_all = atoi(pm) != 0;
+    if (const char* pm = penv("NV_PF_MAX")) e.pf_max = std::max(0, atoi(pm));
+    if (const char* pm = penv("NV_PF_MULTI")) e.pf_multi = std::max(0, atoi(pm));
+    if (const char* pm = penv("NV_TNZC")) e.pol.tnzc = atof(pm);
+    if (const char* pm = penv("NV_CBT")) e.pol.cbt = atof(pm);
+    if (const char* pm = penv("NV_WB_EARLY")) e.wb_early = atoi(pm) != 0;
+    if (const char* pm = penv("NV_RZC1")) e.rzc1 = atoi(pm) != 0;
+    if (const char* pm = penv("NV_RZC_ALL")) e.rzc_all = atoi(pm) != 0;
     {
         const char* v;
-        e.lossy_on = (v = getenv("DSV41_NV_LOSSY")) && atoi(v) == 1;
-        if ((v = getenv("DSV41_NV_LOSSY_EPS"))) e.lossy_eps = (float) atof(v);
-        if ((v = getenv("DSV41_NV_LOSSY_WHI"))) e.lossy_whi = (float) atof(v);
-        if ((v = getenv("DSV41_NV_LOSSY_RENORM"))) e.lossy_renorm = atoi(v);
-        if ((v = getenv("DSV41_NV_LOSSY_PF"))) e.lossy_pf = std::max(0, atoi(v));
-        if ((v = getenv("DSV41_NV_LOSSY_BG"))) e.lossy_bg = std::max(0, atoi(v));
-        if ((v = getenv("DSV41_NV_LOSSY_LO"))) e.lossy_lo = atoi(v);
-        if ((v = getenv("DSV41_NV_LOSSY_HI"))) e.lossy_hi = atoi(v);
-        if ((v = getenv("DSV41_NV_TAIL"))) e.tail_r = atoi(v);
-        if ((v = getenv("DSV41_NV_TAIL_SCOPE"))) e.tail_scope = atoi(v);
+        e.lossy_on = (v = penv("NV_LOSSY")) && atoi(v) == 1;
+        if ((v = penv("NV_LOSSY_EPS"))) e.lossy_eps = (float) atof(v);
+        if ((v = penv("NV_LOSSY_WHI"))) e.lossy_whi = (float) atof(v);
+        if ((v = penv("NV_LOSSY_RENORM"))) e.lossy_renorm = atoi(v);
+        if ((v = penv("NV_LOSSY_PF"))) e.lossy_pf = std::max(0, atoi(v));
+        if ((v = penv("NV_LOSSY_BG"))) e.lossy_bg = std::max(0, atoi(v));
+        if ((v = penv("NV_LOSSY_LO"))) e.lossy_lo = atoi(v);
+        if ((v = penv("NV_LOSSY_HI"))) e.lossy_hi = atoi(v);
+        if ((v = penv("NV_TAIL"))) e.tail_r = atoi(v);
+        if ((v = penv("NV_TAIL_SCOPE"))) e.tail_scope = atoi(v);
         e.lwant.assign(MAXU, 0); e.luix.assign(e.E, -1);
         if (e.lossy_on) fprintf(stderr, "nv2: BCP lossy verify eps %.3f whi %.3f renorm %d pf %d bg %d layers %d..%d\n",
                                 e.lossy_eps, e.lossy_whi, e.lossy_renorm, e.lossy_pf, e.lossy_bg, e.lossy_lo, e.lossy_hi);
@@ -1610,9 +1610,9 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
         // the main thread sleeping on the token event too, core 0 idles and the lane cores clock 4.8 instead of 4.34 GHz.
         // The CPU lane's own waits stay PAUSE spins by default (MWAITX there measured no further clock gain)
         const bool mx = mwaitx_ok();
-        const char* v = getenv("DSV41_NV_CTL_MWX");
+        const char* v = penv("NV_CTL_MWX");
         e.ctl_mwx = mx ? unsigned(v && *v ? std::max(0, atoi(v)) : 20000) : 0;
-        v = getenv("DSV41_NV_LANE_MWX");
+        v = penv("NV_LANE_MWX");
         g_mwx = mx && v && *v ? unsigned(std::max(0, atoi(v))) : 0;
     }
     if (g_mwx) fprintf(stderr, "[nv2] CPU lane waits with MWAITX (timer %u cycles)\n", g_mwx);
@@ -1653,7 +1653,7 @@ void stg_init(at::Tensor addrs, int64_t per_layer)
     Engine& e = *G;
     std::lock_guard<std::mutex> lk(e.mu);
     e.stg_n = int(addrs.numel()); e.stg_max = int(per_layer);
-    if (const char* sg = getenv("DSV41_NV_STG_GATE")) e.stg_gate = atoi(sg);
+    if (const char* sg = penv("NV_STG_GATE")) e.stg_gate = atoi(sg);
     e.stg_addr.assign(addrs.data_ptr<int64_t>(), addrs.data_ptr<int64_t>() + e.stg_n);
     e.stg_key.assign(e.stg_n, -1); e.stg_rslot.assign(e.stg_n, -1); e.stg_st.assign(e.stg_n, 0); e.stg_gt.assign(e.stg_n, 0);
     e.stg_use.assign(e.stg_n, -1); e.stg_after.assign(e.stg_n, 0); e.stg_t.assign(e.stg_n, 0); e.staged_of.assign(e.K, -1);

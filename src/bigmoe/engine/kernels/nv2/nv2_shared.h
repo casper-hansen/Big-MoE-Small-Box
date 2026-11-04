@@ -1,6 +1,7 @@
 // N119 nv2: shared layout between the device kernels (nv2_dev.cu) and the host engine (nv2_host.cpp).
 // All structs below live in ONE pinned, GPU-mapped host region (anon mmap + cudaHostRegister(Mapped)).
 #pragma once
+#include "penv.h"
 #include <cstdint>
 
 namespace nv2s {
