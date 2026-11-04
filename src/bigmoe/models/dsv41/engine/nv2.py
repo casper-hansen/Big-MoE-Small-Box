@@ -100,6 +100,21 @@ def _mapped(nbytes, dev_idx, tag):
     return mm, a, t
 
 
+class _Arenas:
+    """Several HostArenas as one slot id space (RAM slot classes): addr[s], view(s, n)."""
+
+    def __init__(self, arenas):
+        self.arenas = arenas
+        self.addr = np.concatenate([a.addr for a in arenas]) if arenas else np.zeros(0, np.int64)
+        self.n = len(self.addr)
+        self.base = np.cumsum([0] + [a.n for a in arenas])
+
+    def view(self, s, n=None):
+        i = int(np.searchsorted(self.base, s, side="right") - 1)
+        a = self.arenas[i]
+        return a.view(s - int(self.base[i]), n or a.slot)
+
+
 class Nv2:
     def __init__(self, pool):
         e = ext()
@@ -193,13 +208,27 @@ class Nv2:
             # exl3_patch's end-of-turn tail checkpoints live outside the -rcs budget: up to 4 x ~143 MB
             tails = 0.6 * GiB if g("DSV41_EXL3_PATCHES", "1") == "1" else 0
             avail = (mem["max"] - mem["current"]) * GiB - margin - ring_own * self.slot - NT._rcs_bytes() - tails - 0.3 * GiB
-            nram = max(0, int(avail // self.slot))
         else:
-            nram = int(float(want) * GiB // self.slot)
+            avail = float(want) * GiB
+        avail = max(0, avail)
+        # RAM slot classes (DSV41_NV_RAMCLS=1): full slots for the large-record layers, small slots for the layers whose
+        # trellis fits the smallest layer size, the same number of slots per layer either way
+        lens = self.geomt[:, 2].tolist()
+        self.small_bytes = int(min(lens))
+        n_small_layers = sum(1 for x in lens if x <= self.small_bytes)
+        if g("DSV41_NV_RAMCLS", "1") == "1" and self.small_bytes < self.slot and n_small_layers < len(lens):
+            per_layer = avail / (self.slot * (len(lens) - n_small_layers) + self.small_bytes * n_small_layers)
+            n_full, n_small = int(per_layer * (len(lens) - n_small_layers)), int(per_layer * n_small_layers)
+        else:
+            n_full, n_small, self.small_bytes = int(avail // self.slot), 0, 0
+        nram = n_full + n_small
         NT._log(f"nv2: rcs reserve {NT._rcs_bytes() / GiB:.1f} GiB, margin {margin / GiB:.1f} GiB, prefill ring {ring_pf} "
                 f"slots ({'borrowed from the RAM tier' if self.ring_borrow else f'{ring_pf * self.slot / GiB:.2f} GiB'}) -> "
-                f"RAM tier {nram} slots ({nram * self.slot / GiB:.2f} GiB)")
-        self.ram = NT.HostArena(nram, self.slot, 512, dev_idx, "ram")
+                f"RAM tier {nram} slots ({n_full} x {self.slot / 1e6:.2f} MB + {n_small} x {self.small_bytes / 1e6:.2f} MB = "
+                f"{(n_full * self.slot + n_small * self.small_bytes) / GiB:.2f} GiB)")
+        self.ram = _Arenas([NT.HostArena(n_full, self.slot, 512, dev_idx, "ram")] +
+                           ([NT.HostArena(n_small, self.small_bytes, 512, dev_idx, "ram_small")] if n_small else []))
+        self.slot_cls = torch.tensor([0] * n_full + [1] * n_small, dtype=torch.int8)
         self.nram = nram
         self.pf = NT.HostArena(ring_own, self.slot, ring_own, dev_idx, "pfring")
         NT._log(f"nv2: RAM arena + prefill ring registered")
@@ -239,7 +268,7 @@ class Nv2:
                torch.tensor(self.ram.addr.tolist(), dtype=torch.int64), torch.tensor(self.pf.addr.tolist(), dtype=torch.int64),
                torch.from_numpy(sc), int(g("DSV41_NV_THREADS", "16")), rcpus, int(g("DSV41_NV_CTL_CPU", "25")),
                int(self.wb_on), int(g("DSV41_NV_LAND", "64")), int(g("DSV41_NV_FREE_LO", "96")),
-               torch.tensor(self.vring_addr, dtype=torch.int64))
+               torch.tensor(self.vring_addr, dtype=torch.int64), self.slot_cls, int(self.small_bytes))
         e.set_stage_qd(int(g("DSV41_NV_PF_QD", "24")))
         if self.ring_borrow:
             e.set_ring_borrow(ring_pf)
@@ -306,8 +335,17 @@ class Nv2:
         rank = []    # round-robin by rank across layers (top-1 of every layer first)
         for r in range(self.E):
             rank += [order[li][r] for li in range(self.L)]
+        # per RAM slot class: at most that class's slot count (a class never evicts its own warm reads)
+        lens = self.geomt[:, 2].numpy()
+        ncls = [int((self.slot_cls == 0).sum()), int((self.slot_cls == 1).sum())]
+        cls_of = lambda k: 1 if (ncls[1] and lens[k // self.E] <= self.small_bytes) else 0
+        take, used = [], [0, 0]
+        for k in rank:
+            c = cls_of(k)
+            if used[c] < ncls[c]:
+                take.append(k); used[c] += 1
         t = time.perf_counter()
-        n1 = ext().warm_read(torch.tensor(rank[:self.nram], dtype=torch.int64))
+        n1 = ext().warm_read(torch.tensor(take, dtype=torch.int64))
         ext().nv_rows_all(self.L, self.E, p.slotof, self.a["home"], p.tabs)
         torch.cuda.synchronize(self.dev)
         NT._log(f"nv2 RAM warm: {n1} experts in {time.perf_counter() - t:.1f} s")
@@ -514,7 +552,8 @@ class Nv2:
                 xd = x.double()
                 for ex in res:
                     sl = int(st[0][li * self.E + ex])
-                    self.bounce_t[: self.slot].copy_(self.ram.view(sl).to(self.dev))  # selftest (CPU lane)
+                    rv = self.ram.view(sl)
+                    self.bounce_t[: rv.numel()].copy_(rv.to(self.dev))  # selftest (CPU lane)
                     torch.cuda.synchronize(self.dev)
                     Wg = m.gates[ex].inner.get_weight_tensor().cpu().double(); Wu = m.ups[ex].inner.get_weight_tensor().cpu().double()
                     a1, a2 = torch.nn.functional.silu(xd @ Wg), xd @ Wu

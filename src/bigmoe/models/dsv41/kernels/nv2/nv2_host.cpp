@@ -327,8 +327,15 @@ struct Engine
     // RAM tier
     int nram = 0; std::vector<int64_t> ram_addr;
     std::vector<int32_t> slot_of; std::vector<int8_t> kst; std::vector<double> karr;
-    std::vector<int32_t> owner, pinc, lprev, lnext; int lru_old = -1, lru_new = -1;
-    std::vector<int32_t> freel;
+    std::vector<int32_t> owner, pinc, lprev, lnext;
+    // RAM slot classes (DSV41): slot s holds experts of class slot_cls[s] only (0: full slots of slot_bytes, 1: small
+    // slots for layers whose trellis fits small_bytes); key class kcls[key]. One free list and one LRU chain per class
+    static constexpr int NSC = 2;
+    int lru_old_c[NSC] = { -1, -1 }, lru_new_c[NSC] = { -1, -1 };
+    std::vector<int32_t> freel_c[NSC];
+    std::vector<int8_t> slot_cls, kcls;
+    int64_t small_bytes = 0; int nslot_c[NSC] = { 0, 0 };
+    std::vector<int32_t> freel;   // unused (legacy diagnostics: size of class 0 + 1 lists is reported)
     std::vector<uint8_t> prot; std::vector<int32_t> protl;
     // BCP lossy verify (DSV41_NV_LOSSY=1 or ext().set_lossy; approximate, not lossless): see lossy_plan
     bool lossy_on = false; float lossy_eps = 0.0f, lossy_whi = 2.0f; int lossy_renorm = 0, lossy_pf = 0, lossy_bg = 0;
@@ -501,14 +508,27 @@ struct Engine
     // ---------------- LRU over slots ----------------
     void lru_remove(int s)
     {
+        const int c = slot_cls[s];
+        int& lru_old = lru_old_c[c]; int& lru_new = lru_new_c[c];
         const int p = lprev[s], n = lnext[s];
         if (p >= 0) lnext[p] = n; else if (lru_old == s) lru_old = n;
         if (n >= 0) lprev[n] = p; else if (lru_new == s) lru_new = p;
         lprev[s] = lnext[s] = -1;
     }
-    void lru_push_new(int s) { lprev[s] = lru_new; lnext[s] = -1; if (lru_new >= 0) lnext[lru_new] = s; lru_new = s; if (lru_old < 0) lru_old = s; }
-    void lru_push_old(int s) { lnext[s] = lru_old; lprev[s] = -1; if (lru_old >= 0) lprev[lru_old] = s; lru_old = s; if (lru_new < 0) lru_new = s; }
-    void lru_touch(int s) { if (lru_new == s) return; lru_remove(s); lru_push_new(s); }
+    void lru_push_new(int s)
+    {
+        const int c = slot_cls[s];
+        int& lru_old = lru_old_c[c]; int& lru_new = lru_new_c[c];
+        lprev[s] = lru_new; lnext[s] = -1; if (lru_new >= 0) lnext[lru_new] = s; lru_new = s; if (lru_old < 0) lru_old = s;
+    }
+    void lru_push_old(int s)
+    {
+        const int c = slot_cls[s];
+        int& lru_old = lru_old_c[c]; int& lru_new = lru_new_c[c];
+        lnext[s] = lru_old; lprev[s] = -1; if (lru_old >= 0) lprev[lru_old] = s; lru_old = s; if (lru_new < 0) lru_new = s;
+    }
+    void lru_touch(int s) { if (lru_new_c[slot_cls[s]] == s) return; lru_remove(s); lru_push_new(s); }
+    size_t nfree() const { return freel_c[0].size() + freel_c[1].size(); }
 
     void set_home(int key, int64_t a)
     {
@@ -529,11 +549,12 @@ struct Engine
         return s;
     }
     // one free slot (caller holds mu): free list, else the oldest evictable resident key; -1 if none
-    int take_slot()
+    int take_slot_cls(int c)
     {
-        if (!freel.empty()) { int s = freel.back(); freel.pop_back(); return s; }
+        auto& fl = freel_c[c];
+        if (!fl.empty()) { int s = fl.back(); fl.pop_back(); return s; }
         int guard = 0;
-        for (int s = lru_old; s >= 0 && guard < nram; s = lnext[s], ++guard)
+        for (int s = lru_old_c[c]; s >= 0 && guard < nram; s = lnext[s], ++guard)
         {
             const int key = owner[s];
             if (key < 0 || kst[key] != KS_RES || prot[key] || pinc[s] > 0) continue;
@@ -542,7 +563,8 @@ struct Engine
         C.alloc_fail++;
         return -1;
     }
-    void free_slot(int s) { owner[s] = SL_FREE; freel.push_back(s); }
+    int take_slot(int key) { return take_slot_cls(kcls[key]); }
+    void free_slot(int s) { owner[s] = SL_FREE; freel_c[slot_cls[s]].push_back(s); }
 
     // landed (reader thread)
     static void on_land(void* ctx, int64_t tag, int err, double ms)
@@ -576,7 +598,7 @@ struct Engine
     // RC_PREFETCH / RC_BULK (reader priority classes); only demand reads advance the planner's arrival model
     bool start_read(int key, int cls, double* arrival)
     {
-        const int s = take_slot();
+        const int s = take_slot(key);
         if (s < 0) return false;
         owner[s] = key; slot_of[key] = s; kst[key] = KS_INFLIGHT;
         set_home(key, ram_addr[s]);                 // device reads home only after ram_res == 1
@@ -605,7 +627,7 @@ struct Engine
     {
         const int key = le.key, v = le.slot;
         if (kst[key] != KS_NONE) { vfree.push_back(v); C.wb_dup++; return; }
-        const int s = take_slot();
+        const int s = take_slot(key);
         if (s < 0) { vfree.push_back(v); C.wb_drop++; return; }
         // resident at once, backed by the VRAM ring slot (valid bytes, device-readable); the wb thread copies it
         // to RAM slot s on a copy engine and then switches home to s. Pinned until then (no eviction).
@@ -744,18 +766,23 @@ struct Engine
     }
     void stock_free()
     {
-        int guard = 0;
-        while ((int) freel.size() < free_lo && guard++ < 16)
+        for (int c = 0; c < NSC; ++c)
         {
-            int s = -1;
-            for (int x = lru_old, g = 0; x >= 0 && g < nram; x = lnext[x], ++g)
+            if (!nslot_c[c]) continue;
+            const int lo = std::max(1, int(int64_t(free_lo) * nslot_c[c] / std::max(1, nram)));
+            int guard = 0;
+            while ((int) freel_c[c].size() < lo && guard++ < 16)
             {
-                const int key = owner[x];
-                if (key < 0 || kst[key] != KS_RES || prot[key] || pinc[x] > 0) continue;
-                s = evict_key(key); break;
+                int s = -1;
+                for (int x = lru_old_c[c], g = 0; x >= 0 && g < nram; x = lnext[x], ++g)
+                {
+                    const int key = owner[x];
+                    if (key < 0 || kst[key] != KS_RES || prot[key] || pinc[x] > 0) continue;
+                    s = evict_key(key); break;
+                }
+                if (s < 0) break;
+                freel_c[c].push_back(s);
             }
-            if (s < 0) break;
-            freel.push_back(s);
         }
     }
 
@@ -1403,7 +1430,7 @@ struct Engine
             // NVMe like any other non-resident one (free slots, e.g. a previous prefill's ring, are taken first)
             for (int i = 0; i < ring_n; ++i)
             {
-                const int s = take_slot();
+                const int s = take_slot_cls(0);   // the ring holds records of any layer: full slots
                 if (s < 0) break;
                 owner[s] = SL_STAGE; st_ring_slots.push_back(s); st_ring_addr.push_back(ram_addr[s]);
                 C.ring_borrowed++;
@@ -1494,7 +1521,7 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
           int64_t off_d, int64_t fd, int64_t ph, int64_t hc, int64_t req, int64_t rep, int64_t wbl, int64_t adml, int64_t land,
           int64_t home, int64_t ram_res, int64_t hx, int64_t hout, at::Tensor ram_addr, at::Tensor pf_ring, at::Tensor score,
           int64_t readers, std::vector<int64_t> reader_cpus, int64_t ctl_cpu, int64_t exclusive, int64_t land_target, int64_t free_lo,
-          at::Tensor vring)
+          at::Tensor vring, at::Tensor slot_cls, int64_t small_bytes)
 {
     TORCH_CHECK(G == nullptr, "nv2 engine already initialised");
     {
@@ -1555,7 +1582,20 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
                                 e.lossy_eps, e.lossy_whi, e.lossy_renorm, e.lossy_pf, e.lossy_bg, e.lossy_lo, e.lossy_hi);
     }
     e.owner.assign(e.nram, SL_FREE); e.pinc.assign(e.nram, 0); e.lprev.assign(e.nram, -1); e.lnext.assign(e.nram, -1);
-    for (int s = e.nram - 1; s >= 0; --s) e.freel.push_back(s);
+    // slot classes: slot_cls (CPU int8 [nram], 0 full / 1 small) and the small slot size; a layer whose trellis fits a
+    // small slot uses class 1 when there are small slots
+    e.slot_cls.assign(e.nram, 0);
+    if (slot_cls.numel())
+    {
+        TORCH_CHECK(slot_cls.numel() == e.nram && slot_cls.dtype() == at::kChar, "slot_cls: int8 [nram]");
+        std::memcpy(e.slot_cls.data(), slot_cls.data_ptr<int8_t>(), size_t(e.nram));
+    }
+    e.small_bytes = small_bytes;
+    for (int s = 0; s < e.nram; ++s) e.nslot_c[e.slot_cls[s]]++;
+    e.kcls.assign(e.K, 0);
+    for (int k = 0; k < e.K; ++k)
+        e.kcls[k] = (e.nslot_c[1] > 0 && e.small_bytes > 0 && e.l_len[k / e.E] <= e.small_bytes) ? 1 : 0;
+    for (int s = e.nram - 1; s >= 0; --s) e.freel_c[e.slot_cls[s]].push_back(s);
     for (int k = 0; k < e.K; ++k) { e.ram_res[k] = 0; e.set_home(k, ph); }
     e.exclusive = exclusive != 0; e.land_target = int(land_target); e.free_lo = int(free_lo);
     e.ctl_cpu = int(ctl_cpu);
@@ -1672,7 +1712,7 @@ int64_t wb_bulk(at::Tensor keys, at::Tensor src)
         {
             const int key = int(k[i]);
             if (e.kst[key] != KS_NONE) continue;
-            const int s = e.take_slot();
+            const int s = e.take_slot(key);
             if (s < 0) break;
             e.owner[s] = key;                        // reserved
             cudaMemcpyAsync((void*) e.ram_addr[s], (const void*) a[i], size_t(e.klen(key)), cudaMemcpyDeviceToHost, e.wb_stream);
@@ -1749,7 +1789,7 @@ std::vector<int64_t> counters()
         c.partial_lands, c.partial_binds, c.wb_lat_us, c.wb_lat_max_us, c.ring_low, c.ring_low_vfree, c.ring_borrowed };
     std::lock_guard<std::mutex> lk(e.mu);
     int res = 0, inf = 0; for (int k = 0; k < e.K; ++k) { res += e.kst[k] == KS_RES; inf += e.kst[k] == KS_INFLIGHT; }
-    v.push_back(res); v.push_back(inf); v.push_back((int64_t) e.freel.size()); v.push_back(e.land_tail - e.hc[HC_WBN]);
+    v.push_back(res); v.push_back(inf); v.push_back((int64_t) e.nfree()); v.push_back(e.land_tail - e.hc[HC_WBN]);
     return v;
 }
 
