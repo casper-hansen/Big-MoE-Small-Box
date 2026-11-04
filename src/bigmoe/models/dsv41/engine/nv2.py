@@ -568,7 +568,8 @@ class Nv2:
                     cpu = ext().cpu_forward(li, x.float(), sel, w, mode).double()
                     k = {1: "EXACT", 0: "AFFINE", 2: "I16"}[mode]
                     out[k] = max(out.get(k, 0.0), round(float((cpu - ref).norm() / ref.norm()), 6))
-                    if mode == 2 and _vbmi_on():   # the AVX-512 VBMI I16 kernel must match the AVX2 one bit for bit
+                    k3 = float(m.multi_gate.K) == 3 and float(m.multi_up.K) == 3 and float(m.multi_down.K) == 3
+                    if mode == 2 and _vbmi_on() and k3:   # the VBMI I16 kernel must match the AVX2 one bit for bit (K 3 only: no AVX2 decoder for K 2 / 2.5)
                         ext().cpu_knob("vbmi", 0)
                         avx2 = ext().cpu_forward(li, x.float(), sel, w, mode).double()
                         ext().cpu_knob("vbmi", 1)

@@ -790,11 +790,12 @@ inline void fwd4_fn(void* vc, int, int)
                 xp[i] = (U.which ? F.xu : F.xg).data() + size_t(s0 + i) * XH;
                 qs[i] = (U.which ? F.qu : F.qg).data() + size_t(s0 + i) * BH;
             }
-            const int tk = M.k / 16, R = F.rg, C = F.cg;
+            // DSV41: the last column band of a row is clipped (DeepSeek: I / 16 = 144 tiles = 128 + 16)
+            const int tk = M.k / 16, R = F.rg, C = std::min(F.cg, M.n / 16 - U.b * F.cg);
             if (F.wait && F.jlate[U.j]) wait_rows(F, U.j, M, U.which ? F.off_u : 0, U.a * R, std::min(R, tk - U.a * R));
             // partials [band][slot][I]
-            float* y = (U.which ? F.pu : F.pg).data() + (size_t(U.a) * F.ns + s0) * I + size_t(U.b) * C * 16;
-            rect_m(F.kind, J.m, M, U.a * R, std::min(R, tk - U.a * R), U.b * C, C, xp, qs, y, I);
+            float* y = (U.which ? F.pu : F.pg).data() + (size_t(U.a) * F.ns + s0) * I + size_t(U.b) * F.cg * 16;
+            rect_m(F.kind, J.m, M, U.a * R, std::min(R, tk - U.a * R), U.b * F.cg, C, xp, qs, y, I);
             F.c_gu[U.j].v.fetch_add(1, std::memory_order_release);
         }
         else if (U.kind == U_ACT)
@@ -851,9 +852,10 @@ inline void fwd4_fn(void* vc, int, int)
             }
             const void* xp[MAXM]; const float* qs[MAXM];
             for (int i = 0; i < J.m; ++i) { xp[i] = F.xd.data() + size_t(s0 + i) * XI; qs[i] = F.qd.data() + size_t(s0 + i) * BI; }
-            const int tk = E.d.k / 16, R = F.rd, C = F.cd;
-            float* y = F.pd.data() + (size_t(U.a) * F.ns + s0) * H + size_t(U.b) * C * 16;
-            rect_m(F.kind, J.m, E.d, U.a * R, std::min(R, tk - U.a * R), U.b * C, C, xp, qs, y, H);
+            // DSV41: the last column band is clipped (DeepSeek: H / 16 = 320 tiles = 128 + 128 + 64)
+            const int tk = E.d.k / 16, R = F.rd, C = std::min(F.cd, E.d.n / 16 - U.b * F.cd);
+            float* y = F.pd.data() + (size_t(U.a) * F.ns + s0) * H + size_t(U.b) * F.cd * 16;
+            rect_m(F.kind, J.m, E.d, U.a * R, std::min(R, tk - U.a * R), U.b * F.cd, C, xp, qs, y, H);
             F.c_down[U.j].v.fetch_add(1, std::memory_order_release);
         }
         else

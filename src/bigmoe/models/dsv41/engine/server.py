@@ -393,6 +393,16 @@ async def expert_counts(phase: str = "dec", path: str = ""):
     return JSONResponse(c)
 
 
+@app.get("/cpu")
+async def cpu_switch(on: int = 1):
+    """Runtime CPU-lane switch (mode nvme): on=0 puts every pick on the GPU path (bit-exact), for same-server A/B."""
+    from . import nv2
+    if nv2.NV is None:
+        return JSONResponse({"error": "nv2 off"})
+    nv2.NV.set_cpu(bool(on))
+    return JSONResponse({"cpu": bool(on) and nv2.NV.cpu_on})
+
+
 @app.get("/nv_verify")
 async def nv_verify(n: int = 32):
     from . import tiers
