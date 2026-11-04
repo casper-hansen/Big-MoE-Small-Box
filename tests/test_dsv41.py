@@ -33,13 +33,13 @@ def spec_for(tmp_path, monkeypatch, flags=frozenset(VBMI), **kw):
 def test_alias_and_commit(tmp_path):
     box = AutoBox("deepseek-v4.1-flash", home=tmp_path)
     assert box.backend.name == "dsv41" and box.commit == dsv41.VARIANTS["2.25bpw"]
-    assert box.options.mode == "nvme-exact"
+    assert box.options.mode == "nvme" and box.options.speculation == "dspark"
     with pytest.raises(BoxError):
         AutoBox("deepseek-v4.1-flash", home=tmp_path, revision="1.68bpw").commit
 
 
 def test_launch_exact(tmp_path, monkeypatch):
-    box, spec = spec_for(tmp_path, monkeypatch)
+    box, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
     e = spec.env
     assert e["DSV41_NV"] == "2" and e["DSV41_NV_CPU"] == "0" and e["DSV41_NV_STAGE"] == "1"
     assert "DSV41_NV_CPU_CPUS" not in e and e["DSV41_NV_READER_CPUS"] == "7-11" and e["DSV41_NV_CTL_CPU"] == "6"
@@ -65,7 +65,7 @@ def test_dspark_default_and_off(tmp_path, monkeypatch):
 
 
 def test_launch_cpu_lane(tmp_path, monkeypatch):
-    _, spec = spec_for(tmp_path, monkeypatch, mode="nvme")
+    _, spec = spec_for(tmp_path, monkeypatch)   # default mode nvme
     assert spec.env["DSV41_NV_CPU"] == "1" and spec.env["DSV41_NV_CPU_CPUS"] == "1-5"
     box, _ = spec_for(tmp_path, monkeypatch, flags={"avx2", "fma", "f16c"}, mode="nvme")
     monkeypatch.setattr(system, "gpu_compute_apps", lambda: [])
