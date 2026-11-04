@@ -34,25 +34,25 @@ The offloading and scheduling engine started as 0xSero's [glm-flash-lite](https:
 
 ## GLM-5.3-Flash
 
-`bigmoe bench` prompts (Python source files and a question about them), greedy, 128k context, FP16 KV cache. KL: mean per-token KL divergence from exact decode (`nvme-exact`) on the same forced tokens, six chat prompts, 897 positions.
+`bigmoe bench` prompts (Python source files and a question about them), greedy, 128k context, FP16 KV cache. KL and top-1: mean per-token KL divergence from exact decode (`nvme-exact`) and the share of positions with the same most likely token, on the same forced tokens, six chat prompts, 897 positions.
 
-| mode | prompt tokens | prefill | decode | KL |
-|---|---|---|---|---|
-| `nvme` | 1,024 | 113 tok/s | 11.4 tok/s | 0.012 |
-| `nvme` | 8,192 | 776 tok/s | 11.4 tok/s | 0.012 |
-| `nvme` | 32,768 | 833 tok/s | 11.8 tok/s | 0.012 |
-| `nvme` | 120,000 | 826 tok/s | 11.4 tok/s | 0.012 |
-| `nvme-exact` | 1,024 | 60 tok/s | 7.8 tok/s | 0 (reference) |
-| `nvme-exact` | 8,192 | 427 tok/s | 7.9 tok/s | 0 (reference) |
+| mode | prompt tokens | prefill | decode | KL | top-1 |
+|---|---|---|---|---|---|
+| `nvme` | 1,024 | 113 tok/s | 11.4 tok/s | 0.012 | 97.2 % |
+| `nvme` | 8,192 | 776 tok/s | 11.4 tok/s | 0.012 | 97.2 % |
+| `nvme` | 32,768 | 833 tok/s | 11.8 tok/s | 0.012 | 97.2 % |
+| `nvme` | 120,000 | 826 tok/s | 11.4 tok/s | 0.012 | 97.2 % |
+| `nvme-exact` | 1,024 | 60 tok/s | 7.8 tok/s | 0 (reference) | 100 % (reference) |
+| `nvme-exact` | 8,192 | 427 tok/s | 7.9 tok/s | 0 (reference) | 100 % (reference) |
 
 ## DeepSeek-V4.1-Flash
 
-`bigmoe bench` prompts, greedy, 64k context, FP16 KV cache, DSpark speculative decoding. KL: mean per-token KL divergence from exact single-token decode (`nvme-exact`, no speculation) on the same forced tokens, six chat prompts, 1,110 positions; with DSpark even `nvme-exact` differs slightly, because the verify forwards round in other GEMM shapes.
+`bigmoe bench` prompts, greedy, 64k context, FP16 KV cache, DSpark speculative decoding. KL and top-1: mean per-token KL divergence from exact single-token decode (`nvme-exact`, no speculation) and the share of positions with the same most likely token, on the same forced tokens, six chat prompts, 1,110 positions; with DSpark even `nvme-exact` differs slightly, because the verify forwards round in other GEMM shapes.
 
-| mode | prompt tokens | prefill | decode | KL |
-|---|---|---|---|---|
-| `nvme` | 1,024 | 33 tok/s | 15.6 tok/s | 0.0008 |
-| `nvme` | 8,192 | 250 tok/s | 18.1 tok/s | 0.0008 |
-| `nvme` | 32,768 | 405 tok/s | 18.5 tok/s | 0.0008 |
-| `nvme-exact` | 1,024 | 35 tok/s | 11.0 tok/s | 0.0007 |
-| `nvme-exact` | 8,192 | 268 tok/s | 12.6 tok/s | 0.0007 |
+| mode | prompt tokens | prefill | decode | KL | top-1 |
+|---|---|---|---|---|---|
+| `nvme` | 1,024 | 33 tok/s | 15.6 tok/s | 0.0008 | 99.6 % |
+| `nvme` | 8,192 | 250 tok/s | 18.1 tok/s | 0.0008 | 99.6 % |
+| `nvme` | 32,768 | 405 tok/s | 18.5 tok/s | 0.0008 | 99.6 % |
+| `nvme-exact` | 1,024 | 35 tok/s | 11.0 tok/s | 0.0007 | 99.7 % |
+| `nvme-exact` | 8,192 | 268 tok/s | 12.6 tok/s | 0.0007 | 99.7 % |
