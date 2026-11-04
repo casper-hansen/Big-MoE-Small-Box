@@ -355,6 +355,9 @@ struct Engine
     int land_target = 64, free_lo = 96;
     bool wb_early = true;   // DSV41_NV_WB_EARLY: drain parked victims at nv_copy completion (HC_CPDONE), restock at once
     bool rzc1 = true;       // DSV41_NV_RZC1: verify windows zero-copy (do not admit) RAM picks used by one token only
+    // DSV41_NV_RZC_ALL: decode-class GPU-lane RAM picks are read zero-copy from their RAM slot, never admitted (no
+    // VRAM churn: no admission copy, no victim, no write-back); the VRAM cache keeps its warm set. Same bytes: exact
+    bool rzc_all = false;
     bool exclusive = true;
     // NVMe channel model (plan arrival estimates)
     double nv_free_at = 0;
@@ -996,7 +999,7 @@ struct Engine
             if (cpu && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_CPU; ncpu++; cur_ncr++; C.lane_cpu++; }
             // verify window: an expert only one of its tokens picked is read once either way; zero-copy it instead of
             // admitting it, which keeps the VRAM cache and the write-back landing ring for the shared ones
-            else if (rzc1 && r.ntok > 1 && k.cnt == 1) { g = ge; p.lane[k.u] = LN_RZC; C.lane_zc++; }
+            else if (rzc_all || (rzc1 && r.ntok > 1 && k.cnt == 1)) { g = ge; p.lane[k.u] = LN_RZC; C.lane_zc++; }
             else { g = ge; p.lane[k.u] = LN_RAM; C.lane_zc++; }
         }
         for (auto& k : N)
@@ -1567,6 +1570,7 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
     if (const char* pm = getenv("DSV41_NV_CBT")) e.pol.cbt = atof(pm);
     if (const char* pm = getenv("DSV41_NV_WB_EARLY")) e.wb_early = atoi(pm) != 0;
     if (const char* pm = getenv("DSV41_NV_RZC1")) e.rzc1 = atoi(pm) != 0;
+    if (const char* pm = getenv("DSV41_NV_RZC_ALL")) e.rzc_all = atoi(pm) != 0;
     {
         const char* v;
         e.lossy_on = (v = getenv("DSV41_NV_LOSSY")) && atoi(v) == 1;

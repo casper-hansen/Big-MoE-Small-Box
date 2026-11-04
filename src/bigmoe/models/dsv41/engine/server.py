@@ -178,6 +178,16 @@ async def run_job(ids, sp, stop_strings=None):
             fin = None
             if r.get("eos"):
                 n = max(n, int(r.get("new_tokens", 0)))
+                if r.get("accepted_draft_tokens") is not None:   # speculative decoding (DSpark / n-gram)
+                    sd = G["stats"].setdefault("draft", {"accepted": 0, "rejected": 0, "rounds": 0, "windows": {},
+                                                         "accepted_hist": {}})
+                    sd["accepted"] += int(r.get("accepted_draft_tokens") or 0)
+                    sd["rejected"] += int(r.get("rejected_draft_tokens") or 0)
+                    inner = getattr(job, "job", None)
+                    for _pos, win, acc in (getattr(inner, "draft_stats", None) or []):
+                        sd["rounds"] += 1
+                        sd["windows"][str(win)] = sd["windows"].get(str(win), 0) + 1
+                        sd["accepted_hist"][str(acc)] = sd["accepted_hist"].get(str(acc), 0) + 1
                 reason = r.get("eos_reason")
                 fin = {"type": "length" if reason == "max_new_tokens" else "stop", "reason": str(reason)}
                 G["stats"]["completion_tokens"] += n
@@ -395,6 +405,31 @@ async def expert_counts(phase: str = "dec", path: str = ""):
         json.dump(c, open(path, "w"))
         return JSONResponse({"path": path, "layers": len(c)})
     return JSONResponse(c)
+
+
+@app.get("/gpu_prof")
+async def gpu_prof(secs: float = 3.0, path: str = "", top: int = 40):
+    """CUDA kernel profile (torch.profiler / CUPTI) of whatever the GPU runs during the next `secs` seconds: start a
+    decode first. Diagnostics only (CUPTI adds launch overhead)."""
+    from torch.profiler import profile, ProfilerActivity
+    prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+    prof.__enter__()
+    try:
+        await asyncio.sleep(secs)
+    finally:
+        prof.__exit__(None, None, None)
+    if path:
+        prof.export_chrome_trace(path)
+    dev = lambda ev, k: float(getattr(ev, k, None) if getattr(ev, k, None) is not None else 0.0)
+    rows = []
+    for ev in prof.key_averages():
+        t = dev(ev, "self_device_time_total") or dev(ev, "self_cuda_time_total")
+        if t > 0:
+            rows.append({"name": ev.key[:120], "count": int(ev.count), "self_dev_us": round(t, 1),
+                         "us_per_call": round(t / max(1, ev.count), 2)})
+    rows.sort(key=lambda r: -r["self_dev_us"])
+    tot = sum(r["self_dev_us"] for r in rows)
+    return JSONResponse({"secs": secs, "dev_us_total": round(tot, 1), "path": path, "top": rows[:top]})
 
 
 @app.get("/cpu")
