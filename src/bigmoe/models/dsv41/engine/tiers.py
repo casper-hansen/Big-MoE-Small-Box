@@ -154,6 +154,38 @@ void ec_copy(at::Tensor ctl, at::Tensor jobs, int64_t li, int64_t E, at::Tensor 
         home.data_ptr<int64_t>(), (const long long*) arena, (int) spc, rec, sg / 16, su / 16, sd / 16, off_u, off_d);
 }
 
+// slots [s0, s1): owners back to their home rows; disable = 1 takes the slots out of the CLOCK (elastic prefill)
+__global__ void ec_evict_k(int s0, int s1, int disable, int E, int* owner, int* slotof_all, const int64_t* home_all,
+    const int64_t* tabs, int* refb, int* pin)
+{
+    int s = s0 + blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= s1) return;
+    int o = owner[s];
+    if (o >= 0) {
+        int l = o / E, e = o % E;
+        slotof_all[(long long) l * E + e] = -1;
+        const int64_t* h = home_all + ((long long) l * E + e) * 3;
+        int64_t* pg = (int64_t*) tabs[l * 4 + 0]; int64_t* pu = (int64_t*) tabs[l * 4 + 1];
+        int64_t* pd = (int64_t*) tabs[l * 4 + 2]; int64_t* gu = (int64_t*) tabs[l * 4 + 3];
+        pg[e] = h[0]; pu[e] = h[1]; pd[e] = h[2];
+        if (gu) { gu[2 * e] = h[0]; gu[2 * e + 1] = h[1]; }
+        owner[s] = -1;
+    }
+    refb[s] = 0;
+    pin[s] = disable ? -1 : 0;
+}
+
+void ec_evict(int64_t s0, int64_t s1, int64_t disable, int64_t E, at::Tensor owner, at::Tensor slotof, at::Tensor home,
+              at::Tensor tabs, at::Tensor refb, at::Tensor pin)
+{
+    c10::cuda::CUDAGuard g(owner.device());
+    auto st = at::cuda::getCurrentCUDAStream(owner.device().index());
+    int n = (int) (s1 - s0);
+    if (n <= 0) return;
+    ec_evict_k<<<(n + 255) / 256, 256, 0, st>>>((int) s0, (int) s1, (int) disable, (int) E, owner.data_ptr<int>(),
+        slotof.data_ptr<int>(), home.data_ptr<int64_t>(), tabs.data_ptr<int64_t>(), refb.data_ptr<int>(), pin.data_ptr<int>());
+}
+
 // ================= homes / pointer rows of non-VRAM experts =================
 __global__ void nv_apply_k(const int64_t* __restrict__ upd, int n, int64_t* home, const int* __restrict__ slotof,
     const int64_t* __restrict__ tabs, int E, long long off_u, long long off_d)
@@ -294,6 +326,7 @@ int64_t io_read(int64_t fd, at::Tensor offs, at::Tensor dsts, int64_t len, int64
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ec_step", &ec_step);
     m.def("ec_copy", &ec_copy);
+    m.def("ec_evict", &ec_evict);
     m.def("nv_apply", &nv_apply);
     m.def("nv_check", &nv_check);
     m.def("nv_bounce", &nv_bounce);
@@ -671,6 +704,129 @@ class UPool(Pool):
 
     def geom(self, li):
         return self.g[li]
+
+    # ---- staged prefill (nv2): GLM-5.3 engine's Pool._stage_hook_nv2 / elastic VRAM, per-layer slot geometry -----------
+    def stage_init(self, stage_min, elastic_bytes, stage_n):
+        """Prefill forwards with >= stage_min picks per layer stage every non-VRAM expert of the next layer into a VRAM
+        buffer (two buffers, stage_n slots each) on a copy stream. Elastic: the last VRAM-cache chunks (elastic_bytes) are
+        evicted and handed to torch for the prefill (activations + the staging buffers) and come back for decode."""
+        self.stage_min, self.stage_n = stage_min, stage_n
+        self.elastic = elastic_bytes
+        self.stage = None
+        nflex = min(len(self.chunks), int(-(-elastic_bytes // (self.spc * self.rec)))) if elastic_bytes else 0
+        self.flex_all = list(range(len(self.chunks) - nflex, len(self.chunks)))
+        self.flex = list(self.flex_all)
+        self.in_prefill = False
+        self.elastic_stats = {"enter": 0, "exit": 0, "realloc_fail": 0}
+        self.cstream = torch.cuda.Stream(self.device)
+        self.ev_ready = [torch.cuda.Event() for _ in range(2)]
+        for ev in self.ev_ready:
+            ev.record(torch.cuda.current_stream(self.device))
+        self.staged = {}
+        self.last_li = None
+        self.pending = None
+        self.slot_np = None
+        self._st_open = False
+        self.stage_stats = {"forwards": 0, "layers": 0, "experts": 0}
+        if not elastic_bytes and stage_n:
+            self.stage = [torch.empty((stage_n, self.rec), dtype=torch.uint8, device=self.device) for _ in range(2)]
+
+    def _point_staged(self, li, take, b):
+        idx = torch.from_numpy(take.astype(np.int64)).to(self.device)
+        sg, su, sd, ou, od = self.g[li]
+        base = self.stage[b].data_ptr()
+        a = base + torch.arange(len(take), dtype=torch.int64, device=self.device) * self.rec
+        pg, pu, pd, gu = self.keep[li]
+        pg.index_copy_(0, idx, a); pu.index_copy_(0, idx, a + ou); pd.index_copy_(0, idx, a + od)
+        if gu is not None:
+            gu.index_copy_(0, idx, torch.stack([a, a + ou], 1))
+        self.staged[li] = (b, idx)
+
+    def _restore_nv2(self, li):
+        from . import nv2 as N2
+        b, idx = self.staged.pop(li)
+        N2.ext().nv_restore(idx, li, self.E, self.nv2.a["home"], self.tabs)
+
+    def _stage_hook_nv2(self, li, n_picks):
+        from . import nv2 as N2
+        e = N2.ext()
+        prefill = n_picks >= self.stage_min
+        for l in [k for k in self.staged if k != li]:
+            self._restore_nv2(l)
+        if not prefill:
+            if self.last_li is not None or self._st_open:
+                if self.pending is not None:
+                    self.nv2.stage_wait(self.pending)
+                    self.pending = None
+                e.stage_end()
+                self._st_open = False
+            self.last_li = None
+            if self.in_prefill:
+                self._elastic_exit()
+            return
+        cur = torch.cuda.current_stream(self.device)
+        if self.last_li is None or li <= self.last_li:      # new forward pass
+            if self.pending is not None:
+                self.nv2.stage_wait(self.pending)
+                self.pending = None
+            if self.elastic and not self.in_prefill:
+                self._elastic_enter()
+            self.slot_np = self.slotof.cpu().numpy()
+            e.stage_begin(torch.from_numpy(np.ascontiguousarray(self.slot_np)), li)
+            self._st_open = True
+            self.stage_stats["forwards"] += 1
+        self.last_li = li
+        if self.pending is None or self.pending[0] != li:
+            if self.pending is not None:
+                self.nv2.stage_wait(self.pending)
+            self.pending = self.nv2.stage_submit(li, li % 2)
+        h = self.pending
+        self.nv2.stage_wait(h)
+        _, b, take, _f, _ev = h
+        cur.wait_event(self.ev_ready[b])
+        if len(take):
+            self._point_staged(li, take, b)
+        self.stage_stats["layers"] += 1; self.stage_stats["experts"] += len(take)
+        self.pending = self.nv2.stage_submit(li + 1, (li + 1) % 2)
+
+    def _ec_hits(self, li, sel):
+        sg, su, sd, ou, od = self.g[li]
+        _ext().ec_step(sel, self.first, li, self.E, self.S, 0, self.slotof, self.home, self.tabs, self.owner, self.refb,
+                       self.pin, self.ctl, self.jobs, self.stats, self.cbase.data_ptr(), self.spc, self.rec, ou, od)
+
+    def _elastic_enter(self):
+        e = _ext()
+        self.flex = list(self.flex_all)
+        if self.nv2 is not None:
+            self.elastic_stats["wb"] = self.elastic_stats.get("wb", 0) + self.nv2.elastic_writeback(self.flex)
+        for c in self.flex:
+            e.ec_evict(c * self.spc, (c + 1) * self.spc, 1, self.E, self.owner, self.slotof, self.home, self.tabs,
+                       self.refb, self.pin)
+        torch.cuda.synchronize(self.device)
+        for c in self.flex:
+            self.chunks[c] = None
+        torch.cuda.empty_cache()
+        self.stage = [torch.empty((self.stage_n, self.rec), dtype=torch.uint8, device=self.device) for _ in range(2)]
+        self.in_prefill = True
+        self.elastic_stats["enter"] += 1
+
+    def _elastic_exit(self):
+        torch.cuda.synchronize(self.device)
+        self.stage = None
+        torch.cuda.empty_cache()
+        e = _ext()
+        for c in self.flex:
+            try:
+                t = torch.empty((self.spc, self.rec), dtype=torch.uint8, device=self.device)
+            except torch.OutOfMemoryError:
+                self.elastic_stats["realloc_fail"] += 1
+                continue
+            self.chunks[c] = t
+            self.cbase[c] = t.data_ptr()
+            e.ec_evict(c * self.spc, (c + 1) * self.spc, 0, self.E, self.owner, self.slotof, self.home, self.tabs,
+                       self.refb, self.pin)
+        self.in_prefill = False
+        self.elastic_stats["exit"] += 1
 
     def step(self, li, sel, admit):
         sg, su, sd, ou, od = self.g[li]
@@ -1088,6 +1244,12 @@ def attach_nv2(model):
     if mx:
         budget = min(budget, int(mx) * slot)
     p = UPool(dev, mods, budget, admit_max, slot)
+    if env("NV_STAGE", "1") == "1":
+        stage_n = int(env("EC_STAGE_SLOTS", str(p.E)))           # every expert of a layer may be non-VRAM
+        elastic = float(env("EC_ELASTIC_GB", "0")) * GiB or (2 * stage_n * slot + 0.5 * GiB)
+        p.stage_init(int(env("EC_STAGE_MIN", "512")), elastic, stage_n)
+        log(f"staged prefill: >= {p.stage_min} picks per layer, 2 x {stage_n} slots ({2 * stage_n * slot / GiB:.2f} GiB) "
+            f"from {len(p.flex_all)} elastic chunks ({len(p.flex_all) * p.spc * slot / GiB:.2f} GiB)")
     POOLS.append(p)
     N2.attach_pool(p)
     warm = env("EC_WARM")

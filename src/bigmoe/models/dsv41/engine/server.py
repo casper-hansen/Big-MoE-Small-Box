@@ -140,6 +140,9 @@ def ids_of(body):
     return tok.encode(body["text"], encode_special_tokens=True)
 
 
+FORCE = {"ids": None}
+
+
 async def run_job(ids, sp, stop_strings=None):
     """Yields (text so far, completion tokens, finish or None) once per generator step."""
     gen = G["gen"]
@@ -153,6 +156,9 @@ async def run_job(ids, sp, stop_strings=None):
     if KL["on"]:
         KL["prompt"] = [int(x) for x in ids.flatten().tolist()]
         KL["gen"], KL["steps"] = [], []
+    if FORCE["ids"] is not None:   # /kl_force: the decode path runs on these output tokens
+        job.constrain_output_now(torch.tensor([FORCE["ids"]], dtype=torch.long))
+        FORCE["ids"] = None
     G["stats"]["requests"] += 1
     n, text, done = 0, "", False
     try:
@@ -402,6 +408,27 @@ async def kl_capture(on: int = -1):
     return JSONResponse(d)
 
 
+@app.post("/kl_force")
+async def kl_force(req: Request):
+    """Decode `ref` after `prompt` with every output token forced (KL capture on): per-step decode logits of this
+    engine configuration on a fixed token path, comparable across configurations."""
+    b = await req.json()
+    ids = torch.tensor([[int(x) for x in b["prompt"]]], dtype=torch.long)
+    FORCE["ids"] = [int(x) for x in b["ref"]]
+    on = KL["on"]
+    KL["on"] = True
+    t0 = time.time()
+    n = 0
+    try:
+        async for _text, n, _fin in run_job(ids, {"temperature": 0, "max_new_tokens": len(b["ref"])}):
+            pass
+    finally:
+        KL["on"] = on
+    d = {"n": n, "secs": time.time() - t0, "prompt": KL["prompt"], "gen": KL["gen"], "steps": KL["steps"]}
+    KL["steps"] = []
+    return JSONResponse(d)
+
+
 @app.post("/kl_teacher")
 async def kl_teacher(req: Request):
     b = await req.json()
@@ -428,6 +455,14 @@ def main():
     import faulthandler, signal
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     load()
+    if os.environ.get("DSV41_MAIN_CPUS"):   # GPU-feeding thread off the CPU-lane / reader cores
+        cpus = []
+        for part in os.environ["DSV41_MAIN_CPUS"].split(","):
+            a, _, b = part.partition("-")
+            cpus += list(range(int(a), int(b or a) + 1))
+        os.sched_setaffinity(0, set(cpus))
+        torch.set_num_threads(int(os.environ.get("DSV41_TORCH_THREADS", "1")))
+        print(f" -- main thread on cpus {sorted(os.sched_getaffinity(0))}", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

@@ -443,9 +443,10 @@ struct Engine
             }
             for (int j : go)
             {
-                int rs;
-                { std::lock_guard<std::mutex> lk(mu); rs = stg_rslot[j]; stg_st[j] = SG_FLIGHT; }
-                cudaMemcpyAsync((void*) stg_addr[j], (const void*) ram_addr[rs], size_t(slot_bytes), cudaMemcpyHostToDevice, stg_stream);
+                int rs; int64_t ln;
+                { std::lock_guard<std::mutex> lk(mu); rs = stg_rslot[j]; stg_st[j] = SG_FLIGHT; ln = rs >= 0 && owner[rs] >= 0 ? klen(owner[rs]) : slot_bytes; }
+                ln = std::min<int64_t>(ln, slot_cls[rs] ? small_bytes : slot_bytes);
+                cudaMemcpyAsync((void*) stg_addr[j], (const void*) ram_addr[rs], size_t(ln), cudaMemcpyHostToDevice, stg_stream);
                 cudaEventRecord(stg_ev[j], stg_stream);
                 infl.push_back(j);
             }
@@ -1472,8 +1473,9 @@ struct Engine
         double waited = 0;
         if (st_active && li < L)
         {
+            const size_t ln = size_t(l_len[li]);   // DSV41: the layer's record image (RAM slots may be small-class slots)
             for (size_t i = 0; i < st_ram_src[li].size(); ++i)
-                cudaMemcpyAsync((void*) (base + st_ram_j[li][i] * slot_bytes), (const void*) st_ram_src[li][i], size_t(slot_bytes), cudaMemcpyDefault, st);
+                cudaMemcpyAsync((void*) (base + st_ram_j[li][i] * slot_bytes), (const void*) st_ram_src[li][i], ln, cudaMemcpyDefault, st);
             for (int g : st_nv_idx[li])
             {
                 StageEntry& se = st_nv[size_t(g)];
@@ -1485,7 +1487,7 @@ struct Engine
                     waited += now_ms() - tw;
                     if (!se.ready.load()) { hc[HC_ERR] = 18; continue; }
                 }
-                cudaMemcpyAsync((void*) (base + se.j * slot_bytes), (const void*) ring_addr()[se.ring], size_t(slot_bytes), cudaMemcpyHostToDevice, st);
+                cudaMemcpyAsync((void*) (base + se.j * slot_bytes), (const void*) ring_addr()[se.ring], ln, cudaMemcpyHostToDevice, st);
                 cudaEventRecord(pf_ev[se.ring], st);
                 {
                     std::lock_guard<std::mutex> lk(st_mu);
