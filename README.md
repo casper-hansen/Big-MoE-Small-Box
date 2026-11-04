@@ -234,6 +234,36 @@ The three limits are within ~15 % of each other, so fixing one moves the bottlen
 
 Measured at 128k context on chat (2026-10-20): the useful NVMe reads per token are 45-50 on prose and 60-70 on code (prefetches included), so at 1.45 ms per record the SSD alone caps decode at ~14 tok/s on prose and ~10-11 on code, against 9.9-10.8 and 7.8-9.1 tok/s then. With the RAM-tier, VBMI and streaming changes since, prose reads ~50 and code ~58 records per token (caps ~13.8 and ~11.9 tok/s) and decodes at ~11.3 and ~10.1 tok/s: 82-85 % of what the SSD allows. Offline simulation over decode traces puts the best practical replacement policy only 6 % below LRU in misses, so the remaining headroom is in overlapping the reads better and in RAM capacity (every +5 % of RAM-tier slots removes ~11 % of the misses in the LRU simulation).
 
+## DeepSeek-V4.1-Flash (`dsv41` backend)
+
+`AutoBox.from_pretrained("deepseek-v4.1-flash")` serves [turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3) @ `2.25bpw` (commit `9183eaae`) on the same box, on exllamav3 1.6.6 (the first release with DeepSeek-V4.1). The 361 GB checkpoint is 158 GB of model (146 GB of it routed experts: 40 layers x 384 experts, 6 per token) plus 203 GB of Engram n-gram tables. The experts go to the same three tiers as GLM's; the Engram tables stay in the checkpoint and exllamav3 streams the ~48 rows a token needs from disk (through the page cache).
+
+```python
+box = AutoBox.from_pretrained("deepseek-v4.1-flash")                       # mode "nvme-exact": bit-exact decode
+box = AutoBox.from_pretrained("deepseek-v4.1-flash", mode="nvme")          # + CPU lane: faster, near-exact
+```
+
+| mode | prompt tokens | prefill | decode |
+|---|---|---|---|
+| `nvme-exact` | 1,024 | 34 tok/s | 11.2 tok/s |
+| `nvme-exact` | 8,192 | 268 tok/s | 12.7 tok/s |
+| `nvme-exact` | 16,384 | 364 tok/s | 11.6 tok/s |
+| `nvme-exact` | 32,768 | 423 tok/s | 10.6 tok/s |
+| `nvme-exact` | 60,000 | 450 tok/s | 11.6 tok/s |
+| `nvme` | 1,024 | 35 tok/s | 14.9 tok/s |
+| `nvme` | 8,192 | 271 tok/s | 16.8 tok/s |
+| `nvme` | 16,384 | 368 tok/s | 16.3 tok/s |
+| `nvme` | 32,768 | 426 tok/s | 13.6 tok/s |
+| `nvme` | 60,000 | 439 tok/s | 15.2 tok/s |
+
+`bigmoe bench` prompts (Python sources + the three-files question, DeepSeek chat framing, thinking off), greedy, 64k context, chunk 8192, warm start from `data/stats_dec.json`. Every answer names the first three files correctly. Per decoded token: 240 expert picks, ~142 from VRAM, ~83 from RAM, ~13-16 NVMe reads (DeepSeek's routing is more concentrated than GLM's: GLM reads ~35).
+
+- **Quality.** Teacher-forced logits equal stock exllamav3's (module-streamed reference) to the precision of the comparison (KL <= 5e-5, max |dlogprob| 1e-4: fp16-stored reference). Decode in `nvme-exact` is independent of where the experts live: the tiers engine and nv2 with completely different VRAM / RAM states give identical tokens and identical top-256 logprobs at all 1,110 test positions (`tools/kl_force.py`, KL 0.000000). Against the stock *prefill* reference, decode agrees on 99.1% of top-1 tokens (mean KL 0.0018): that is stock exllamav3's own decode-vs-prefill kernel difference, not the offload. Mode `nvme` (CPU lane) vs `nvme-exact` on forced tokens: top-1 0.9937, mean KL 0.0011; its kernel error per expert (1.04e-3 relative, selftest) is the same as the GLM CPU lane's (1.06e-3).
+- **Prefill** streams every non-resident expert of each layer through VRAM staging buffers once per 8192-token chunk (~90 GB per chunk at the SN850X's 6.6 GB/s), so it is NVMe-bound; short prompts pay one such pass plus the sliding-window layers' last-page pass (~30 s for a 1k prompt).
+- **Disk.** 361 GB checkpoint + 146 GB store; `slim` punches the expert bytes out of the checkpoint afterwards (-145 GB).
+
+What changed against the GLM engine: store v2 (per-layer record sizes: 2.25 bpw mixes 2.5 bpw outer layers and 2.0 bpw middle layers), one VRAM pool of uniform slots with per-layer slot geometry, RAM slots in two size classes, victim write-backs as a separate whole-slot copy, MAXU 384, prefetch with DeepSeek's sqrt-softplus router, and the CPU lane's AVX-512 VBMI trellis decode generated per bitrate (K 2 / 2.5 / 3, tables checked against exllamav3's own unpack: `tests/gpu_dsv41_vbmi_tables.py`). The CPU lane needs AVX-512 VBMI + VNNI (Zen 4, Ice Lake or later).
+
 ## Adding a model
 
 A backend is a `ModelBackend` subclass, registered with `register_backend` or through the `bigmoe.backends` entry-point group. It says which repos and aliases it accepts, its options, its prepare steps, the Python runtime its server needs, and how to launch it:

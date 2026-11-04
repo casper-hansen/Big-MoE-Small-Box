@@ -42,7 +42,9 @@ TUNED_PLANNER = "0.17,0.023,0.36,0.145,0.42,0.12,0.40,0.25,1.36,0.75"
 
 @dataclasses.dataclass
 class DSV41Options:
-    mode: str = "nvme"
+    # "nvme-exact" (default): bit-exact decode, 10.6-12.7 tok/s up to 32k prompts; "nvme": + CPU lane, 13.6-16.8 tok/s,
+    # near-exact (forced-token mean KL 0.0011 vs nvme-exact)
+    mode: str = "nvme-exact"
     cache_quant: int = None      # KV-cache bits (-cq); None = FP16
     chunk_size: int = 8192   # staged prefill streams every non-resident expert once per chunk: 8192 -> ~270-360 tok/s
     max_batch_size: int = 4
