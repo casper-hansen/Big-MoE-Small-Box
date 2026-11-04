@@ -44,7 +44,7 @@ TUNED_PLANNER = "0.17,0.023,0.36,0.145,0.42,0.12,0.40,0.25,1.36,0.75"
 class DSV41Options:
     mode: str = "nvme"
     cache_quant: int = None      # KV-cache bits (-cq); None = FP16
-    chunk_size: int = 2048
+    chunk_size: int = 8192   # staged prefill streams every non-resident expert once per chunk: 8192 -> ~270-360 tok/s
     max_batch_size: int = 4
     vram_expert_slots: int = None
     planner_cost: str = TUNED_PLANNER
@@ -227,7 +227,9 @@ class DSV41(ModelBackend):
     def launch_spec(self, box) -> LaunchSpec:
         o, store = box.options, self.store(box)
         env = {"DSV41_NV": "2", "DSV41_NV_STORE": str(store.bin), "DSV41_NV_CPU": "1" if o.mode == "nvme" else "0",
-               "DSV41_NV_POL": o.planner_cost, "TRITON_CACHE_DIR": str(box.home.triton), "PYTHONUNBUFFERED": "1"}
+               "DSV41_NV_POL": o.planner_cost, "DSV41_NV_STAGE": "1", "DSV41_EC_ELASTIC_GB": "11",
+               "DSV41_MAX_RQ_TOKENS": "4096",
+               "TRITON_CACHE_DIR": str(box.home.triton), "PYTHONUNBUFFERED": "1"}
         warm = DATA / "stats_dec.json"
         if warm.is_file():
             env["DSV41_EC_WARM"] = str(warm)
