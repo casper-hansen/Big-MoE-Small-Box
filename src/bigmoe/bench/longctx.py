@@ -23,6 +23,16 @@ def glm_frame(n_tokens: int):
     return f"[gMASK]<sop><|user|>[document set {n_tokens}]\n", QUESTION + "<|assistant|><think></think>"
 
 
+def deepseek_frame(n_tokens: int):
+    """DeepSeek-V4.x chat framing, thinking off (the checkpoint template's chat mode: the assistant turn opens with a
+    closed think tag)."""
+    return (f"<｜begin▁of▁sentence｜><｜User｜>[document set {n_tokens}]\n",
+            QUESTION + "<｜Assistant｜></think>")
+
+
+FRAMES = {"glm": glm_frame, "deepseek": deepseek_frame}
+
+
 def corpus(min_chars: int, site_packages) -> str:
     parts, n = [], 0
     for root in (os.path.join(str(site_packages), p) for p in CORPUS_PACKAGES):
@@ -144,6 +154,7 @@ def main(argv=None):
     ap.add_argument("--tokens", type=int, nargs="*", default=[1024, 32768, 131072])
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2, metavar=("BASE", "NOW"))
+    ap.add_argument("--frame", default="glm", choices=sorted(FRAMES))
     a = ap.parse_args(argv)
     if a.compare:
         base, now = (json.load(open(p)) for p in a.compare)
@@ -152,7 +163,7 @@ def main(argv=None):
         return 0
     if not a.corpus:
         ap.error("--corpus is required (bigmoe bench finds it for you)")
-    run(Client(a.url), a.tokens, a.corpus, out=a.out, log=lambda m: print(m, flush=True))
+    run(Client(a.url), a.tokens, a.corpus, frame=FRAMES[a.frame], out=a.out, log=lambda m: print(m, flush=True))
     return 0
 
 
