@@ -432,6 +432,15 @@ async def gpu_prof(secs: float = 3.0, path: str = "", top: int = 40):
     return JSONResponse({"secs": secs, "dev_us_total": round(tot, 1), "path": path, "top": rows[:top]})
 
 
+@app.get("/nv2_rate")
+async def nv2_rate(mbps: float = 0.0):
+    """NVMe emulation (diagnostics): reads complete no faster than a single device of `mbps` MB/s would serve them
+    (0 = off, the real drive). Only slower than the real drive can be emulated."""
+    from . import nv2
+    nv2.ext().set_read_rate(float(mbps))
+    return JSONResponse({"read_rate_mbps": mbps})
+
+
 @app.get("/cpu")
 async def cpu_switch(on: int = 1):
     """Runtime CPU-lane switch (mode nvme): on=0 puts every pick on the GPU path (bit-exact), for same-server A/B."""

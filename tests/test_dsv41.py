@@ -50,6 +50,20 @@ def test_launch_exact(tmp_path, monkeypatch):
     assert "-ccs" in spec.argv and spec.memory_gb == 56.0
 
 
+def test_dspark_default_and_off(tmp_path, monkeypatch):
+    box, spec = spec_for(tmp_path, monkeypatch)
+    assert box.options.speculation == "dspark" and box.options.dspark_conf == 0.5
+    assert "-mtp" in spec.argv and spec.env["EXL3_DSPARK_CONF"] == "0.5"
+    _, spec = spec_for(tmp_path, monkeypatch, speculation="none")
+    assert "-mtp" not in spec.argv and "EXL3_DSPARK_CONF" not in spec.env
+    _, spec = spec_for(tmp_path, monkeypatch, dspark_conf=0.35)
+    assert spec.env["EXL3_DSPARK_CONF"] == "0.35"
+    _, spec = spec_for(tmp_path, monkeypatch, env={"EXL3_DSPARK_CONF": "0.6"})
+    assert spec.env["EXL3_DSPARK_CONF"] == "0.6"
+    with pytest.raises(ValueError):
+        AutoBox("deepseek-v4.1-flash", home=tmp_path, speculation="ngram")
+
+
 def test_launch_cpu_lane(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme")
     assert spec.env["DSV41_NV_CPU"] == "1" and spec.env["DSV41_NV_CPU_CPUS"] == "1-5"

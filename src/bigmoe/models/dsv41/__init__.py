@@ -36,6 +36,7 @@ STORE_NAME = "dsv41_flash_exl3_2.25bpw_experts"
 EXLLAMAV3 = SourceBuild("exllamav3", "1.6.6", "https://codeload.github.com/turboderp-org/exllamav3/tar.gz/"
                                               "bd1f519172406a9560bd5c90e61000691bb69a07")
 MODES = ("nvme", "nvme-exact")
+SPECULATION = ("dspark", "none")
 # planner cost model "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone" (ms per expert), see nv2_host.cpp Pol
 TUNED_PLANNER = "0.17,0.023,0.36,0.145,0.42,0.12,0.40,0.25,1.36,0.75"
 
@@ -54,10 +55,20 @@ class DSV41Options:
     slim: bool = True
     verify_weights: bool = True
     prefix_cache_gb: float = 0.5   # exllamav3's SWA-layer state checkpoints in host RAM (-rcs, GiB)
+    # DSpark speculative decoding (the checkpoint's own MTP block drafter, exllamav3 -mtp): drafts up to 5 tokens per
+    # step, cut where its confidence head drops below dspark_conf; the target verifies the block in one forward.
+    # Measured in mode nvme: +12.5 % (0.5: 75 % of drafted tokens accepted, 2.83 tokens per verify), 0.25 no gain.
+    # Costs ~3.4 GB of VRAM (the drafter's experts), i.e. ~350 fewer VRAM expert slots. "none" turns it off.
+    speculation: str = "dspark"
+    dspark_conf: float = 0.5
 
     def validate(self):
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
+        if self.speculation not in SPECULATION:
+            raise ValueError(f"speculation must be one of {SPECULATION}, got {self.speculation!r}")
+        if not 0.0 <= float(self.dspark_conf) <= 1.0:
+            raise ValueError(f"dspark_conf must be 0..1, got {self.dspark_conf!r}")
         if self.cache_quant is not None and not 2 <= int(self.cache_quant) <= 8:
             raise ValueError(f"cache_quant must be 2..8 bits or None, got {self.cache_quant!r}")
         if int(self.chunk_size) <= 0 or int(self.max_batch_size) <= 0:
@@ -253,6 +264,9 @@ class DSV41(ModelBackend):
                 "-ccs", "0", "-rcs", f"{float(o.prefix_cache_gb):g}"]
         if o.cache_quant:
             argv += ["-cq", str(o.cache_quant)]
+        if o.speculation == "dspark":   # the checkpoint's MTP block drafter (mtp.* tensors, never slimmed: not in the store)
+            argv += ["-mtp"]
+            env.setdefault("EXL3_DSPARK_CONF", f"{float(o.dspark_conf):g}")   # an explicit env override wins
         argv += ["--host", box.host, "--port", str(box.port), "--served-name", box.served_name, *box.extra_args]
         unset = tuple(v for v in os.environ if v.startswith(("DSV41_", "EXL3_", "EXLLAMAV3_")) and v not in env)
         unset += ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
