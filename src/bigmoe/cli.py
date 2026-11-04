@@ -170,6 +170,10 @@ def cmd_verify(a):
     from .bench.verification import verify
     box_kw = {k: v for k, v in dict(revision=a.revision, backend=a.backend, context=a.context, memory_gb=a.memory_gb,
                                     host=a.host, port=a.port, home=a.home, runtime=a.runtime).items() if v is not None}
+    for item in a.option:   # backend options (-o key=value) reach every verify run; each run sets its own mode
+        k, _, v = item.partition("=")
+        if k.strip() != "mode":
+            box_kw[k.strip()] = _value(v)
     verify(a.model, out_dir=a.out, baseline_dir=a.baseline, log=lambda m: print(m, flush=True), **box_kw)
 
 
