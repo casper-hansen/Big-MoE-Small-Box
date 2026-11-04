@@ -10,3 +10,7 @@ GLM-5.3 nvme vs exact, shared engine:
 TOTAL 897 positions: top-1 agreement 0.9721, mean KL 0.011898, max KL 2.019022
 GLM-5.3 nvme vs exact, pre-refactor engine (commit 1c33ca8):
 TOTAL 897 positions: top-1 agreement 0.9666, mean KL 0.012576, max KL 2.634734
+DeepSeek nvme + DSpark (default) vs exact single-token decode (gen_v0), verify-window rows included:
+TOTAL 1110 positions: top-1 agreement 0.9964, mean KL 0.000775, max KL 0.129229
+DeepSeek nvme-exact + DSpark vs the same:
+TOTAL 1110 positions: top-1 agreement 0.9973, mean KL 0.000733, max KL 0.049391

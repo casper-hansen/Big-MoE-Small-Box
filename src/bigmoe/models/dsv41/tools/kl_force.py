@@ -35,10 +35,15 @@ def main():
         t0 = time.time()
         r = post(a.url + "/kl_force", {"prompt": g["prompt"], "ref": g["gen"]})
         P = len(g["prompt"])
-        steps = {}
+        # decode and speculative-verify forwards: row j of a forward starting at p0 is the prediction made at position
+        # p0 + j. Rows after a rejected draft saw a wrong context, but the next forward covers those positions again,
+        # so the last forward that covers a position holds the distribution the target actually decoded with.
+        steps, windows = {}, 0
         for s in r["steps"]:
-            if s["n"] == 1 and s["p0"] >= P - 1:
-                steps[str(s["p0"])] = {"lp": s["lp"][-1], "ix": s["ix"][-1]}
+            if s["p0"] >= P - 1 and s["n"] <= 16 and len(s["lp"]) == s["n"]:
+                windows += int(s["n"] > 1)
+                for j in range(s["n"]):
+                    steps[str(s["p0"] + j)] = {"lp": s["lp"][j], "ix": s["ix"][j]}
         n = t1 = 0
         ks = []
         for p, rs in g["steps"].items():
@@ -50,7 +55,8 @@ def main():
             ks.append(kl(rs["ix"], rs["lp"], st["ix"], st["lp"]))
         out[name] = steps
         tot_n += n; tot_top1 += t1; tot_kl += sum(ks); kmax = max([kmax] + ks)
-        print(f"{name}: {n} forced decode steps in {time.time() - t0:.1f} s, top-1 agreement {t1}/{n}, mean KL "
+        print(f"{name}: {n} forced decode steps ({windows} multi-token verify forwards) in {time.time() - t0:.1f} s, "
+              f"top-1 agreement {t1}/{n}, mean KL "
               f"{sum(ks) / max(1, len(ks)):.6f}, max KL {max(ks) if ks else 0:.6f}", flush=True)
     print(f"TOTAL {tot_n} positions: top-1 agreement {tot_top1 / max(1, tot_n):.4f}, mean KL {tot_kl / max(1, tot_n):.6f}, "
           f"max KL {kmax:.6f}")
