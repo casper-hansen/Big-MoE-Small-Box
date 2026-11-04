@@ -6,7 +6,7 @@ from pathlib import Path
 from .exl3_experts import compare, manifest, pack, paths, verify
 from .slim import punch_experts
 
-__all__ = ["ExpertStore", "pack", "verify", "compare", "manifest", "paths", "punch_experts"]
+__all__ = ["ExpertStore", "ExpertStoreV2", "pack", "verify", "compare", "manifest", "paths", "punch_experts"]
 
 
 class ExpertStore:
@@ -63,6 +63,21 @@ class ExpertStore:
 
     def verify(self, *, threads=8, sample=None, log=print) -> list:
         bad = verify(self.dir, self.name, threads=threads, sample=sample, log=log)
+        if not bad and sample is None:
+            self.mark_verified("full O_DIRECT sha256 of every record")
+        return bad
+
+
+class ExpertStoreV2(ExpertStore):
+    """Store v2 (exl3_store_v2.py): per-layer record sizes (quants that mix bitrates across layers)."""
+
+    def manifest(self) -> dict:
+        from . import exl3_store_v2
+        return exl3_store_v2.manifest(self.dir, self.name)
+
+    def verify(self, *, threads=8, sample=None, log=print) -> list:
+        from . import exl3_store_v2
+        bad = exl3_store_v2.verify(self.dir, self.name, threads=threads, sample=sample, log=log)
         if not bad and sample is None:
             self.mark_verified("full O_DIRECT sha256 of every record")
         return bad

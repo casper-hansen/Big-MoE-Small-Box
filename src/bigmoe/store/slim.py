@@ -7,7 +7,7 @@ import re
 import struct
 
 PUNCH = 0x02 | 0x01   # FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
-TRELLIS = re.compile(r"^(.*)\.experts\.\d+\.(gate|up|down)_proj\.trellis$")
+TRELLIS = re.compile(r"^(.*)\.experts\.\d+\.(gate_proj|up_proj|down_proj|w1|w2|w3)\.trellis$")   # GLM / DeepSeek names
 
 
 def expert_ranges(path, layer_keys):
