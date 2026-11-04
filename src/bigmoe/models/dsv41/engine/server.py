@@ -15,6 +15,10 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from bigmoe.kernels import install_prebuilt_loader
+
+install_prebuilt_loader()  # AutoBox prebuilt the kernels into the DSV41_*_BUILD dirs: no toolchain at runtime
+
 app = FastAPI()
 G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
 KL = {"on": os.environ.get("DSV41_KL_CAPTURE") == "1", "prompt": None, "gen": [], "steps": []}
