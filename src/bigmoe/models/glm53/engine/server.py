@@ -1,16 +1,15 @@
-"""OpenAI-compatible server over stock exllamav3 1.5.1 (AsyncGenerator), configured through GLM53_* variables. Each
-piece of the offload stack is a monkeypatch around stock exllamav3:
+"""OpenAI-compatible server over stock exllamav3 (AsyncGenerator, the release in models/runtime.py), configured through
+GLM53_* variables. The offload stack is a monkeypatch around stock exllamav3:
   bigmoe.engine    GLM53_NV=2           shared expert-offload engine: loader skips the routed-expert bytes, elastic
-                                        VRAM cache + staged prefill, RAM tier, NVMe store, planner, CPU lane
-  triton_pin.py    GLM53_TRITON_PIN     fixed Triton autotune picks for the KDA (linear attention) kernels
-  k_hcfuse.py      GLM53_K_HCFUSE=1     fused hyper-connection decode sites (bit-exact)
-  k_lookahead.py   GLM53_LA=1           C1 decode lookahead: next step enqueued on the device token (bit-exact)
+                                        VRAM cache + staged (warm) prefill, last-page split, RAM tier, NVMe store,
+                                        planner, CPU lane
+  ngram_policy.py  -ngram               cost-aware n-gram drafting (speculation="ngram")
+exllamav3's own fused hyper-connection sites (EXL3_HC_FOLD=1, set by the backend) replace the custom decode kernels the
+1.5.1 runtime needed.
 No output caps: max_tokens defaults to the remaining context. /generate and /tokenize are SGLang-shaped (benchmark).
 """
 import argparse, asyncio, json, os, re, sys, time, uuid
 import torch
-from . import exl3_patch                 # prompt / tail checkpoint patches for exllamav3 (before its modules load)
-print(" -- exllamav3 patch: " + exl3_patch.apply(), flush=True)
 from exllamav3 import model_init
 from exllamav3.generator import AsyncGenerator, AsyncJob
 from exllamav3.generator.sampler import ArgmaxSampler, ComboSampler
@@ -52,23 +51,11 @@ def load():
         engine.install()
     elif os.environ.get("GLM53_NV") not in (None, "", "0") or os.environ.get("GLM53_EC"):
         sys.exit("GLM53_NV must be 2 (the shared engine) when the expert cache is on")
-    if os.environ.get("GLM53_TRITON_PIN"):
-        from . import triton_pin
-        triton_pin.install()
 
     t_load = time.time()
     model, config, cache, tok, draft_model, _draft_config, draft_cache = model_init.init(args)
-    if os.environ.get("GLM53_LA") == "1":   # N136: embedding table host-mapped (device-side lookup for lookahead)
-        from . import k_lookahead
-        k_lookahead.prep_model(model)
     if engine is not None:
         engine.attach(model)   # pool + nv2 + routing hooks + bounce proxies + startup verify
-    if os.environ.get("GLM53_K_HCFUSE") == "1":   # fused hyper-connection sites, bit-exact (k_hcfuse.py)
-        from . import k_hcfuse
-        k_hcfuse.install(model)
-    if os.environ.get("GLM53_LA") == "1":   # N136: decode lookahead (next forward enqueued before the token is read)
-        k_lookahead.install(model)
-        k_lookahead.set_enabled(os.environ.get("GLM53_LA_ON", "1") == "1")
     t_load = time.time() - t_load
     print(f" -- loaded in {t_load:.1f} s", flush=True)
 
@@ -202,7 +189,7 @@ def _bcp_install():
         if KL["on"] and ids.shape[0] == 1:
             with torch.inference_mode():
                 v, ix = out[0].float().log_softmax(-1).topk(256, dim=-1)
-            KL["steps"].append({"p0": p0, "ids": [int(x) for x in ids[0].tolist()],
+            KL["steps"].append({"p0": p0, "n": ntok, "ids": [int(x) for x in ids[0].tolist()],
                                 "lp": [[round(x, 4) for x in row] for row in v.tolist()], "ix": ix.tolist()})
         return out
 
@@ -237,10 +224,7 @@ async def run_job(ids, sp, stop_strings=None):
     """Yields (text so far, completion tokens, finish or None) once per generator step."""
     gen = G["gen"]
     max_new = sp.get("max_new_tokens")
-    # the end-of-turn tail checkpoints (exl3_patch) hold up to 4 cache pages: a job that reserves pages for the whole
-    # remaining context (no GLM53_MAX_RQ_TOKENS, e.g. mode nvme-exact) would otherwise wait for pages forever
-    tails = 4 * 256 if os.environ.get("GLM53_EXL3_PATCHES", "1") == "1" else 0
-    room = CTX - ids.shape[-1] - (args.num_draft_tokens or 8) - 2 - tails
+    room = CTX - ids.shape[-1] - (args.num_draft_tokens or 8) - 2
     max_new = room if max_new is None else min(int(max_new), room)
     # N119: GLM53_MAX_RQ_TOKENS = page-allocation round per job (exllamav3 max_rq_tokens: the job requeues itself after
     # that many tokens and keeps going; NOT an output cap). Without it every job reserves pages for the whole remaining
@@ -528,12 +512,6 @@ async def stats():
     if os.environ.get("GLM53_NV") == "2":
         from bigmoe.engine import tiers as engine
         st["expert_cache"] = engine.POOLS[0].summary() if engine.POOLS else None
-    if os.environ.get("GLM53_K_HCFUSE") == "1":
-        from . import k_hcfuse
-        st["k_hcfuse"] = dict(k_hcfuse.STATS)
-    if os.environ.get("GLM53_LA") == "1":
-        from . import k_lookahead
-        st["k_lookahead"] = k_lookahead.summary()
     if os.environ.get("GLM53_NV") == "2":
         from bigmoe.engine import nv2
         st["nv2"] = nv2.summary()
@@ -720,13 +698,6 @@ async def nv_verify(n: int = 64):
     return JSONResponse(nv2.NV.verify(n) if nv2.NV is not None else {"error": "GLM53_NV off"})
 
 
-@app.get("/la")
-async def la(on: int = 1):
-    """N136: runtime lookahead switch for same-server A/B (takes effect at the next decode step)."""
-    from . import k_lookahead
-    return JSONResponse({"enabled": k_lookahead.set_enabled(bool(on)), "stats": k_lookahead.summary()})
-
-
 # ---- BCP / KL endpoints (box-only experiment) -------------------------------------------------------------------------
 
 @app.post("/bcp")
@@ -743,22 +714,33 @@ async def bcp_set(req: Request):
 
 
 @app.get("/kl_capture")
-async def kl_capture():
-    d = {"prompt": KL["prompt"], "gen": KL["gen"], "steps": KL["steps"], "eos": list(EOS)}
+async def kl_capture(on: int = -1):
+    """Captured decode steps since the last call; on=1 / on=0 switches capture (as in the dsv41 server)."""
+    if on >= 0:
+        KL["on"] = bool(on)
+    d = {"prompt": KL["prompt"], "gen": KL["gen"], "steps": KL["steps"], "eos": list(EOS), "on": KL["on"]}
     KL["steps"] = []
     return JSONResponse(d)
 
 
 @app.post("/kl_force")
 async def kl_force(req: Request):
+    """Decode `ref` after `prompt` with every output token forced and capture on: per-step logits of this
+    configuration on a fixed token path (dsv41's /kl_force, so models/dsv41/tools/kl_force.py serves both)."""
     b = await req.json()
     ids = torch.tensor([[int(x) for x in b["prompt"]]], dtype=torch.long)
     BCP["force"] = [int(x) for x in b["ref"]]
+    on, KL["on"], KL["steps"] = KL["on"], True, []
     t0 = time.time()
     n = 0
-    async for _text, n, _fin in run_job(ids, {"temperature": 0, "max_new_tokens": len(b["ref"])}):
-        pass
-    return JSONResponse({"n": n, "secs": time.time() - t0})
+    try:
+        async for _text, n, _fin in run_job(ids, {"temperature": 0, "max_new_tokens": len(b["ref"])}):
+            pass
+    finally:
+        KL["on"] = on
+    d = {"n": n, "secs": time.time() - t0, "prompt": KL["prompt"], "gen": KL["gen"], "steps": KL["steps"]}
+    KL["steps"] = []
+    return JSONResponse(d)
 
 
 @app.post("/kl_teacher")

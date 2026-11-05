@@ -26,7 +26,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "bigmoe.engine" = ["kernels/nv2/*"]
-"bigmoe.models.glm53" = ["requirements/*.txt", "data/*", "baselines/*.json"]
+"bigmoe.models" = ["requirements/*.txt"]
+"bigmoe.models.glm53" = ["data/*", "baselines/*.json"]
 "bigmoe.models.dsv41" = ["data/*", "baselines/*.json"]
 
 [tool.pytest.ini_options]

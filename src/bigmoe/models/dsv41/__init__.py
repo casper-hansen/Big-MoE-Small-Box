@@ -1,8 +1,8 @@
-"""DeepSeek-V4.1-Flash-1017 (EXL3 2.25 bpw) on one 24 GB GPU, on exllamav3 1.6.6: routed experts in a VRAM cache, a
-pinned RAM tier sized from the memory cap and an NVMe store (store v2: per-layer record sizes, the quant mixes 2.5 bpw
-outer layers with 2.0 bpw middle layers); mode "nvme" adds the CPU lane (AVX-512 VBMI trellis decode for K 2 / 2.5),
-"nvme-exact" keeps every expert on the GPU (bit-exact with stock exllamav3). The 203 GB Engram n-gram tables stay in the
-checkpoint and are streamed from disk by exllamav3 itself (row gathers through the page cache).
+"""DeepSeek-V4.1-Flash-1017 (EXL3 2.25 bpw) on one 24 GB GPU, on exllamav3 (models/runtime.py): routed experts in a
+VRAM cache, a pinned RAM tier sized from the memory cap and an NVMe store (store v2: per-layer record sizes, the quant
+mixes 2.5 bpw outer layers with 2.0 bpw middle layers); mode "nvme" adds the CPU lane (AVX-512 VBMI trellis decode for
+K 2 / 2.5), "nvme-exact" keeps every expert on the GPU (bit-exact with stock exllamav3). The 203 GB Engram n-gram tables
+stay in the checkpoint and are streamed from disk by exllamav3 itself (row gathers through the page cache).
 """
 import dataclasses
 import hashlib
@@ -17,8 +17,8 @@ from ...hub import COMMIT_RE, Checkpoint, is_sparse
 from ...kernels import KernelSpec, is_built
 from ...launcher import LaunchSpec
 from ...registry import ModelBackend, register_backend
-from ...runtime import RuntimeSpec, SourceBuild
 from ...steps import Step
+from ..runtime import DESCRIPTION as RUNTIME, runtime_spec
 from ...store import ExpertStoreV2, punch_experts
 from ...store import exl3_store_v2 as V2
 from ...store.slim import expert_ranges
@@ -26,15 +26,12 @@ from ...store.slim import expert_ranges
 PKG = Path(__file__).resolve().parent
 ENGINE = PKG / "engine"
 DATA = PKG / "data"
-GLM_REQ = PKG.parent / "glm53" / "requirements"   # same pinned package set (torch 2.13.0+cu130, ...)
 
 REPO = "turboderp/DeepSeek-V4.1-Flash-1017-exl3"
 VARIANTS = {"2.25bpw": "9183eaaeb6f08dff6ee5b6e34b852911cf6733c9"}   # branch -> the commit the engine was validated on
 DEFAULT_VARIANT = "2.25bpw"
 IGNORE = ("README.md", ".gitattributes", "quantization_config.json")   # never read by the server
 STORE_NAME = "dsv41_flash_exl3_2.25bpw_experts"
-EXLLAMAV3 = SourceBuild("exllamav3", "1.6.6", "https://codeload.github.com/turboderp-org/exllamav3/tar.gz/"
-                                              "bd1f519172406a9560bd5c90e61000691bb69a07")
 MODES = ("nvme", "nvme-exact")
 SPECULATION = ("dspark", "none")
 # planner cost model "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone" (ms per expert), see nv2_host.cpp Pol
@@ -132,12 +129,8 @@ class DSV41(ModelBackend):
         return ExpertStoreV2(d, STORE_NAME)
 
     def runtime_spec(self, box):
-        return RuntimeSpec(
-            name="dsv41", python="3.12", requirements=GLM_REQ / "runtime.txt", build_requirements=GLM_REQ / "build.txt",
-            index_url="https://download.pytorch.org/whl/cu130", extra_index_urls=("https://pypi.org/simple",),
-            index_strategy="unsafe-best-match", source_builds=(EXLLAMAV3,), cuda_subdir="nvidia/cu13",
-            smoke_test="import torch, exllamav3; from exllamav3.ext import exllamav3_ext; "
-                       "from exllamav3.architecture.deepseek_v41 import DeepseekV41Config")
+        return runtime_spec("dsv41", "import torch, exllamav3; from exllamav3.ext import exllamav3_ext; "
+                                     "from exllamav3.architecture.deepseek_v41 import DeepseekV41Config")
 
     def kernel_specs(self, box) -> list:
         from ... import engine
@@ -154,8 +147,8 @@ class DSV41(ModelBackend):
             return all(is_built(s, dirs[s.name]) for s in specs)
 
         steps = [
-            Step("runtime", "create the server's Python environment (torch 2.13 + CUDA 13; exllamav3 1.6.6 built from "
-                 "source)", rt.is_ready, lambda: rt.ensure(box.arch), detail=lambda: str(rt.path)),
+            Step("runtime", f"create the server's Python environment ({RUNTIME})", rt.is_ready,
+                 lambda: rt.ensure(box.arch), detail=lambda: str(rt.path)),
             Step("kernels", "compile the shared engine's torch extensions (expert pool, nv2 + CPU lane)", kernels_done,
                  lambda: rt.build_kernels(specs, box.arch), detail=lambda: str(box.home.kernels)),
         ]

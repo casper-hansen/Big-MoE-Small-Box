@@ -12,7 +12,6 @@ model is copying:
   - the match is at least GLM53_NG_LONG tokens (default 12) and the acceptance is >= GLM53_NG_ACC_LONG (0.35): a probe of
     GLM53_NG_PROBE tokens (default 2), which is how a job (re-)enters drafting;
   - matched steps that do not draft let a low acceptance recover slowly toward 0.5 (GLM53_NG_RECOVER per step).
-wants_draft() tells k_lookahead whether the next step will draft, so single-token steps keep the lookahead otherwise.
 Exact: drafts only decide what gets verified, the target model's tokens are unchanged (verification shapes can still
 flip an fp16 near-tie, as with stock speculation). Measured (README): copy +27 %, file edit +13 %, others -6..-1 %.
 """
@@ -42,25 +41,6 @@ def _draft_len(p, kmax):
     return max(1, k)
 
 
-def wants_draft(job):
-    """Would the policy draft for this job right now (lookahead hybrid: no lookahead launch when it would)?"""
-    sam = getattr(job, "sam", None)
-    if sam is None:
-        return False
-    seq = job.sequences[0].sequence_ids.torch()
-    last = getattr(job, "_ng_last", None)
-    if last is not None and last[0] == seq.shape[-1]:
-        L = last[1]      # same history as this step's get_ngram_draft (a second accept_tensor sees no new tokens)
-    else:
-        beg, end = sam.accept_tensor(seq)
-        L = int(end - beg)
-        job._ng_last = (seq.shape[-1], L, int(end))
-    if L < max(MIN, job.generator.ngram_match_min):
-        return False
-    p = getattr(job, "_ng_acc", 0.5)
-    return p >= ACC or (L >= LONG and p >= ACC_LONG)
-
-
 def install(generator_cls, job_cls):
     if getattr(job_cls, "_ng_policy", False):
         return
@@ -70,15 +50,8 @@ def install(generator_cls, job_cls):
         assert self.sam
         STATS["calls"] += 1
         seq = self.sequences[0].sequence_ids.torch()
-        last = getattr(self, "_ng_last", None)
-        if last is not None and last[0] == seq.shape[-1]:
-            L, end = last[1], last[2] if len(last) > 2 else None
-        else:
-            beg, end = self.sam.accept_tensor(seq)
-            L = int(end - beg)
-            self._ng_last = (seq.shape[-1], L, int(end))
-        if end is None:
-            return torch.empty((1, 0), dtype=torch.long)
+        beg, end = self.suffix_match(seq)      # exllamav3's per-round cache: the automaton sees each token once
+        L = int(end - beg)
         if not hasattr(self, "_ng_acc"):
             self._ng_acc = 0.5
         empty = torch.empty((1, 0), dtype=torch.long)
@@ -119,12 +92,6 @@ def install(generator_cls, job_cls):
     job_cls.get_ngram_draft = get_ngram_draft
     generator_cls.iterate_gen = iterate_gen
     job_cls._ng_policy = True
-    if os.environ.get("GLM53_NG_LA", "1") == "1":
-        try:
-            from . import k_lookahead
-            k_lookahead.NG_HOOK = wants_draft
-        except Exception:
-            pass
     print(f" -- ngram policy: min match {MIN}, acceptance >= {ACC} (EWMA {ALPHA}) or match >= {LONG}, keep {KEEP}",
           flush=True)
 

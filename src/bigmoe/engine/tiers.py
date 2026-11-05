@@ -585,9 +585,11 @@ def attach(model):
         Ly = by_key[m.key]
         sg, su, sd, ou, od = p.geom(li)
         assert (Ly["off_u"], Ly["off_d"]) == (ou, od) and sg + su + sd <= Ly["trellis_bytes"] <= p.rec, (m.key, Ly, p.geom(li))
-    if p.stage_n and env("NV_CPU", "0") == "1":
-        # mode nvme (approximate, with the CPU lane): warm prefill. Created before nv2 sizes the RAM tier from the
-        # cgroup's free memory, which then already excludes its pinned read slots
+    # mode nvme (approximate, with the CPU lane) also prefills approximately: warm prefill and the last-page split (which
+    # changes how the recurrent state's prefill is chunked, so its rounding); mode nvme-exact keeps exllamav3's prefill
+    approx_prefill = bool(p.stage_n) and env("NV_CPU", "0") == "1"
+    if approx_prefill:
+        # created before nv2 sizes the RAM tier from the cgroup's free memory, which then excludes its pinned slots
         from .warm_prefill import WarmPrefill
         p.warm_prefill = WarmPrefill(p)
     POOLS.append(p)
@@ -628,6 +630,9 @@ def attach(model):
         m.cpu_split_combine = comb
     if p.elastic and p.stage_n:
         _hook_prefill(type(model))
+    if approx_prefill:
+        from . import last_page
+        log(last_page.apply(p.stage_min, p.topk))
     log(f"pool: {len(mods)} MoE layers (experts {p.first}..{p.first + p.E - 1}), {p.S} slots x {p.rec / 1e6:.2f} MB = "
         f"{p.S * p.rec / GiB:.2f} GiB ({p.S / len(mods):.1f}/layer), {'uniform' if p.uniform else 'per-layer'} geometry, "
         f"admit <= {admit_max} picks, stage 2 x {p.stage_n} experts (>= {stage_min} picks), elastic "

@@ -12,16 +12,15 @@ from ...bench.longctx import glm_frame
 from ...cpus import CpuLayout, format_cpus, plan_layout
 from ...errors import BoxError, PrepareError
 from ...hub import COMMIT_RE, Checkpoint, is_sparse
-from ...kernels import KernelSpec, is_built
+from ...kernels import is_built
 from ...launcher import LaunchSpec
 from ...registry import ModelBackend, register_backend
-from ...runtime import RuntimeSpec, SourceBuild
 from ...steps import Step
+from ..runtime import DESCRIPTION as RUNTIME, runtime_spec
 from ...store import ExpertStore, compare, pack, punch_experts
 from ...store.slim import expert_ranges
 
 PKG = Path(__file__).resolve().parent
-ENGINE = PKG / "engine"
 DATA = PKG / "data"
 
 REPO = "turboderp/GLM-5.3-Flash-exl3"
@@ -30,8 +29,6 @@ DEFAULT_VARIANT = "3.05bpw"
 IGNORE = ("README.md", ".gitattributes", "*.kate-swp", "quantization_config.json")  # never read by the server
 STORE_NAME = "glm53_flash_exl3_3.05bpw_experts"
 MTP_MODEL_LAYER = 45
-EXLLAMAV3 = SourceBuild("exllamav3", "1.5.1", "https://codeload.github.com/turboderp-org/exllamav3/tar.gz/"
-                                              "958ec933361b24eb8426ec7222e5b0062a679dcd")
 # planner cost model "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone" (ms). Upstream's cb = 0.165 ms per CPU-lane expert
 # is calibrated for 22 EPYC cores; with 5 Ryzen lane cores an expert costs ~0.65 ms and the stock model overloads the
 # lane. Tuned on the RTX 3090 box (2026-10-19, C1 chat): cb 0.165 -> 9.5, 0.30 -> 10.1, 0.40 -> 10.1, 0.65 -> 9.7 tok/s.
@@ -141,18 +138,11 @@ class GLM53(ModelBackend):
         return ExpertStore(d, STORE_NAME)
 
     def runtime_spec(self, box):
-        return RuntimeSpec(
-            name="glm53", python="3.12", requirements=PKG / "requirements" / "runtime.txt",
-            build_requirements=PKG / "requirements" / "build.txt",
-            index_url="https://download.pytorch.org/whl/cu130", extra_index_urls=("https://pypi.org/simple",),
-            index_strategy="unsafe-best-match", source_builds=(EXLLAMAV3,), cuda_subdir="nvidia/cu13",
-            smoke_test="import torch, exllamav3; from exllamav3.ext import exllamav3_ext")
+        return runtime_spec("glm53", "import torch, exllamav3; from exllamav3.ext import exllamav3_ext")
 
     def kernel_specs(self, box) -> list:
         from ... import engine
-        e = "bigmoe.models.glm53.engine."
-        return engine.kernel_specs() + [KernelSpec("glm53_k101", "GLM53_K_BUILD", e + "k_hcfuse", "ext",
-                                                   (ENGINE / "k_hcfuse.py",))]
+        return engine.kernel_specs()
 
     def steps(self, box) -> list:
         o, rt = box.options, box.runtime
@@ -165,8 +155,8 @@ class GLM53(ModelBackend):
             return all(is_built(s, dirs[s.name]) for s in specs)
 
         steps = [
-            Step("runtime", "create the server's Python environment (torch 2.13 + CUDA 13; exllamav3 1.5.1 built from "
-                 "source)", rt.is_ready, lambda: rt.ensure(box.arch), detail=lambda: str(rt.path)),
+            Step("runtime", f"create the server's Python environment ({RUNTIME})", rt.is_ready,
+                 lambda: rt.ensure(box.arch), detail=lambda: str(rt.path)),
             Step("kernels", "compile the torch extensions (shared engine: expert pool, nv2 + CPU lane; GLM: "
                  "hyper-connections)", kernels_done, lambda: rt.build_kernels(specs, box.arch),
                  detail=lambda: str(box.home.kernels)),
@@ -270,23 +260,23 @@ class GLM53(ModelBackend):
         env = {"BIGMOE_ENGINE_PREFIX": "GLM53_"}   # shared engine (bigmoe.engine), knobs under GLM53_
         if o.mode == "nvme-exact":
             reserve, k, mode_args = "1.0", "0", []
-            # stock exllamav3 prefill: the single-pass prompt checkpoint (exl3_patch) prefills the last page boundary in
-            # one pass, which changes the fp16 rounding of the recurrent state and with it the greedy answers
-            env.update(GLM53_NV="2", GLM53_NV_CPU="0", GLM53_K_HCFUSE="1", GLM53_EXL3_PATCHES="0")
+            env.update(GLM53_NV="2", GLM53_NV_CPU="0")
         else:
             reserve, k, mode_args = "1.5", "1", ["-ambs", "4"]
             env.update(GLM53_NV="2", GLM53_NV_CPU="1", GLM53_K_FTSPLIT="0", GLM53_K_OVL="0", GLM53_NV_VRING="24",
-                       GLM53_NV_PREFETCH="1", GLM53_MAX_RQ_TOKENS="4096", GLM53_NV_CPU_KERN="1", GLM53_LA="1",
-                       GLM53_NV_PUBFAST="1", GLM53_NV_PFSIDE="1", GLM53_LA_BTTRIM="1", GLM53_NV_POL=self.planner(o))
+                       GLM53_NV_PREFETCH="1", GLM53_MAX_RQ_TOKENS="4096", GLM53_NV_CPU_KERN="1",
+                       GLM53_NV_PUBFAST="1", GLM53_NV_PFSIDE="1", GLM53_NV_POL=self.planner(o))
         env["GLM53_EC_STAGE_MIN"] = "512"
         env["GLM53_NV_STORE"] = str(store.bin)
-        for var in ("GLM53_K_HCFUSE", "GLM53_K_FTSPLIT", "GLM53_K_OVL"):
+        for var in ("GLM53_K_FTSPLIT", "GLM53_K_OVL"):
             env.setdefault(var, k)
         stats = str(DATA / "stats_own_dec.json")
         env.update(GLM53_ZC_STATS=stats, GLM53_EC="1", GLM53_EC_WARM=stats, GLM53_EC_RESERVE_GB=reserve,
                    GLM53_EC_STAGE_GB="2.6", GLM53_EC_ELASTIC_GB="10", GLM53_CPU_TIER="0",
-                   GLM53_TRITON_PIN=str(DATA / "triton_pin_exact.json"), EXLLAMAV3_TUNE_CACHE=str(tune),
-                   TRITON_CACHE_DIR=str(box.home.triton), PYTHONUNBUFFERED="1")
+                   EXLLAMAV3_TUNE_CACHE=str(tune), TRITON_CACHE_DIR=str(box.home.triton), PYTHONUNBUFFERED="1",
+                   # exllamav3's fused hyper-connection sites (mix + RMSNorm, deferred apply), bit-identical to the
+                   # unfused launches; off by default on CUDA, measured on par with the 1.5.1 runtime's custom kernels
+                   EXL3_HC_FOLD="1")
         if o.vram_expert_slots is not None:
             env["GLM53_EC_MAX_SLOTS"] = str(int(o.vram_expert_slots))
         lay = self.cpu_layout(box)

@@ -211,9 +211,7 @@ class Nv2:
         want = g("NV_RAM_GB", "auto")
         if want == "auto":
             assert mem.get("max"), "NV_RAM_GB=auto needs a memory-capped container"
-            # exl3_patch's end-of-turn tail checkpoints live outside the -rcs budget: up to 4 x ~143 MB
-            tails = 0.6 * GiB if g("EXL3_PATCHES", "1") == "1" else 0
-            avail = (mem["max"] - mem["current"]) * GiB - margin - ring_own * self.slot - NT._rcs_bytes() - tails - 0.3 * GiB
+            avail = (mem["max"] - mem["current"]) * GiB - margin - ring_own * self.slot - NT._rcs_bytes() - 0.3 * GiB
         else:
             avail = float(want) * GiB
         avail = max(0, avail)

@@ -1,5 +1,5 @@
-# Runtime of the glm53 server (Python 3.12): the exact package set measured on the RTX 3090 box, 2026-10-18/19.
-# exllamav3 1.5.1 is built from source on top (commit 958ec933, the glm-flash-lite pin) and installed without deps.
+# Runtime of both servers (Python 3.12): the exact package set measured on the RTX 3090 box, 2026-10-18/19.
+# exllamav3 is built from source on top (bigmoe/models/runtime.py: EXLLAMAV3) and installed without deps.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1

@@ -7,10 +7,12 @@ from bigmoe import AutoBox, system
 from bigmoe.models import glm53
 
 BASE = Path(glm53.__file__).parent / "baselines"
-PATHS = ("GLM53_EC_WARM", "GLM53_ZC_STATS", "GLM53_TRITON_PIN", "GLM53_NV_STORE")
+PATHS = ("GLM53_EC_WARM", "GLM53_ZC_STATS", "GLM53_NV_STORE")
 # deliberate changes since the reference runs: the planner's NVMe arrival model (nvlat, nvdeep; see TUNED_PLANNER), and
-# mode nvme-exact runs exllamav3's stock prefill (the prompt / tail checkpoint patch changes its greedy answers)
-CHANGED = {"nvme": {"GLM53_NV_POL": glm53.TUNED_PLANNER}, "nvme-exact": {"GLM53_EXL3_PATCHES": "0"}}
+# the exllamav3 1.5.1 runtime's own modules are gone with it (fused hyper-connection kernels, decode lookahead, Triton
+# pin, prompt / tail checkpoint patch): exllamav3's fused sites (EXL3_HC_FOLD) and the engine's prefill replace them
+CHANGED = {"nvme": {"GLM53_NV_POL": glm53.TUNED_PLANNER}, "nvme-exact": {}}
+REMOVED = {"GLM53_K_HCFUSE", "GLM53_LA", "GLM53_LA_BTTRIM", "GLM53_TRITON_PIN", "GLM53_EXL3_PATCHES"}
 
 
 class FakeRuntime:
@@ -35,6 +37,7 @@ def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
     # the reference runs were measured with the old 52 GiB cap and a 1376-slot expert cache: pass them explicitly
     box, spec = spec_for(tmp_path, monkeypatch, mode, memory_gb=52.0, vram_expert_slots=1376)
     ref = dict(json.loads((BASE / fname).read_text())["env"], **CHANGED[mode])
+    ref = {k: v for k, v in ref.items() if k not in REMOVED}
     ours = {k: v for k, v in spec.env.items() if k.startswith("GLM53_") and not k.endswith("_BUILD")}
     assert set(ours) == set(ref)
     for k, v in ref.items():
@@ -43,8 +46,8 @@ def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
         else:
             assert ours[k] == v, k
     assert spec.env["BIGMOE_ENGINE_PREFIX"] == "GLM53_"
-    assert {spec.env[v] for v in ("BIGMOE_EC_BUILD", "GLM53_K_BUILD", "BIGMOE_NV2_BUILD")} == \
-        {"/k/bigmoe_ec-key", "/k/glm53_k101-key", "/k/bigmoe_nv2-key"}
+    assert {spec.env[v] for v in ("BIGMOE_EC_BUILD", "BIGMOE_NV2_BUILD")} == {"/k/bigmoe_ec-key", "/k/bigmoe_nv2-key"}
+    assert "GLM53_K_BUILD" not in spec.env and spec.env["EXL3_HC_FOLD"] == "1"
     assert spec.files == {spec.env["EXLLAMAV3_TUNE_CACHE"]: str(glm53.DATA / "coop_autotune_1gpu.bin")}
     assert not Path(spec.env["EXLLAMAV3_TUNE_CACHE"]).exists()
 
