@@ -268,6 +268,14 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
         nmiss = 0; nhit = 0; epoch = ctl[1] + 1; ctl[1] = epoch; ctl[2] = 0;
     }
     __syncthreads();
+    // X16 lane: this layer's request record dflag[1 + li] = +-(seq * 64 + picks), + with a CPU job, written once this
+    // call's masked selection (sel_out / w_out) is complete; the side-stream epilogue (x16_epa) finds its call by it
+    if (t == 0 && li < DFLAG_LAYERS)
+    {
+        __threadfence();
+        const long long rec = sq * 64 + (n < 63 ? n : 63);
+        ((volatile long long*) dflag)[1 + li] = (s_ok && rp->ncpu > 0) ? rec : -rec;
+    }
     for (int s = t; s < n; s += blockDim.x)
     {
         const long long e = sel_out[s] - first;

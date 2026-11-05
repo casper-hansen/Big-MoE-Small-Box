@@ -152,6 +152,7 @@ class Nv2:
                           R.ROUTING_ACT_SIGMOID for m in pool.mods]
         g = env
         self.cpu_on = g("NV_CPU", "0") == "1"
+        self.x16, self.x16_hi, self.stepped = None, 0, False   # X16 lane (x16_setup)
         self.b70 = g("B70", "0") == "1"
         assert not self.b70 or self.cpu_on, "B70=1 needs the CPU tier (NV_CPU=1): the CPU worker runs the B70 lane"
         self.b70_ring = g("B70_RING", "/run/local-ai/shared/b70.ring")
@@ -252,7 +253,8 @@ class Nv2:
         self.dc, self.uidx, self.uexp, self.ulane = D(DCN, torch.int64), D(self.E), D(self.MAXU), D(self.MAXU)
         self.jobx, self.jobnv = D(pool.jobs.numel() // 2), D(pool.jobs.numel() // 2)
         self.jobsrc = D(pool.jobs.numel() // 2, torch.int64)
-        self.dflag, self.dstats = D(1, torch.int64), D(STN, torch.int64)
+        # dflag[0]: this call's CPU job seq (0 = none); [1 + li]: nv_step's per-layer request records (X16 lane)
+        self.dflag, self.dstats = D(128, torch.int64), D(STN, torch.int64)
         self.dbg = D(DBG * DBGW, torch.int64)
         self.sel_out = torch.empty(16384, dtype=torch.int64, device=self.dev)
         self.w_out = torch.empty(16384, dtype=torch.half, device=self.dev)
@@ -325,6 +327,7 @@ class Nv2:
                  "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "pf_keys", "pf_skip", "pf_used", "pf_wasted", "lane_skip", "lossy_calls", "lossy_tok", "lossy_tok_skip", "lossy_cold_x1e6", "lossy_skip_x1e6", "lossy_coldu", "lossy_want", "lossy_bg_reads", "promoted", "stg_issued", "stg_ready", "stg_hit", "stg_late",
                  "stg_nofree", "stg_dup", "stg_waste", "wb_early", "partial_lands", "partial_binds", "wb_lat_us",
                  "wb_lat_max_us", "ring_low", "ring_low_vfree", "ring_borrowed",
+                 "x16_jobs", "x16_experts", "x16_gu_ns", "x16_wait_ns", "x16_down_ns",
                  "resident", "inflight", "free", "landing"]
         return dict(zip(names, ext().counters()))
 
@@ -415,6 +418,7 @@ class Nv2:
                 s = s.long().contiguous()
             p._ec_hits(li, s)
             self.st["staged_calls"] += 1
+            self.stepped = False
             return sel, w, False
         if p.stage_n:
             p._stage_hook_nv2(li, n)
@@ -455,11 +459,17 @@ class Nv2:
                   p.rec, ou_, od_, self.a["hc"], self.a["rep"], self.dc, self.uidx, self.ulane, self.a["wbl"],
                   self.a["adml"], self.a["land"], self.dflag, self.timeout_ns, int(self.wb_on), self.dbg,
                   self.stg_addr_dev.data_ptr() if self.stg_addr else 0, self.jobsrc)
+        if self.x16 is not None and li < self.x16_hi and bsz == 1:
+            # X16 epilogue gate: this call's nv_step is done (its masked selection and request record exist)
+            b = self.x16
+            b["cur_ev"] = b["ev"][b["evi"]]; b["evi"] = (b["evi"] + 1) % len(b["ev"])
+            b["cur_ev"].record(torch.cuda.current_stream(self.dev))
         e.nv_copy(p.ctl, p.jobs, self.jobx, self.jobnv, li, self.E, self.a["home"], self.a["res"], p.cbase.data_ptr(), p.spc,
                   p.rec, sg_, su_, sd_, ou_, od_, self.ram_addr_dev, self.dc, self.uexp, self.ulane, p.slotof,
                   p.tabs, self.ph, self.a["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg, self.jobsrc,
                   int(p.uniform))
         self.st["dec_calls" if dec else "small_calls"] += 1
+        self.stepped = True
         return so.view(sel.shape), wo.view(w.shape), send_x
 
     def _lg_ptr(self, li):
@@ -536,6 +546,165 @@ class Nv2:
                 f"{self.selftest}")
         e.cpu_start(cpus[0])
         self.cpu_mode, self.cpu_lim = mode, lim
+
+    # ---- X16 lane: bit-exact CPU experts in the first NV_X16_HI MoE layers (x16.py) -----------------------------------
+    def x16_setup(self):
+        want = int(env("NV_X16_HI", "0"))
+        if not want:
+            return
+        if not self.cpu_on:
+            NT._log("nv2 X16 lane: off (needs the CPU tier, NV_CPU=1)")
+            return
+        from . import x16 as X
+        hi = 0
+        for li in range(min(want, self.L)):
+            why = X.unsupported(self.pool.mods[li])
+            if why:
+                NT._log(f"nv2 X16 lane: layer {li} not supported ({why})")
+                break
+            hi = li + 1
+        cfg = self.pool.mods[0].experts_cfg
+        I, Ho, k = cfg.interm_g.shape[-1], cfg.out_d.shape[-1], self.topk
+        pin = lambda n, dt: torch.zeros(n, dtype=dt, pin_memory=True)
+        b = dict(gg=pin(k * I, torch.half), gu=pin(k * I, torch.half), act=pin(k * I, torch.half),
+                 d=pin(k * Ho, torch.float), flags=pin(4, torch.int64), I=I, Ho=Ho)
+        cost = int(env("NV_X16_COST", "550"))
+        hi = ext().x16_init(b["gg"].data_ptr(), b["gu"].data_ptr(), b["act"].data_ptr(), b["d"].data_ptr(),
+                            b["flags"].data_ptr(), hi, cost) if hi else 0
+        if not hi:
+            NT._log("nv2 X16 lane: off (no supported layers: needs AVX-512 VBMI and EXL3 K 2 / 2.5 / 3 mul1 experts)")
+            return
+        D = lambda n, dt=torch.int64: torch.zeros(n, dtype=dt, device=self.dev)
+        b.update(err=D(1, torch.int32), last=D(128), started=D(1), ticket=0, timeout=self.timeout_ns,
+                 side=torch.cuda.ExternalStream(X.ext().x16_stream(self.dev.index), device=self.dev),
+                 ev=[torch.cuda.Event() for _ in range(4)], evi=0)
+        # the epilogue launches pair with nv_step calls from here on: start past the records written so far
+        torch.cuda.synchronize(self.dev)
+        b["last"][:127].copy_(self.dflag[1:].abs() // 64)
+        t = time.perf_counter()
+        for li in range(hi):   # every layer: its expert formats / sizes may differ
+            ok, info = self.x16_selftest(b, li)
+            if not ok:
+                ext().x16_init(0, 0, 0, 0, 0, 0, cost)
+                NT._log(f"nv2 X16 lane: OFF, self-test not bit-exact ({info})")
+                return
+        self.x16, self.x16_hi = b, hi
+        NT._log(f"nv2 X16 lane: MoE layers 0-{hi - 1} (bit-exact CPU experts, planner cost {cost} %), self-test: every "
+                f"layer bit-identical with {(self.topk + 1) // 2} of {self.topk} picks on the CPU "
+                f"({time.perf_counter() - t:.1f} s)")
+
+    def _x16_mod(self, m):
+        """Per-module constants of the epilogue / reduction (cached on the module)."""
+        c = getattr(m, "_x16_c", None)
+        if c is None:
+            from . import x16 as X
+            shg = getattr(m, "shared_gate", None) if getattr(m, "bc_sh_exp", False) else None
+            sho = getattr(m, "_x16_sh_out", None) if getattr(m, "bc_sh_exp", False) else None
+            c = m._x16_c = dict(act=X.ACT[m.activation_fn], lim=float(m.act_limit or 0.0), gated=bool(m.gated),
+                                shw=shg.inner.weight.reshape(-1) if shg is not None else None,
+                                sho=sho.reshape(-1, self.H)[0] if sho is not None else None)
+        return c
+
+    def x16_start(self, m):
+        """Right after a single-token X16-layer call's publish / step (a CPU job may be planned): exllamav3's activation
+        epilogue for the CPU's picks, as ONE block on a high-priority non-blocking side stream gated by this call's
+        nv_step, plus a main-stream gate that holds the layer's MoE kernels until that block is resident (so it answers as
+        soon as the CPU's gate / up rows land; it is never resident outside this layer call, exllamav3's prefill GEMMs
+        are cooperative launches). The block finds its call through nv_step's request record dflag[1 + li]."""
+        from . import x16 as X
+        (sel, w, _z), msel = m._x16
+        b, c = self.x16, self._x16_mod(m)
+        li = m._ec[1]
+        sel, msel, w = sel.reshape(-1), msel.reshape(-1), w.reshape(-1)
+        if w.dtype != torch.half:
+            w = w.half()
+        f = b["flags"].data_ptr()
+        b["ticket"] += 1
+        st = b["started"].data_ptr()
+        with torch.cuda.stream(b["side"]):
+            b["side"].wait_event(b["cur_ev"])
+            X.ext().x16_epa(b["gg"].data_ptr(), b["gu"].data_ptr(), b["I"], sel, msel, w, m.multi_gate.ptrs_svh,
+                            m.multi_up.ptrs_svh, m.multi_down.ptrs_suh, c["act"], c["lim"], c["gated"],
+                            b["act"].data_ptr(), self.topk, self.dflag.data_ptr() + 8 * (1 + li),
+                            b["last"].data_ptr() + 8 * li, st, b["ticket"], f, b["timeout"], f + 8, b["err"])
+        X.ext().x16_gate(st, b["ticket"], b["timeout"], b["err"])
+        for t in (sel, w):
+            t.record_stream(b["side"])
+
+    def x16_finish(self, m, fhs):
+        """After the MoE kernel of an X16-layer call with CPU picks: exllamav3's token reduction over every slot (the
+        GPU's down outputs and the CPU's) into fhs; x16_red waits for the CPU's down rows."""
+        from . import x16 as X
+        (sel, w, z), msel = m._x16
+        b, c = self.x16, self._x16_mod(m)
+        sel, msel, w = sel.reshape(-1), msel.reshape(-1), w.reshape(-1)
+        if w.dtype != torch.half:
+            w = w.half()
+        zz = z.reshape(-1)
+        if zz.dtype != torch.half:
+            zz = zz.half()
+        out = fhs if fhs.is_contiguous() else fhs.contiguous()
+        X.ext().x16_red(m.experts_cfg.out_d.reshape(-1, b["Ho"]), b["d"].data_ptr(), msel, sel, w, self.topk, self.H,
+                        b["Ho"], self.H, m.multi_down.ptrs_svh, zz, c["shw"], c["sho"], out.reshape(-1, self.H),
+                        self.dflag, b["flags"].data_ptr() + 16, b["timeout"], b["err"])
+        return out
+
+    @torch.inference_mode()
+    def x16_selftest(self, b, li):
+        """One token through layer li with the first half of its picks on the X16 path (CPU GEMVs + x16_epa + x16_red,
+        synchronously), the rest on the GPU kernel, against the GPU kernel on all picks: must be bit-identical."""
+        from . import x16 as X
+        e, xe = ext(), X.ext()
+        m = self.pool.mods[li]
+        st = e.state()[1].numpy()
+        res = [x for x in range(self.E) if st[li * self.E + x] == 2]
+        k = self.topk
+        if len(res) < k:
+            return False, f"layer {li}: only {len(res)} RAM-resident experts"
+        g = torch.Generator(device="cpu").manual_seed(16)
+        pick = [res[i] for i in torch.randperm(len(res), generator=g)[:k].tolist()]
+        z = (torch.randn(1, self.H, generator=g) * 0.5).half().to(self.dev)
+        sel = torch.tensor([pick], dtype=torch.long, device=self.dev)
+        rw = (torch.rand(1, k, generator=g) * 0.5 + 0.1).half().to(self.dev)
+        cfg = m.experts_cfg
+        m.bc.run_bszN(z, sel, rw)
+        ref = cfg.out_bszn[:1].clone()
+        xs = list(range((k + 1) // 2))
+        msel, mw = sel.clone(), rw.clone()
+        msel[0, xs] = -1
+        mw[0, xs] = 0
+        cfg.out_d.zero_()
+        m.bc.run_bszN(z, msel, mw)
+        torch.cuda.synchronize(self.dev)
+        I, Ho = b["I"], b["Ho"]
+        gg, gu = b["gg"].view(k, I), b["gu"].view(k, I)
+        act, d = b["act"].view(k, I), b["d"].view(k, Ho)
+        zf = z[0].float().cpu()
+        for j in xs:
+            gg[j] = e.x16_gemv(li, pick[j], 0, zf, 1).half()
+            gu[j] = e.x16_gemv(li, pick[j], 1, zf, 1).half()
+        c = self._x16_mod(m)
+        seq = 1
+        flags = torch.zeros(4, dtype=torch.int64, pin_memory=True)
+        flags[0] = seq
+        D = lambda *v: torch.tensor(list(v), dtype=torch.int64, device=self.dev)
+        req, last, started, dflag = D(seq * 64 + k), D(0), D(0), D(seq)
+        err = torch.zeros(1, dtype=torch.int32, device=self.dev)
+        xe.x16_epa(gg.data_ptr(), gu.data_ptr(), I, sel[0], msel[0], rw[0], m.multi_gate.ptrs_svh, m.multi_up.ptrs_svh,
+                   m.multi_down.ptrs_suh, c["act"], c["lim"], c["gated"], act.data_ptr(), k, req.data_ptr(),
+                   last.data_ptr(), started.data_ptr(), 1, flags.data_ptr(), 2_000_000_000, flags.data_ptr() + 8, err)
+        torch.cuda.synchronize(self.dev)
+        for j in xs:
+            d[j] = e.x16_gemv(li, pick[j], 2, act[j].float(), 0)
+        flags[2] = seq
+        out = torch.zeros(1, self.H, dtype=torch.float, device=self.dev)
+        xe.x16_red(cfg.out_d.reshape(-1, Ho), d.data_ptr(), msel[0], sel[0], rw[0], k, self.H, Ho, self.H,
+                   m.multi_down.ptrs_svh, z.reshape(-1), c["shw"], c["sho"], out, dflag, flags.data_ptr() + 16,
+                   2_000_000_000, err)
+        torch.cuda.synchronize(self.dev)
+        same = float((out.view(torch.int32) == ref.view(torch.int32)).float().mean())
+        ok = same == 1.0 and int(err.item()) == 0
+        return ok, f"layer {li}: {same * 100:.3f} % of outputs equal, err {int(err.item())}"
 
     @torch.inference_mode()
     def _selftest(self, lim, n_layers=3, n_exp=4):

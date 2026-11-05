@@ -9,7 +9,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from ... import log, system
+from ... import engine, log, system
 from ...bench.longctx import deepseek_frame
 from ...cpus import CpuLayout, format_cpus, plan_layout
 from ...errors import BoxError, PrepareError
@@ -64,6 +64,9 @@ class DSV41Options:
     # Costs ~3.4 GB of VRAM (the drafter's experts), i.e. ~350 fewer VRAM expert slots. "none" turns it off.
     speculation: str = "dspark"
     dspark_conf: float = 0.5
+    # mode nvme: the first x16_layers MoE layers keep the CPU lane on its bit-exact X16 path (engine/x16.py); 0 = off.
+    # Only single-token forwards use it (with DSpark on, verify forwards of those layers run their experts on the GPU)
+    x16_layers: int = 0
 
     def validate(self):
         if self.mode not in MODES:
@@ -82,6 +85,7 @@ class DSV41Options:
             raise ValueError(f"cpu_cache_gb must be 0..64, got {self.cpu_cache_gb!r}")
         if self.disk_cache and not float(self.cpu_cache_gb) > 0:
             raise ValueError("disk_cache needs cpu_cache_gb > 0 (exllamav3's disk tier sits behind the CPU tier)")
+        engine.check_x16_layers(self.x16_layers)
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
             raise ValueError("cpus must be 'auto', a CpuLayout or a dict(main=, controller=, lane=, readers=)")
 
@@ -257,6 +261,7 @@ class DSV41(ModelBackend):
                    DSV41_NV_READER_CPUS=format_cpus(lay.readers))
         if env["DSV41_NV_CPU"] == "1":
             env["DSV41_NV_CPU_CPUS"] = format_cpus(lay.lane)
+            env.update(engine.x16_env("DSV41_", o.x16_layers))
         for spec in self.kernel_specs(box):
             env[spec.env_var] = str(box.runtime.kernel_dirs([spec], box.arch)[spec.name])
         if not system.systemd_scope_available():

@@ -95,6 +95,17 @@ def test_launch_cpu_lane(tmp_path, monkeypatch):
         box.backend.check(box)
 
 
+def test_x16_layers(tmp_path, monkeypatch):
+    _, spec = spec_for(tmp_path, monkeypatch)   # off by default
+    assert not any("NV_X16" in k for k in spec.env)
+    _, spec = spec_for(tmp_path, monkeypatch, x16_layers=12)
+    assert spec.env["DSV41_NV_X16_HI"] == "12" and spec.env["DSV41_NV_X16_COST"] == "550"
+    _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact", x16_layers=12)   # no CPU lane: nothing to do
+    assert not any("NV_X16" in k for k in spec.env)
+    with pytest.raises(ValueError):
+        AutoBox("deepseek-v4.1-flash", home=tmp_path, x16_layers=-1)
+
+
 def _st(path, tensors):
     """Minimal safetensors writer: {name: (dtype, shape, bytes)}."""
     hdr, off, blobs = {}, 0, []
