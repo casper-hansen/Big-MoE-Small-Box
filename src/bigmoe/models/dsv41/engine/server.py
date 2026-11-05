@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from bigmoe.kernels import install_prebuilt_loader
+from bigmoe.models.dsv41.toolcalls import ToolStream, normalize_messages, parse_tool_calls
 
 install_prebuilt_loader()  # AutoBox prebuilt the kernels into the DSV41_*_BUILD dirs: no toolchain at runtime
 
@@ -76,8 +77,8 @@ def chat_prompt(messages, enable_thinking=False, tools=None, template_kwargs=Non
         kw = dict(template_kwargs or {})
         kw.pop("enable_thinking", None)
         try:
-            return hf_tok.apply_chat_template(messages, tools=tools or None, tokenize=False, add_generation_prompt=True,
-                                              enable_thinking=enable_thinking, **kw)
+            return hf_tok.apply_chat_template(normalize_messages(messages), tools=tools or None, tokenize=False,
+                                              add_generation_prompt=True, enable_thinking=enable_thinking, **kw)
         except Exception as e:
             print(f" !! chat template failed ({e}); built-in template", flush=True)
     p, sys_p = BOS, ""
@@ -298,7 +299,9 @@ async def chat(req: Request):
     body = await req.json()
     kw = dict(body.get("chat_template_kwargs") or {})
     thinking = bool(kw.get("enable_thinking", kw.get("thinking", False)))
-    ids = tok.encode(chat_prompt(body["messages"], thinking, None, kw), encode_special_tokens=True)
+    # the template renders the tools and the model calls them in DSML (../toolcalls.py parses the calls back)
+    tools = body.get("tools") if body.get("tool_choice") != "none" else None
+    ids = tok.encode(chat_prompt(body["messages"], thinking, tools, kw), encode_special_tokens=True)
     sp, stops = openai_sp(body), stops_of(body)
     cid, created, P = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), ids.shape[-1]
     if body.get("stream"):
@@ -306,6 +309,7 @@ async def chat(req: Request):
             g = run_job(ids, sp, stops)
             gone, wt = watch_disconnect(req)
             sent, in_think = 0, thinking
+            ts = ToolStream(tools) if tools else None
             base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": args.served_name}
             yield sse(dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]))
             n, fin = 0, None
@@ -328,12 +332,22 @@ async def chat(req: Request):
                                 break
                             in_think, new = False, rest
                         else:
-                            yield sse(dict(base, choices=[{"index": 0, "delta": {"content": new}, "finish_reason": None}]))
+                            out = ts.feed(new) if ts else new
+                            if out:
+                                yield sse(dict(base, choices=[{"index": 0, "delta": {"content": out}, "finish_reason": None}]))
                             break
                     if fin is None and gone.is_set():
                         break
+                reason = (fin or {}).get("type", "stop")
+                if ts:
+                    content, calls = ts.finish()
+                    if content:
+                        yield sse(dict(base, choices=[{"index": 0, "delta": {"content": content}, "finish_reason": None}]))
+                    if calls:
+                        reason = "tool_calls"
+                        yield sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]}, "finish_reason": None}]))
                 usage = {"prompt_tokens": P, "completion_tokens": n, "total_tokens": P + n}
-                yield sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": (fin or {}).get("type", "stop")}], usage=usage))
+                yield sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": reason}], usage=usage))
                 yield "data: [DONE]\n\n"
             finally:
                 gone.set(); wt.cancel()
@@ -348,9 +362,13 @@ async def chat(req: Request):
             reasoning, content = text.strip(), ""
     else:
         reasoning, content = None, text.strip()
+    content, calls = parse_tool_calls(content, tools)
     msg = {"role": "assistant", "content": content, "reasoning_content": reasoning}
+    if calls:
+        msg["tool_calls"] = calls
     return JSONResponse({"id": cid, "object": "chat.completion", "created": created, "model": args.served_name,
-                         "choices": [{"index": 0, "message": msg, "finish_reason": (fin or {}).get("type")}],
+                         "choices": [{"index": 0, "message": msg,
+                                      "finish_reason": "tool_calls" if calls else (fin or {}).get("type")}],
                          "usage": {"prompt_tokens": P, "completion_tokens": n, "total_tokens": P + n}})
 
 
