@@ -163,7 +163,7 @@ def cmd_chat(a):
 
 def cmd_bench(a):
     box = _box(a)
-    box.bench(a.tokens, out=a.out, log=lambda m: print(m, flush=True))
+    box.bench(a.tokens, prefill_tokens=a.prefill_tokens, out=a.out, log=lambda m: print(m, flush=True))
 
 
 def cmd_verify(a):
@@ -228,9 +228,12 @@ def main(argv=None):
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int)
     p.set_defaults(fn=cmd_chat)
-    p = sub.add_parser("bench", help="long-context benchmark (starts the server if needed)")
+    p = sub.add_parser("bench", help="long-context and cached-prefix prefill benchmark (starts the server if needed)")
     _add_box_args(p)
-    p.add_argument("--tokens", type=int, nargs="+", default=[1024, 8192, 32768])
+    p.add_argument("--tokens", type=int, nargs="*", default=[1024, 8192, 32768],
+                   help="long-context prompt sizes (none: skip)")
+    p.add_argument("--prefill-tokens", type=int, nargs="*", default=None,
+                   help="new tokens on a cached 8192-token prefix (default: 8 .. 10000; none: skip)")
     p.add_argument("--out", help="result JSON (default: <home>/results/...)")
     p.set_defaults(fn=cmd_bench)
     p = sub.add_parser("verify", help="speed + outputs against the reference results (~15 min per model)")

@@ -22,7 +22,7 @@ def verify(model="glm-5.3-flash", *, out_dir=None, baseline_dir=None, log=print,
             log(f"[verify {time.strftime('%H:%M:%S')}] {label}: {options}")
             box = AutoBox(model, **{**box_kwargs, **options})
             box.start(restart=True)
-            box.bench(tokens, out=out / fname, log=log)
+            box.bench(tokens, prefill_tokens=(), out=out / fname, log=log)
     finally:
         probe.stop()
     log(f"[verify {time.strftime('%H:%M:%S')}] done")

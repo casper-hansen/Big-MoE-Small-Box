@@ -1,4 +1,5 @@
 import functools
+import json
 import os
 import sys
 import time
@@ -176,11 +177,22 @@ class AutoBox:
     def generate(self, prompt: str, **kwargs):
         return self.client.complete(prompt, **kwargs)
 
-    def bench(self, tokens=(1024, 8192, 32768), *, out=None, log=print) -> dict:
-        from .bench import longctx
+    def bench(self, tokens=(1024, 8192, 32768), *, prefill_tokens=None, out=None, log=print) -> dict:
+        """Long-context runs (prompts of `tokens` tokens, bench/longctx.py), then prefill on a cached prefix
+        (`prefill_tokens` new tokens, bench/prefill.py; None = its default sizes, () = skip). One result JSON."""
+        from .bench import longctx, prefill
         if not (self.running and self.server.healthy()):
             self.start()
         if out is None:
-            out = self.home.results / f"longctx-{self.backend.name}-{time.strftime('%Y%m%d-%H%M%S')}.json"
-        return longctx.run(self.client, list(tokens), self.runtime.purelib, frame=self.backend.bench_frame,
-                           out=str(out), log=log)
+            out = self.home.results / f"bench-{self.backend.name}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        if tokens:
+            res = longctx.run(self.client, list(tokens), self.runtime.purelib, frame=self.backend.bench_frame,
+                              out=str(out), log=log)
+        else:
+            res = {"started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "runs": {}}
+        sizes = prefill.SIZES if prefill_tokens is None else tuple(prefill_tokens)
+        if sizes:
+            res["prefill"] = prefill.run(self.client, self.runtime.purelib, sizes, log=log)
+            Path(out).parent.mkdir(parents=True, exist_ok=True)
+            Path(out).write_text(json.dumps(res, indent=1))
+        return res

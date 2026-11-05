@@ -7,6 +7,7 @@
            record image), so per-layer kernel calls pass geom(li). Prefill chunks stage every non-VRAM expert of the
            next layer into two VRAM buffers on a copy stream; in elastic mode those buffers (and the activations) come
            from the last chunks of the cache, which are handed back to torch for the prefill and reclaimed for decode.
+           In mode nvme a staged forward stages the warm experts plus each layer's heaviest cold ones (warm_prefill.py).
   attach   pool + nv2 + routing / combine hooks + bounce proxies for exllamav3's per-expert paths
 
 Knobs (<prefix>NAME, see env.py): NV_STORE (store .bin), EC_RESERVE_GB (VRAM left to torch, 2.5), EC_MAX_SLOTS,
@@ -333,6 +334,7 @@ class Pool:
             self.pending = None
             self._st_open = False
             self.stage_stats = {"forwards": 0, "layers": 0, "experts": 0}
+        self.warm_prefill = None      # warm_prefill.WarmPrefill in mode nvme (set by attach)
         for li, m in enumerate(mods):
             m._ec = (self, li)
 
@@ -414,6 +416,8 @@ class Pool:
             if self.elastic and not self.in_prefill:
                 self._elastic_enter(n_picks // self.topk)
             self.slot_np = self.slotof.cpu().numpy()    # stable during prefill (no admission)
+            if self.warm_prefill is not None:
+                self.slot_np = self.warm_prefill.begin(e, self.slot_np)
             e.stage_begin(torch.from_numpy(np.ascontiguousarray(self.slot_np)), li)
             self._st_open = True
             self.stage_stats["forwards"] += 1
@@ -488,6 +492,7 @@ class Pool:
                 "hits": s[0], "misses": s[1], "admitted": s[2], "no_victim": s[3], "evictions": s[4],
                 "hit_rate": round(s[0] / max(1, s[0] + s[1]), 4),
                 "stage": dict(self.stage_stats, per_buffer=self.stage_n) if self.stage_n else None,
+                "warm_prefill": self.warm_prefill.summary() if self.warm_prefill is not None else None,
                 "picks_hist": dict(sorted(self.size_hist.items()))}
 
 
@@ -580,8 +585,15 @@ def attach(model):
         Ly = by_key[m.key]
         sg, su, sd, ou, od = p.geom(li)
         assert (Ly["off_u"], Ly["off_d"]) == (ou, od) and sg + su + sd <= Ly["trellis_bytes"] <= p.rec, (m.key, Ly, p.geom(li))
+    if p.stage_n and env("NV_CPU", "0") == "1":
+        # mode nvme (approximate, with the CPU lane): warm prefill. Created before nv2 sizes the RAM tier from the
+        # cgroup's free memory, which then already excludes its pinned read slots
+        from .warm_prefill import WarmPrefill
+        p.warm_prefill = WarmPrefill(p)
     POOLS.append(p)
     N2.attach_pool(p)
+    if p.warm_prefill is not None:
+        N2.ext().set_ring_borrow(0)   # the prefill ring would evict RAM experts that the forward counts as warm
     warm = env("EC_WARM")
     scores = json.load(open(warm)) if warm else None
     if scores:
@@ -599,7 +611,11 @@ def attach(model):
             sel, w = _orig(bsz, cfg, z, params)
             _m._nv2_cpu = False
             if not params.get("autosplit_measure") and not params.get("tp_warmup"):
-                sel, w, _m._nv2_cpu = nv.layer(_m._ec[1], sel, w, z, bsz)
+                pool, li = _m._ec
+                staged = pool.warm_prefill is not None and sel.numel() >= pool.stage_min
+                sel, w, _m._nv2_cpu = nv.layer(li, sel, w, z, bsz)
+                if staged:
+                    sel, w = pool.warm_prefill.route(li, sel, w)
             return sel, w
         m.routing_fn = routed
         orig_comb = m.cpu_split_combine
