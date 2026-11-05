@@ -17,8 +17,26 @@ ROOT = Path(__file__).resolve().parent
 
 
 def kernel_specs():
-    """The engine's two torch extensions (one build per torch / Python / GPU arch, shared by every backend)."""
+    """The engine's torch extensions (one build per torch / Python / GPU arch, shared by every backend)."""
     from ..kernels import KernelSpec
     nv2_src = tuple(sorted((ROOT / "kernels" / "nv2").iterdir()))
+    x16_src = tuple(sorted((ROOT / "kernels" / "x16").iterdir()))
     return [KernelSpec("bigmoe_ec", "BIGMOE_EC_BUILD", "bigmoe.engine.ec", "ext", (ROOT / "ec.py", ROOT / "env.py")),
-            KernelSpec("bigmoe_nv2", "BIGMOE_NV2_BUILD", "bigmoe.engine.nv2", "ext", (ROOT / "nv2.py", ROOT / "env.py") + nv2_src)]
+            KernelSpec("bigmoe_nv2", "BIGMOE_NV2_BUILD", "bigmoe.engine.nv2", "ext", (ROOT / "nv2.py", ROOT / "env.py") + nv2_src),
+            KernelSpec("bigmoe_x16", "BIGMOE_X16_BUILD", "bigmoe.engine.x16", "ext", (ROOT / "x16.py", ROOT / "env.py") + x16_src)]
+
+
+# X16 lane (engine/x16.py): every backend's `x16_layers` option (mode nvme: the first x16_layers MoE layers compute their
+# CPU-lane experts bit-exactly). 0 = off, the default
+
+
+def check_x16_layers(n):
+    if isinstance(n, bool) or int(n) != n or not 0 <= int(n) <= 1024:
+        raise ValueError(f"x16_layers must be a whole number of MoE layers >= 0, got {n!r}")
+
+
+def x16_env(prefix, layers):
+    """Engine knobs of the X16 lane for x16_layers = layers (planner cost of an X16 expert: 5.5x the CPU lane's)."""
+    n = int(layers)
+    return {f"{prefix}NV_X16_HI": str(n), f"{prefix}NV_X16_COST": "550"} if n else {}
+

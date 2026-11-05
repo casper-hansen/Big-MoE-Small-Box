@@ -10,10 +10,12 @@ from bigmoe import engine
 
 def test_kernel_specs():
     specs = {s.name: s for s in engine.kernel_specs()}
-    assert set(specs) == {"bigmoe_ec", "bigmoe_nv2"}
+    assert set(specs) == {"bigmoe_ec", "bigmoe_nv2", "bigmoe_x16"}
     assert specs["bigmoe_ec"].env_var == "BIGMOE_EC_BUILD" and specs["bigmoe_nv2"].env_var == "BIGMOE_NV2_BUILD"
     names = {p.name for p in specs["bigmoe_nv2"].sources}
-    assert {"nv2.py", "nv2_host.cpp", "nv2_dev.cu", "nv2_shared.h", "ft_core.h", "ft_n135.h", "penv.h"} <= names
+    assert {"nv2.py", "nv2_host.cpp", "nv2_dev.cu", "nv2_shared.h", "ft_core.h", "ft_n135.h", "ft_x16.h", "penv.h"} <= names
+    assert specs["bigmoe_x16"].env_var == "BIGMOE_X16_BUILD"
+    assert {"x16.py", "x16_dev.cu"} <= {p.name for p in specs["bigmoe_x16"].sources}
 
 
 def test_env_prefix(monkeypatch):

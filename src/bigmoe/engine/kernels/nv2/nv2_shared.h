@@ -9,6 +9,7 @@ namespace nv2s {
 constexpr int MAXU = 384;   // unique experts per layer call (E; DeepSeek-V4.1-Flash: 384)
 constexpr int MAXP = 64;    // picks with per-pick payload (decode: <= 8 tokens x top-8)
 constexpr int RQ = 64;      // request / reply ring entries
+constexpr int DFLAG_LAYERS = 127;   // nv_step's per-layer X16 request records: dflag[1 + li] for li < DFLAG_LAYERS
 constexpr int LG = 8192;    // write-back / admission log ring entries
 constexpr int LR = 256;     // landing ring (fresh RAM slots for VRAM victims)
 constexpr int MAXB = 8;     // tokens per CPU job

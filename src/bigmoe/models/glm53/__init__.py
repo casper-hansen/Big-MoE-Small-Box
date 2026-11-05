@@ -7,7 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from ... import log, system
+from ... import engine, log, system
 from ...bench.longctx import glm_frame
 from ...cpus import CpuLayout, format_cpus, plan_layout
 from ...errors import BoxError, PrepareError
@@ -67,6 +67,10 @@ class GLM53Options:
     # exllamav3's recurrent-state prefix cache in host RAM (-rcs, GiB; ~143 MB per checkpoint). Every GiB left to the RAM
     # expert tier instead is ~110 more cached experts: 4 -> 1 GiB measured +5 % decode (fewer NVMe reads)
     prefix_cache_gb: float = 1.0
+    # mode nvme: the first x16_layers MoE layers keep the CPU lane on its bit-exact X16 path (engine/x16.py); 0 = off.
+    # 21 (measured 2026-11-05): forced-token top-1 agreement with exact decode 99.0 % (mean KL 0.0013) instead of 97.2 %
+    # (0.012), decode -12 % (bigmoe verify: 9.7-10.3 tok/s instead of 11.2-11.5)
+    x16_layers: int = 0
 
     def validate(self):
         if self.mode not in MODES:
@@ -79,6 +83,7 @@ class GLM53Options:
             raise ValueError(f"cache_quant must be 2..8 bits or None, got {self.cache_quant!r}")
         if int(self.chunk_size) <= 0 or int(self.max_batch_size) <= 0:
             raise ValueError("chunk_size and max_batch_size must be positive")
+        engine.check_x16_layers(self.x16_layers)
         if not 0.25 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0.25..64, got {self.prefix_cache_gb!r}")
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
@@ -278,6 +283,7 @@ class GLM53(ModelBackend):
             env.update(GLM53_NV="2", GLM53_NV_CPU="1", GLM53_K_FTSPLIT="0", GLM53_K_OVL="0", GLM53_NV_VRING="24",
                        GLM53_NV_PREFETCH="1", GLM53_MAX_RQ_TOKENS="4096", GLM53_NV_CPU_KERN="1", GLM53_LA="1",
                        GLM53_NV_PUBFAST="1", GLM53_NV_PFSIDE="1", GLM53_LA_BTTRIM="1", GLM53_NV_POL=self.planner(o))
+            env.update(engine.x16_env("GLM53_", o.x16_layers))
         env["GLM53_EC_STAGE_MIN"] = "512"
         env["GLM53_NV_STORE"] = str(store.bin)
         for var in ("GLM53_K_HCFUSE", "GLM53_K_FTSPLIT", "GLM53_K_OVL"):

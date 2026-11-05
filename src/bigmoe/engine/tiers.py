@@ -165,7 +165,8 @@ def install():
 
     def wrapped(*a, **k):
         obj = real(*a, **k)
-        _BC_ARGS[id(a[16])] = (a[16], a[22], a[43])   # gate ptrs (identity key), up ptrs, gu_trellis_ptr
+        # gate ptrs (identity key), up ptrs, gu_trellis_ptr, the shared expert's output rows (X16 lane reduction)
+        _BC_ARGS[id(a[16])] = (a[16], a[22], a[43], a[9])
         return obj
     ext.BC_BlockSparseMLP = wrapped
     bsm.ext.BC_BlockSparseMLP = wrapped
@@ -308,6 +309,7 @@ class Pool:
             pg, pu, pd = m.multi_gate.ptrs_trellis, m.multi_up.ptrs_trellis, m.multi_down.ptrs_trellis
             cap = _BC_ARGS.get(id(pg))
             gu = None
+            m._x16_sh_out = cap[3] if cap is not None else None
             if cap is not None:
                 assert cap[0] is pg and cap[1] is pu
                 gu = cap[2]
@@ -589,6 +591,7 @@ def attach(model):
         p.warm(scores)
     p.nv2.post_warm()
     p.nv2.cpu_setup()
+    p.nv2.x16_setup()
     for m in mods:
         orig = m.routing_fn
 
@@ -598,8 +601,15 @@ def attach(model):
                 nv.predict_early(_m._ec[1], z, bsz)
             sel, w = _orig(bsz, cfg, z, params)
             _m._nv2_cpu = False
+            _m._x16 = None
             if not params.get("autosplit_measure") and not params.get("tp_warmup"):
+                # X16 lane: a single-token call of one of its layers keeps the original selection for the reduction
+                x16 = nv.x16 is not None and bsz == 1 and _m._ec[1] < nv.x16_hi
+                orig_sw = (sel.clone(), w.clone(), z) if x16 else None
                 sel, w, _m._nv2_cpu = nv.layer(_m._ec[1], sel, w, z, bsz)
+                if x16 and nv.stepped and _m._nv2_cpu:
+                    _m._x16 = (orig_sw, sel)
+                    nv.x16_start(_m)
             return sel, w
         m.routing_fn = routed
         orig_comb = m.cpu_split_combine
@@ -607,7 +617,11 @@ def attach(model):
         def comb(fhs, cpu_partial, cpu_pending, shape, _orig=orig_comb, _m=m):
             if getattr(_m, "_nv2_cpu", False):
                 _m._nv2_cpu = False
-                fhs = _m._ec[0].nv2.combine(fhs)
+                if getattr(_m, "_x16", None) is not None:
+                    fhs = _m._ec[0].nv2.x16_finish(_m, fhs)
+                    _m._x16 = None
+                else:
+                    fhs = _m._ec[0].nv2.combine(fhs)
             return _orig(fhs, cpu_partial, cpu_pending, shape)
         m.cpu_split_combine = comb
     if p.elastic and p.stage_n:

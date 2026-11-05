@@ -100,3 +100,14 @@ def test_speculation_option(tmp_path, monkeypatch):
         spec_for(tmp_path, monkeypatch, "nvme", speculation="dflash")
     with pytest.raises(ValueError):
         spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram", draft_tokens=0)
+
+
+def test_x16_layers(tmp_path, monkeypatch):
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme")   # off by default
+    assert not any("NV_X16" in k for k in spec.env)
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", x16_layers=21)
+    assert spec.env["GLM53_NV_X16_HI"] == "21" and spec.env["GLM53_NV_X16_COST"] == "550"
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme-exact", x16_layers=21)
+    assert not any("NV_X16" in k for k in spec.env)
+    with pytest.raises(ValueError):
+        glm53.GLM53Options(x16_layers=2.5).validate()

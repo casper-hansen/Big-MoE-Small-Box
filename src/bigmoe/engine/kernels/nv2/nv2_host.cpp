@@ -23,6 +23,7 @@
 #include <signal.h>
 #include "ft_core.h"
 #include "ft_n135.h"
+#include "ft_x16.h"
 // N135 CPU-lane forward switch: NV_CPU_KERN=1 -> n135::moe_forward4 (ft_n135.h), default 0 -> ft_core moe_forward
 static int g_cpu_kern = -1;
 static inline void cpu_kern_init()
@@ -30,7 +31,7 @@ static inline void cpu_kern_init()
     if (g_cpu_kern >= 0) return;
     const char* s = penv("NV_CPU_KERN");
     g_cpu_kern = s && *s ? atoi(s) : 1;   // store v2: n135 by default (the only kernel that decodes K 2 / 2.5 trellises)
-    n135::configure_env(); n135::init_p16();
+    n135::configure_env(); n135::init_p16(); n135::init_x16();
     fprintf(stderr, "[nv2] CPU lane kernel: %s (rg %d cg %d rd %d cd %d bandmaxm %d pfr %d p16 %d rt %d merge %d vbmi %d)\n", g_cpu_kern == 1 ? "n135 v4" : "ft_core moe_forward",
             n135::K_.rg, n135::K_.cg, n135::K_.rd, n135::K_.cd, n135::K_.bandmaxm, n135::K_.pfr, n135::K_.kern, n135::K_.rt, n135::K_.merge,
             int(n135::vbmi_ok));
@@ -280,6 +281,9 @@ struct Pol
     // done at max(lane free + cb, arrival + cbt) instead of max(lane free, arrival) + cb
     double cbt = -1;
     int cpu_on = 0, nvcpu_on = 0, maxcpu = 32, nv_noadmit = 0;
+    // X16 lane (x16_init): MoE layers [0, x16_hi) put their CPU-lane picks on the bit-exact X16 path (RAM-resident
+    // picks of single-token calls only; NVMe picks stay on the GPU) at x16_cost % of the CPU cost per expert
+    int x16_hi = 0, x16_cost = 550;
 };
 
 struct Counters
@@ -288,6 +292,7 @@ struct Counters
         lane_zc{0}, lane_cpu{0}, lane_nvg{0}, lane_nvc{0}, reads{0}, read_bytes{0}, wb_landed{0}, wb_dup{0}, adm_freed{0},
         adm_pinned{0}, evictions{0}, cpu_jobs{0}, cpu_experts{0}, cpu_tokens{0}, stage_ram{0}, stage_nv{0},
         stage_reads{0}, read_err{0}, alloc_fail{0}, land_pushed{0}, prefetch{0}, dec_tok{0}, wb_issued{0}, wb_drop{0}, vring_hits{0}, notice_ns{0}, notice_max_ns{0}, serve_max_ns{0};
+    std::atomic<long long> x16_jobs{0}, x16_experts{0}, x16_gu_ns{0}, x16_wait_ns{0}, x16_down_ns{0};
     std::atomic<long long> lane_b70{0}, b70_jobs{0}, b70_rows{0}, b70_wait_ns{0}, b70_rtt_ns{0}, b70_err{0}, b70_rtt_max_ns{0};
     std::atomic<long long> reply_ns{0}, plan_ns{0}, ctl_busy_ns{0}, cpu_busy_ns{0}, cpu_wait_land_ns{0}, read_ms_x1000{0},
         stage_wait_ns{0}, stage_job_ns{0}, wb_bulk{0};
@@ -487,7 +492,7 @@ struct Engine
     std::vector<torch::Tensor> keep;
     int cpu_mode = -1;
     std::atomic<int64_t> cpu_job_seq{0};
-    struct CJob { int64_t seq; int li, ntok, np; int e[MAXP], t[MAXP], lane[MAXP]; float w[MAXP]; } cj;
+    struct CJob { int64_t seq; int li, ntok, np; int e[MAXP], t[MAXP], lane[MAXP], slot[MAXP]; float w[MAXP]; } cj;
     // N137 B70 expert tier: static resident key set on the B70 server, shared host ring (b70/ring.py layout)
     std::vector<int8_t> b70k; bool b70_on = false; uint8_t* b70r = nullptr; int64_t b70_seq = 0; int64_t b70_timeout_ns = 2000000000LL;
     std::vector<float> xf, tmpout;
@@ -951,7 +956,9 @@ struct Engine
         }
         if (lossy && tail_r > 0) lossy_tail_plan(r, p);
         else if (lossy) lossy_plan(r, p);
-        const bool cpu = dec && pol.cpu_on && cpu_ready && r.np <= MAXP && r.ntok <= MAXB;
+        const bool x16l = r.li < pol.x16_hi && x16_ready;   // X16 layer: bit-exact CPU lane, single-token calls only
+        const bool cpu = dec && pol.cpu_on && cpu_ready && r.np <= MAXP && r.ntok <= MAXB && !(x16l && r.ntok > 1);
+        const double cb = x16l ? pol.cb * pol.x16_cost / 100.0 : pol.cb;
         V.clear(); Rm.clear(); N.clear();
         int nnv = 0, nb70 = 0, nstg = 0;
         const bool b70 = dec && b70_on && cpu_ready && r.np <= MAXP && r.ntok <= MAXB;   // independent of the CPU lane switch
@@ -994,7 +1001,7 @@ struct Engine
         for (auto& k : Rm)
         {
             if (!dec) { p.lane[k.u] = LN_RAM; C.lane_zc++; continue; }
-            const double ce = c + pol.cb + pol.ctok * (k.cnt - 1);
+            const double ce = c + cb + pol.ctok * (k.cnt - 1);
             const double ge = g + pol.tzc;
             if (cpu && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_CPU; ncpu++; cur_ncr++; C.lane_cpu++; }
             // verify window: an expert only one of its tokens picked is read once either way; zero-copy it instead of
@@ -1012,7 +1019,7 @@ struct Engine
             const bool nzc = dec && pol.nv_noadmit && (r.ntok == 1 || k.cnt == 1);
             // GPU cost after landing: zero-copy in the MoE kernel (tnzc, NV_TNZC; < 0: legacy push + thit model)
             const double ge = (nzc && pol.tnzc >= 0) ? std::max(g, a) + pol.tnzc : std::max(g, a + pol.push) + pol.thit;
-            if (cpu && pol.nvcpu_on && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_NVC; ncpu++; cur_ncn++; C.lane_nvc++; }
+            if (cpu && pol.nvcpu_on && !x16l && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_NVC; ncpu++; cur_ncn++; C.lane_nvc++; }
             else if (nzc) { g = pol.tnzc >= 0 ? ge : std::max(g, a) + pol.tzc; p.lane[k.u] = LN_NZC; C.lane_nvg++; }
             else { g = ge; p.lane[k.u] = LN_NVG; C.lane_nvg++; }
         }
@@ -1086,7 +1093,7 @@ struct Engine
                 const int topk = r.np / std::max(1, r.ntok);
                 const int tt = i / std::max(1, topk);
                 cj.e[cj.np] = e; cj.t[cj.np] = tt; cj.w[cj.np] = r.pw[i] * ((p.rn_on && tt < MAXB) ? p.rn_sc[tt] : 1.0f);
-                cj.lane[cj.np] = ln; cj.np++;
+                cj.lane[cj.np] = ln; cj.slot[cj.np] = i % std::max(1, topk); cj.np++;
             }
             cpu_job_seq.store(s, std::memory_order_release);
         }
@@ -1156,8 +1163,130 @@ struct Engine
             __atomic_store_n(&hc[HC_CDONE], s, __ATOMIC_RELEASE);
         }
     }
+    // ---------------- X16 lane (bit-exact CPU experts, engine/x16.py) ----------------
+    // The CPU worker computes its picks' gate / up GEMVs with rect_x16 (bit-identical to the GPU kernel's) into x16_gg /
+    // x16_gu (fp16, row = the pick's slot in the token's selection) and publishes x16_fl[0] = seq; the GPU's x16_epa
+    // runs exllamav3's activation epilogue on them into x16_act and publishes x16_fl[1]; the CPU computes the down GEMVs
+    // into x16_d (fp32) and publishes x16_fl[2], which the GPU's x16_red waits for before its full token reduction.
+    bool x16_ready = false;
+    uint16_t* x16_gg = nullptr; uint16_t* x16_gu = nullptr; uint16_t* x16_act = nullptr; float* x16_d = nullptr;
+    volatile int64_t* x16_fl = nullptr;
+    std::vector<float> x16_xg, x16_xu, x16_eg, x16_eu, x16_wg, x16_wu, x16_xd, x16_ed, x16_wd;
+    struct X16Run { std::function<void(int)> f; int n = 0; std::atomic<int> next{0}; };
+    static void x16_tramp(void* c, int, int)
+    {
+        X16Run& R = *static_cast<X16Run*>(c);
+        for (int u; (u = R.next.fetch_add(1, std::memory_order_relaxed)) < R.n; ) R.f(u);
+    }
+    void x16_run(int n, std::function<void(int)> f)   // n work units over the CPU lane's pool
+    {
+        X16Run R; R.f = std::move(f); R.n = n;
+        pool.run(&x16_tramp, &R);
+    }
+    void run_x16_job()
+    {
+        const int li = cj.li, np = cj.np;
+        const int64_t seq = cj.seq;
+        Layer& Ly = layers[li];
+        std::vector<int> pinned, js;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            for (int k = 0; k < np; ++k)
+            {
+                if (cj.lane[k] != LN_CPU || cj.t[k] != 0) { hc[HC_ERR] = 35; continue; }
+                const int e = cj.e[k], key = li * E + e;
+                if (kst[key] != KS_RES || kvr[key] >= 0) { hc[HC_ERR] = 34; continue; }
+                const int s = slot_of[key];
+                if (std::find(pinned.begin(), pinned.end(), s) == pinned.end()) { pinc[s]++; pinned.push_back(s); }
+                const int64_t a = ram_addr[s];
+                Ly.ex[e].g.tr = reinterpret_cast<const uint8_t*>(a);
+                Ly.ex[e].u.tr = reinterpret_cast<const uint8_t*>(a + l_offu[li]);
+                Ly.ex[e].d.tr = reinterpret_cast<const uint8_t*>(a + l_offd[li]);
+                js.push_back(k);
+            }
+        }
+        const int nj = int(js.size());
+        const Expert& E0 = Ly.ex[0];
+        const int Hi = E0.g.k, I = E0.g.n, Ho = E0.d.n, WK = n135::X16_WKK;
+        const double t0 = now_ms();
+        xf.assign(Hi, 0.0f);   // the MoE input row, zero-padded to the experts' input width as the kernel does
+        for (int i = 0; i < std::min(H, Hi); ++i) xf[i] = h2f(hx[i]);
+        // work units: (pick, matrix, warp range w, 16-tile column group c); each unit's folds go straight into the warp's
+        // running sum (rect_x16), the X16_WKK warp sums of a column are added in order afterwards (x16_reduce)
+        constexpr int CG = 16;
+        const int Cn = I / 16, ncg = (Cn + CG - 1) / CG, kpw = Hi / 16 / WK;
+        auto grow = [](std::vector<float>& v, size_t n) { if (v.size() < n) v.resize(n); };
+        grow(x16_xg, size_t(nj) * Hi); grow(x16_xu, size_t(nj) * Hi); grow(x16_eg, size_t(nj) * Hi); grow(x16_eu, size_t(nj) * Hi);
+        grow(x16_wg, size_t(nj) * WK * Cn * 32); grow(x16_wu, size_t(nj) * WK * Cn * 32);
+        x16_run(2 * nj, [&](int u) {   // the GPU kernel's input rotation (x * suh, Hadamard, fp16): prep_block_v, bit for bit
+            const int j = u >> 1, which = u & 1;
+            const Expert& Ex = Ly.ex[cj.e[js[j]]];
+            const Mat& M = which ? Ex.u : Ex.g;
+            float* xr = (which ? x16_xu : x16_xg).data() + size_t(j) * Hi;
+            float* er = (which ? x16_eu : x16_eg).data() + size_t(j) * Hi;
+            for (int b = 0; b < Hi / 128; ++b) n135::prep_block_v(xf.data() + b * 128, M.suh + b * 128, xr + b * 128);
+            for (int i = 0; i < Hi; ++i) er[i] = n135::x16_exp(xr[i]);
+        });
+        x16_run(nj * 2 * WK * ncg, [&](int u) {
+            const int c = u % ncg, w = (u / ncg) % WK, which = (u / (ncg * WK)) & 1, j = u / (ncg * WK * 2);
+            const Expert& Ex = Ly.ex[cj.e[js[j]]];
+            const Mat& M = which ? Ex.u : Ex.g;
+            float* ws = (which ? x16_wu : x16_wg).data() + (size_t(j) * WK + w) * Cn * 32 + size_t(c) * CG * 32;
+            n135::rect_x16(M, w * kpw, kpw, c * CG, std::min(CG, Cn - c * CG), (which ? x16_xu : x16_xg).data() + size_t(j) * Hi,
+                           (which ? x16_eu : x16_eg).data() + size_t(j) * Hi, ws);
+        });
+        x16_run(2 * nj * ncg, [&](int u) {   // fp16 rows, as the kernel stores its gate / up outputs
+            const int c = u % ncg, which = (u / ncg) & 1, j = u / (ncg * 2);
+            std::vector<float> y(I);
+            const int ta = c * CG, tz = std::min(Cn, (c + 1) * CG);
+            n135::x16_reduce((which ? x16_wu : x16_wg).data() + size_t(j) * WK * Cn * 32, Cn, ta, tz, y.data());
+            uint16_t* dst = (which ? x16_gu : x16_gg) + size_t(cj.slot[js[j]]) * I;
+            for (int i = ta * 16; i < tz * 16; ++i) dst[i] = f2h(y[i]);
+        });
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        __atomic_store_n(&x16_fl[0], seq, __ATOMIC_RELEASE);
+        C.x16_gu_ns += (long long) ((now_ms() - t0) * 1e6);
+        {   // the GPU's activation epilogue (x16_epa) -> fp16 down inputs in x16_act
+            const double tw = now_ms(); long n = 0;
+            while (__atomic_load_n(&x16_fl[1], __ATOMIC_ACQUIRE) < seq)
+            {
+                _mm_pause();
+                if ((++n & 4095) == 0 && now_ms() - tw > 10000.0) { hc[HC_ERR] = 36; break; }
+            }
+            C.x16_wait_ns += (long long) ((now_ms() - tw) * 1e6);
+        }
+        const double td = now_ms();
+        const int Cd = Ho / 16, ncd = (Cd + CG - 1) / CG, kpd = I / 16 / WK;
+        grow(x16_xd, size_t(nj) * I); grow(x16_ed, size_t(nj) * I); grow(x16_wd, size_t(nj) * WK * Cd * 32);
+        for (int j = 0; j < nj; ++j)
+        {
+            const uint16_t* a = x16_act + size_t(cj.slot[js[j]]) * I;
+            for (int i = 0; i < I; ++i) { const float v = h2f(a[i]); x16_xd[size_t(j) * I + i] = v; x16_ed[size_t(j) * I + i] = n135::x16_exp(v); }
+        }
+        x16_run(nj * WK * ncd, [&](int u) {
+            const int c = u % ncd, w = (u / ncd) % WK, j = u / (ncd * WK);
+            float* ws = x16_wd.data() + (size_t(j) * WK + w) * Cd * 32 + size_t(c) * CG * 32;
+            n135::rect_x16(Ly.ex[cj.e[js[j]]].d, w * kpd, kpd, c * CG, std::min(CG, Cd - c * CG), x16_xd.data() + size_t(j) * I,
+                           x16_ed.data() + size_t(j) * I, ws);
+        });
+        x16_run(nj * ncd, [&](int u) {   // fp32 rows, as the kernel stores its down outputs
+            const int c = u % ncd, j = u / ncd;
+            n135::x16_reduce(x16_wd.data() + size_t(j) * WK * Cd * 32, Cd, c * CG, std::min(Cd, (c + 1) * CG),
+                             x16_d + size_t(cj.slot[js[j]]) * Ho);
+        });
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        __atomic_store_n(&x16_fl[2], seq, __ATOMIC_RELEASE);
+        C.x16_down_ns += (long long) ((now_ms() - td) * 1e6);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            for (int s : pinned) pinc[s]--;
+        }
+        C.x16_jobs++; C.x16_experts += nj; C.cpu_jobs++; C.cpu_experts += nj; C.cpu_tokens += 1;
+    }
+
     void run_cpu_job()
     {
+        if (cj.li < pol.x16_hi && x16_ready) { run_x16_job(); return; }
         // RAM-resident picks first (computed while the NVMe->CPU picks are still landing), then the NVMe ones
         const int ntok = cj.ntok, np = cj.np, li = cj.li;
         Layer& Ly = layers[li];
@@ -1792,7 +1921,8 @@ std::vector<int64_t> counters()
         c.lane_b70, c.b70_jobs, c.b70_rows, c.b70_wait_ns, c.b70_rtt_ns, c.b70_err, c.b70_rtt_max_ns, c.pf_keys, c.pf_skip, c.pf_used, c.pf_wasted, c.lane_skip, c.lossy_calls, c.lossy_tok, c.lossy_tok_skip,
         c.lossy_cold_x1e6, c.lossy_skip_x1e6, c.lossy_coldu, c.lossy_want, c.lossy_bg_reads, c.promoted,
         c.stg_issued, c.stg_ready, c.stg_hit, c.stg_late, c.stg_nofree, c.stg_dup, c.stg_waste, c.wb_early,
-        c.partial_lands, c.partial_binds, c.wb_lat_us, c.wb_lat_max_us, c.ring_low, c.ring_low_vfree, c.ring_borrowed };
+        c.partial_lands, c.partial_binds, c.wb_lat_us, c.wb_lat_max_us, c.ring_low, c.ring_low_vfree, c.ring_borrowed,
+        c.x16_jobs, c.x16_experts, c.x16_gu_ns, c.x16_wait_ns, c.x16_down_ns };
     std::lock_guard<std::mutex> lk(e.mu);
     int res = 0, inf = 0; for (int k = 0; k < e.K; ++k) { res += e.kst[k] == KS_RES; inf += e.kst[k] == KS_INFLIGHT; }
     v.push_back(res); v.push_back(inf); v.push_back((int64_t) e.nfree()); v.push_back(e.land_tail - e.hc[HC_WBN]);
@@ -1907,6 +2037,59 @@ at::Tensor cpu_forward(int64_t li, at::Tensor x, at::Tensor sel, at::Tensor w, i
     cpu_moe_forward(e.pool, Ly, x.data_ptr<float>(), m, route, out.data_ptr<float>(), md);
     std::lock_guard<std::mutex> lk(e.mu);
     for (int s : pinned) e.pinc[s]--;
+    return out;
+}
+
+// ---- X16 lane (engine/x16.py) ----
+// Host-mapped buffers allocated by nv2.py: gate / up rows [topk][I] fp16, activation rows [topk][I] fp16 (written by the
+// GPU's x16_epa), down rows [topk][H] fp32, flags int64[3]. Layers [0, hi) use the lane if every one of their expert
+// matrices is X16-computable; returns how many leading layers are (0 = the lane stays off).
+int64_t x16_init(int64_t gg, int64_t gu, int64_t act, int64_t d, int64_t flags, int64_t hi, int64_t cost)
+{
+    Engine& e = *G;
+    cpu_kern_init();
+    int ok = 0;
+    for (int li = 0; li < std::min<int>(int(hi), int(e.layers.size())); ++li)
+    {
+        bool good = !e.layers[li].ex.empty();
+        for (auto& x : e.layers[li].ex) good = good && n135::x16_mat_ok(x.g) && n135::x16_mat_ok(x.u) && n135::x16_mat_ok(x.d);
+        if (!good) break;
+        ok = li + 1;
+    }
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.x16_gg = (uint16_t*) gg; e.x16_gu = (uint16_t*) gu; e.x16_act = (uint16_t*) act; e.x16_d = (float*) d;
+    e.x16_fl = (volatile int64_t*) flags;
+    e.pol.x16_hi = ok; e.pol.x16_cost = int(cost);
+    e.x16_ready = ok > 0 && gg && gu && act && d && flags;
+    return e.x16_ready ? ok : 0;
+}
+
+// X16 self-test: one GEMV of a RAM-resident expert (which 0 gate, 1 up, 2 down) on the CPU; prep = 1 first applies the
+// GPU kernel's input rotation (x * suh, Hadamard, fp16) as for gate / up
+at::Tensor x16_gemv(int64_t li, int64_t ex, int64_t which, at::Tensor x, int64_t prep)
+{
+    Engine& e = *G;
+    cpu_kern_init();
+    Layer& Ly = e.layers[li];
+    int s;
+    {
+        std::lock_guard<std::mutex> lk(e.mu);
+        const int key = int(li) * e.E + int(ex);
+        TORCH_CHECK(e.kst[key] == KS_RES, "x16_gemv: expert not RAM-resident");
+        s = e.slot_of[key]; e.pinc[s]++;
+        const int64_t a = e.ram_addr[s];
+        Ly.ex[ex].g.tr = (const uint8_t*) a; Ly.ex[ex].u.tr = (const uint8_t*) (a + e.l_offu[li]); Ly.ex[ex].d.tr = (const uint8_t*) (a + e.l_offd[li]);
+    }
+    const Mat& M = which == 0 ? Ly.ex[ex].g : which == 1 ? Ly.ex[ex].u : Ly.ex[ex].d;
+    auto xc = x.contiguous().to(torch::kFloat);
+    std::vector<float> xr(M.k);
+    const float* xp = xc.data_ptr<float>();
+    if (prep) for (int b = 0; b < M.k / 128; ++b) n135::prep_block_v(xp + b * 128, M.suh + b * 128, xr.data() + b * 128);
+    else std::memcpy(xr.data(), xp, size_t(M.k) * 4);
+    auto out = torch::zeros({ M.n }, torch::kFloat);
+    n135::x16_gemv(M, xr.data(), out.data_ptr<float>());
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.pinc[s]--;
     return out;
 }
 
@@ -2043,6 +2226,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cpu_start", &cpu_start);
     m.def("cpu_set", &cpu_set);
     m.def("cpu_forward", &cpu_forward, py::call_guard<py::gil_scoped_release>());
+    m.def("x16_init", &x16_init);
+    m.def("x16_gemv", &x16_gemv, py::call_guard<py::gil_scoped_release>());
     m.def("b70_attach", &b70_attach, py::call_guard<py::gil_scoped_release>());
     m.def("b70_set", &b70_set);
     m.def("b70_test_engine", &b70_test_engine);
