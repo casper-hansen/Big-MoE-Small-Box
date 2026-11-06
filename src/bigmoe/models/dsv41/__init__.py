@@ -55,7 +55,7 @@ class DSV41Options:
     verify_weights: bool = True
     prefix_cache_gb: float = 0.5   # exllamav3's SWA-layer state checkpoints in host RAM (-rcs, GiB)
     # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
-    # 64k-token GPU cache evicts (one long conversation evicts every other) are restored from it instead of prefilled
+    # GPU cache evicts (one long conversation evicts every other) are restored from it instead of prefilled
     # again. disk_cache: a directory for exllamav3's persistent third tier behind it (pages and checkpoints survive
     # restarts); written only when pages leave the GPU or the server goes idle. A restore from disk goes through the
     # RAM tier, so with disk_cache cpu_cache_gb defaults (None) to the whole context (models/prefix_cache.py).
@@ -104,7 +104,9 @@ class DSV41(ModelBackend):
     repos = (REPO,)
     aliases = {"deepseek-v4.1-flash": (REPO, DEFAULT_VARIANT), "dsv41": (REPO, DEFAULT_VARIANT)}
     Options = DSV41Options
-    default_context = 65536
+    # 128k: agent sessions grow past 64k; the model's own window is 1M (YaRN). The FP16 KV cache costs 3.2 KB per token
+    # (420 MB at 128k); measured against 64k: the same 864 VRAM expert slots, bigmoe verify within a few percent
+    default_context = 131072
     default_port = 30000
     default_served_name = "deepseek-v4.1-flash"
 

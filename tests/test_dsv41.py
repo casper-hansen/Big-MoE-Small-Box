@@ -48,7 +48,7 @@ def test_launch_exact(tmp_path, monkeypatch):
     assert e["BIGMOE_ENGINE_PREFIX"] == "DSV41_"
     assert {e["BIGMOE_EC_BUILD"], e["BIGMOE_NV2_BUILD"]} == {"/k/bigmoe_ec-key", "/k/bigmoe_nv2-key"}
     assert spec.argv[:3] == ["/envs/dsv41/bin/python", "-m", "bigmoe.models.dsv41.engine.server"]
-    assert spec.argv[spec.argv.index("-chunk_size") + 1] == "8192" and spec.argv[spec.argv.index("-cs") + 1] == "65536"
+    assert spec.argv[spec.argv.index("-chunk_size") + 1] == "8192" and spec.argv[spec.argv.index("-cs") + 1] == "131072"
     assert "-ccs" in spec.argv and spec.memory_gb == 56.0
 
 
@@ -59,8 +59,8 @@ def test_prefix_cache_tiers(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch, prefix_cache_gb=1, cpu_cache_gb=1, disk_cache="~/pc")
     assert (arg(spec, "-ccs"), arg(spec, "-rcs")) == ("1", "1")
     assert arg(spec, "-dcd") == str(Path("~/pc").expanduser())
-    _, spec = spec_for(tmp_path, monkeypatch, disk_cache="/x")   # RAM tier sized for the 64k context: 0.22 -> 0.25
-    assert arg(spec, "-ccs") == "0.25"
+    _, spec = spec_for(tmp_path, monkeypatch, disk_cache="/x")   # RAM tier sized for the 128k context: 0.43 -> 0.5
+    assert arg(spec, "-ccs") == "0.5"
     with pytest.raises(ValueError):   # the disk tier sits behind the CPU tier
         spec_for(tmp_path, monkeypatch, cpu_cache_gb=0, disk_cache="/x")
 

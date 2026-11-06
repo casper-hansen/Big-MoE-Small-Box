@@ -56,17 +56,17 @@ exllamav3's fused hyper-connection sites (`EXL3_HC_FOLD=1`) replace the custom d
 
 ## DeepSeek-V4.1-Flash
 
-`bigmoe bench` prompts, greedy, 64k context, FP16 KV cache, DSpark speculative decoding (`bigmoe verify`, 2026-11-06). KL and top-1: mean per-token KL divergence from exact single-token decode (`nvme-exact`, no speculation) and the share of positions with the same most likely token, on the same forced tokens, six chat prompts, 1,110 positions; with DSpark even `nvme-exact` differs slightly, because the verify forwards round in other GEMM shapes.
+`bigmoe bench` prompts, greedy, 128k context, FP16 KV cache, DSpark speculative decoding (`bigmoe verify`, 2026-11-06). KL and top-1: mean per-token KL divergence from exact single-token decode (`nvme-exact`, no speculation) and the share of positions with the same most likely token, on the same forced tokens, six chat prompts, 1,110 positions; with DSpark even `nvme-exact` differs slightly, because the verify forwards round in other GEMM shapes.
 
 | mode | prompt tokens | prefill | decode | KL | top-1 |
 |---|---|---|---|---|---|
-| `nvme` | 1,024 | 178 tok/s | 17.0 tok/s | 0.0011 | 99.6 % |
-| `nvme` | 8,192 | 698 tok/s | 18.9 tok/s | 0.0011 | 99.6 % |
-| `nvme` | 32,768 | 745 tok/s | 18.4 tok/s | 0.0011 | 99.6 % |
-| `nvme-exact` | 1,024 | 35 tok/s | 11.0 tok/s | 0.0007 | 99.7 % |
-| `nvme-exact` | 8,192 | 267 tok/s | 12.5 tok/s | 0.0007 | 99.7 % |
+| `nvme` | 1,024 | 174 tok/s | 17.5 tok/s | 0.0011 | 99.6 % |
+| `nvme` | 8,192 | 680 tok/s | 20.2 tok/s | 0.0011 | 99.6 % |
+| `nvme` | 32,768 | 725 tok/s | 19.0 tok/s | 0.0011 | 99.6 % |
+| `nvme-exact` | 1,024 | 33 tok/s | 10.6 tok/s | 0.0007 | 99.7 % |
+| `nvme-exact` | 8,192 | 248 tok/s | 11.8 tok/s | 0.0007 | 99.7 % |
 
-Mode `nvme` prefills with warm prefill (teacher-forced against exact prefill: top-1 99.2 %, mean KL 0.023); `nvme-exact` answers are identical to the runs before it. `bigmoe bench`, prefill on a cached 8,192-token prefix, time to first token by new tokens, mode `nvme` with exact prefill (before warm prefill and the last-page split: 400, 2,000 and 5,000 new tokens took two forwards) and now:
+A 120,000-token prompt prefills at 657 tok/s (183 s) and decodes at 18.5 tok/s; with `-o chunk_size=10240` (fewer, larger forwards; fits in VRAM at 128k) at 815 tok/s (147 s). Mode `nvme` prefills with warm prefill (teacher-forced against exact prefill: top-1 99.2 %, mean KL 0.023); `nvme-exact` answers are identical to the runs before it. `bigmoe bench`, prefill on a cached 8,192-token prefix, time to first token by new tokens, mode `nvme` with exact prefill (before warm prefill and the last-page split: 400, 2,000 and 5,000 new tokens took two forwards) and now:
 
 | new tokens | 8 | 80 | 120 | 400 | 800 | 2,000 | 5,000 | 10,000 |
 |---|---|---|---|---|---|---|---|---|
