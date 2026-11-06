@@ -16,6 +16,7 @@ from ...kernels import is_built
 from ...launcher import LaunchSpec
 from ...registry import ModelBackend, register_backend
 from ...steps import Step
+from ..prefix_cache import cpu_tier_gb
 from ..runtime import DESCRIPTION as RUNTIME, runtime_spec
 from ...store import ExpertStore, compare, pack, punch_experts
 from ...store.slim import expert_ranges
@@ -43,6 +44,7 @@ TUNED_PLANNER = "0.17,0.023,0.38,0.145,0.40,0.10,0.40,0.25,1.45,0.75"
 TUNED_PLANNER_VBMI = "0.17,0.023,0.38,0.145,0.29,0.10,0.40,0.25,1.45,0.75"
 VBMI_FLAGS = {"avx512f", "avx512bw", "avx512vl", "avx512vbmi", "avx512_vnni"}
 MODES = ("nvme", "nvme-exact")
+KV_BYTES_PER_TOKEN = 17609   # measured: a 4,507,871-byte disk page image, 256 tokens (FP16 KV)
 # speculation: "ngram" drafts tokens from the context (prompt lookup) and verifies them with the target model (see README).
 SPECULATION = ("none", "ngram")
 
@@ -66,9 +68,10 @@ class GLM53Options:
     prefix_cache_gb: float = 1.0
     # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
     # GPU cache evicts are restored from it instead of prefilled again. disk_cache: a directory for exllamav3's
-    # persistent third tier behind it (pages and checkpoints survive restarts; needs cpu_cache_gb > 0); written only
-    # when pages leave the GPU or the server goes idle.
-    cpu_cache_gb: float = 0.0
+    # persistent third tier behind it (pages and checkpoints survive restarts); written only when pages leave the GPU
+    # or the server goes idle. A restore from disk goes through the RAM tier, so with disk_cache cpu_cache_gb defaults
+    # (None) to the whole context: ~2.5 GiB at 128k (models/prefix_cache.py).
+    cpu_cache_gb: float = None
     disk_cache: str = None
     # mode nvme: the first x16_layers MoE layers keep the CPU lane on its bit-exact X16 path (engine/x16.py); 0 = off.
     # 21 (measured 2026-11-05): forced-token top-1 agreement with exact decode 99.0 % (mean KL 0.0013) instead of 97.2 %
@@ -93,9 +96,9 @@ class GLM53Options:
         engine.check_x16_layers(self.x16_layers)
         if not 0.25 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0.25..64, got {self.prefix_cache_gb!r}")
-        if not 0.0 <= float(self.cpu_cache_gb) <= 64:
+        if self.cpu_cache_gb is not None and not 0.0 <= float(self.cpu_cache_gb) <= 64:
             raise ValueError(f"cpu_cache_gb must be 0..64, got {self.cpu_cache_gb!r}")
-        if self.disk_cache and not float(self.cpu_cache_gb) > 0:
+        if self.disk_cache and self.cpu_cache_gb is not None and not float(self.cpu_cache_gb) > 0:
             raise ValueError("disk_cache needs cpu_cache_gb > 0 (exllamav3's disk tier sits behind the CPU tier)")
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
             raise ValueError("cpus must be 'auto', a CpuLayout or a dict(main=, controller=, lane=, readers=)")
@@ -318,8 +321,9 @@ class GLM53(ModelBackend):
         argv = [str(box.runtime.python), "-m", "bigmoe.models.glm53.engine.server", "-m", str(self.model_dir(box)),
                 "-cs", str(box.context), "--max-batch-size", str(o.max_batch_size), "-chunk_size", str(o.chunk_size),
                 *mode_args, *small]
-        if o.cpu_cache_gb:
-            argv += ["-ccs", f"{float(o.cpu_cache_gb):g}"]
+        ccs = cpu_tier_gb(o.cpu_cache_gb, o.disk_cache, box.context, KV_BYTES_PER_TOKEN)
+        if ccs:
+            argv += ["-ccs", f"{ccs:g}"]
         if o.disk_cache:
             argv += ["-dcd", str(Path(o.disk_cache).expanduser())]
         if o.cache_quant:

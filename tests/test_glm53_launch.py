@@ -111,8 +111,10 @@ def test_prefix_cache_tiers(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch, "nvme", cpu_cache_gb=1, disk_cache="~/pc")
     assert spec.argv[spec.argv.index("-ccs") + 1] == "1"
     assert spec.argv[spec.argv.index("-dcd") + 1] == str(Path("~/pc").expanduser())
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", disk_cache="/x")   # sized for the 128k context: 2.36 -> 2.5
+    assert spec.argv[spec.argv.index("-ccs") + 1] == "2.5"
     with pytest.raises(ValueError):   # the disk tier sits behind the CPU tier
-        spec_for(tmp_path, monkeypatch, "nvme", disk_cache="/x")
+        spec_for(tmp_path, monkeypatch, "nvme", cpu_cache_gb=0, disk_cache="/x")
 
 
 def test_x16_layers(tmp_path, monkeypatch):
