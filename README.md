@@ -66,7 +66,7 @@ exllamav3's fused hyper-connection sites (`EXL3_HC_FOLD=1`) replace the custom d
 | `nvme-exact` | 1,024 | 33 tok/s | 10.6 tok/s | 0.0007 | 99.7 % |
 | `nvme-exact` | 8,192 | 248 tok/s | 11.8 tok/s | 0.0007 | 99.7 % |
 
-A 120,000-token prompt prefills at 657 tok/s (183 s) and decodes at 18.5 tok/s; with `-o chunk_size=10240` (fewer, larger forwards; fits in VRAM at 128k) at 815 tok/s (147 s). Mode `nvme` prefills with warm prefill (teacher-forced against exact prefill: top-1 99.2 %, mean KL 0.023); `nvme-exact` answers are identical to the runs before it. `bigmoe bench`, prefill on a cached 8,192-token prefix, time to first token by new tokens, mode `nvme` with exact prefill (before warm prefill and the last-page split: 400, 2,000 and 5,000 new tokens took two forwards) and now:
+A 120,000-token prompt prefills at 657 tok/s (183 s) and decodes at 18.5 tok/s. Larger chunks prefill long prompts faster (`-o chunk_size=10240`: 815 tok/s) but leave too little VRAM at 128k: a ~125k-token re-prefill peaks 300 MiB below the card's limit (8192: 900 MiB), and a long agent session ran out of GPU memory with them; `/stats` reports GPU memory (`gpu`). Mode `nvme` prefills with warm prefill (teacher-forced against exact prefill: top-1 99.2 %, mean KL 0.023); `nvme-exact` answers are identical to the runs before it. `bigmoe bench`, prefill on a cached 8,192-token prefix, time to first token by new tokens, mode `nvme` with exact prefill (before warm prefill and the last-page split: 400, 2,000 and 5,000 new tokens took two forwards) and now:
 
 | new tokens | 8 | 80 | 120 | 400 | 800 | 2,000 | 5,000 | 10,000 |
 |---|---|---|---|---|---|---|---|---|

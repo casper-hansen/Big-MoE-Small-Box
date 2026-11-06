@@ -526,6 +526,7 @@ async def server_info():
 async def stats():
     st = dict(G["stats"])
     st["recurrent_cache"] = serving.recurrent_cache_stats(G["gen"])
+    st["gpu"] = serving.gpu_memory_stats()
     if os.environ.get("GLM53_NV") == "2":
         from bigmoe.engine import tiers as engine
         st["expert_cache"] = engine.POOLS[0].summary() if engine.POOLS else None

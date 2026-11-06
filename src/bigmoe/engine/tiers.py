@@ -563,7 +563,15 @@ def _hook_prefill(cls):
             for p in POOLS:
                 if p.elastic and p.stage_n and not p.in_prefill and n * p.topk >= p.stage_min:
                     p._elastic_enter(n)
-            return _orig(self, input_ids, params)
+            try:
+                return _orig(self, input_ids, params)
+            except BaseException:
+                # a failed forward (e.g. CUDA out of memory) ends the prefill: free the staging buffers and take the
+                # flex chunks back now instead of holding them until the next request's first small forward
+                for p in POOLS:
+                    if p.in_prefill:
+                        p._elastic_exit()
+                raise
         setattr(cls, name, wrapped)
     cls._bigmoe_prefill_hooked = True
 

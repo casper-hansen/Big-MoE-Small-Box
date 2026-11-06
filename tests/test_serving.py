@@ -154,3 +154,13 @@ def test_prefix_cache_tiers():
                                                 "disk_cache_size": 50 * 1024 ** 3, "disk_cache_write_interval": 0.0}
     Args.cpu_cache_size, Args.disk_cache_dir = None, None   # exllamav3's -ccs default when the option is not passed
     assert serving.prefix_cache_tiers(Args)["cpu_cache_size"] == 0
+
+
+def test_gpu_memory_stats():
+    torch = pytest.importorskip("torch")
+    s = serving.gpu_memory_stats()
+    if not torch.cuda.is_available():
+        assert s is None
+    else:
+        assert set(s) == {"allocated_mib", "reserved_mib", "peak_allocated_mib", "free_mib", "total_mib"}
+        assert 0 <= s["free_mib"] <= s["total_mib"]

@@ -184,6 +184,18 @@ def recurrent_cache_stats(gen) -> dict | None:
             "bytes_per_checkpoint": int(rc.current_size / n) if n else None, **dict(getattr(rc, "metrics", {}))}
 
 
+def gpu_memory_stats() -> dict | None:
+    """GPU memory in MiB as torch sees it: held by live tensors, reserved by its caching allocator, the peak since the
+    start, and what the device has free in total (torch imported here: this module stays stdlib-only at import)."""
+    import torch
+    if not torch.cuda.is_available():
+        return None
+    free, total = torch.cuda.mem_get_info()
+    mib = lambda b: round(b / 2 ** 20)
+    return {"allocated_mib": mib(torch.cuda.memory_allocated()), "reserved_mib": mib(torch.cuda.memory_reserved()),
+            "peak_allocated_mib": mib(torch.cuda.max_memory_allocated()), "free_mib": mib(free), "total_mib": mib(total)}
+
+
 def install(app, get_gen, name: str = "server", exit_on_dead: bool = True):
     """Error handlers, a liveness-aware /health and the dead-generator exit for a FastAPI app. get_gen() returns the
     AsyncGenerator (None until startup). Registers GET /health: define no other /health route. exit_on_dead=False
