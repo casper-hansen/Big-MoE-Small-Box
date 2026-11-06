@@ -12,7 +12,8 @@ are rescaled to their original sum. Decode is unchanged.
 Against exact prefill: DeepSeek-V4.1-Flash on five steps of a DeepSeek Harness agent turn (14k to 36k tokens, decode
 exact) prefills in 77.5 s instead of 116.9 s with top-1 agreement 99.7 % and mean KL 0.0021 on 330 forced answer
 positions; teacher-forced (prompt and answer through warm prefill) DeepSeek keeps 100 % top-1 (mean KL 0.023) and
-GLM-5.3-Flash 94.5 % (0.042). It is part of mode nvme (created with the CPU lane); mode nvme-exact prefills exactly.
+GLM-5.3-Flash 94.5 % (0.042). Mode nvme only, as the backends' warm_prefill option (DeepSeek: on by default,
+GLM: off); mode nvme-exact prefills exactly.
 """
 import concurrent.futures as cf
 import time

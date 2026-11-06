@@ -74,6 +74,10 @@ class GLM53Options:
     # 21 (measured 2026-11-05): forced-token top-1 agreement with exact decode 99.0 % (mean KL 0.0013) instead of 97.2 %
     # (0.012), decode -12 % (bigmoe verify: 9.7-10.3 tok/s instead of 11.2-11.5)
     x16_layers: int = 0
+    # mode nvme: warm prefill (engine/warm_prefill.py), staged prefill on the VRAM / RAM experts plus each layer's 64
+    # heaviest NVMe-only ones. Off for GLM: its answers react more to approximate prefill (teacher-forced top-1 94.5 %
+    # against exact prefill, DeepSeek 100 %); on, a cached-prefix step with 120-2000 new tokens takes ~5-7 s instead of ~9
+    warm_prefill: bool = False
 
     def validate(self):
         if self.mode not in MODES:
@@ -282,6 +286,7 @@ class GLM53(ModelBackend):
                        GLM53_NV_PREFETCH="1", GLM53_MAX_RQ_TOKENS="4096", GLM53_NV_CPU_KERN="1",
                        GLM53_NV_PUBFAST="1", GLM53_NV_PFSIDE="1", GLM53_NV_POL=self.planner(o))
             env.update(engine.x16_env("GLM53_", o.x16_layers))
+            env["GLM53_EC_WARM_PREFILL"] = "1" if o.warm_prefill else "0"
         env["GLM53_EC_STAGE_MIN"] = "512"
         env["GLM53_NV_STORE"] = str(store.bin)
         for var in ("GLM53_K_FTSPLIT", "GLM53_K_OVL"):

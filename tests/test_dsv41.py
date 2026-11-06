@@ -142,3 +142,12 @@ def test_store_v2_mixed_sizes(odirect_dir, tmp_path):
     assert L0["off_u"] == 1024 and L0["off_d"] == 2048 and L1["base"] == 3 * L0["rec_bytes"]
     assert V2.verify(odirect_dir, "s", log=lambda m: None) == []
     assert V2.compare(md, odirect_dir, "s", sample=6, log=lambda m: None) == []
+
+
+def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
+    _, spec = spec_for(tmp_path, monkeypatch)
+    assert spec.env["DSV41_EC_WARM_PREFILL"] == "1"
+    _, spec = spec_for(tmp_path, monkeypatch, warm_prefill=False)
+    assert spec.env["DSV41_EC_WARM_PREFILL"] == "0"
+    _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
+    assert "DSV41_EC_WARM_PREFILL" not in spec.env

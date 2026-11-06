@@ -67,6 +67,9 @@ class DSV41Options:
     # mode nvme: the first x16_layers MoE layers keep the CPU lane on its bit-exact X16 path (engine/x16.py); 0 = off.
     # Only single-token forwards use it (with DSpark on, verify forwards of those layers run their experts on the GPU)
     x16_layers: int = 0
+    # mode nvme: warm prefill (engine/warm_prefill.py), staged prefill on the VRAM / RAM experts plus each layer's 64
+    # heaviest NVMe-only ones; measured top-1 99.7 % against exact prefill on an agent turn, one-forward step 15 -> 9 s
+    warm_prefill: bool = True
 
     def validate(self):
         if self.mode not in MODES:
@@ -261,6 +264,7 @@ class DSV41(ModelBackend):
                    DSV41_NV_READER_CPUS=format_cpus(lay.readers))
         if env["DSV41_NV_CPU"] == "1":
             env["DSV41_NV_CPU_CPUS"] = format_cpus(lay.lane)
+            env["DSV41_EC_WARM_PREFILL"] = "1" if o.warm_prefill else "0"
             env.update(engine.x16_env("DSV41_", o.x16_layers))
         for spec in self.kernel_specs(box):
             env[spec.env_var] = str(box.runtime.kernel_dirs([spec], box.arch)[spec.name])

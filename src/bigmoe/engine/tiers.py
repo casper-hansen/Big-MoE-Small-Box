@@ -7,13 +7,14 @@
            record image), so per-layer kernel calls pass geom(li). Prefill chunks stage every non-VRAM expert of the
            next layer into two VRAM buffers on a copy stream; in elastic mode those buffers (and the activations) come
            from the last chunks of the cache, which are handed back to torch for the prefill and reclaimed for decode.
-           In mode nvme a staged forward stages the warm experts plus each layer's heaviest cold ones (warm_prefill.py).
+           In mode nvme with EC_WARM_PREFILL=1 a staged forward stages the warm experts plus each layer's heaviest
+           cold ones (warm_prefill.py; the backends' warm_prefill option).
   attach   pool + nv2 + routing / combine hooks + bounce proxies for exllamav3's per-expert paths
 
 Knobs (<prefix>NAME, see env.py): NV_STORE (store .bin), EC_RESERVE_GB (VRAM left to torch, 2.5), EC_MAX_SLOTS,
 EC_ADMIT_MAX (64), EC_CHUNK_SLOTS (32), EC_STAGE_SLOTS / EC_STAGE_GB (staging buffer size; 0 = no staged prefill),
 EC_STAGE_MIN (picks per layer call that stage, 8192), EC_ELASTIC_GB (0 = off), EC_ELASTIC_DYN (1),
-EC_ACT_MB_PER_TOK (0.6), EC_COPY_GRID, EC_WARM (JSON {layer key: [score x E]}).
+EC_ACT_MB_PER_TOK (0.6), EC_COPY_GRID, EC_WARM (JSON {layer key: [score x E]}), EC_WARM_PREFILL (0; mode nvme only).
 """
 import ctypes
 import json
@@ -593,7 +594,7 @@ def attach(model):
     # mode nvme (approximate, with the CPU lane) also prefills approximately: warm prefill and the last-page split (which
     # changes how the recurrent state's prefill is chunked, so its rounding); mode nvme-exact keeps exllamav3's prefill
     approx_prefill = bool(p.stage_n) and env("NV_CPU", "0") == "1"
-    if approx_prefill:
+    if approx_prefill and env("EC_WARM_PREFILL", "0") == "1":   # the backend's warm_prefill option
         # created before nv2 sizes the RAM tier from the cgroup's free memory, which then excludes its pinned slots
         from .warm_prefill import WarmPrefill
         p.warm_prefill = WarmPrefill(p)

@@ -11,7 +11,7 @@ PATHS = ("GLM53_EC_WARM", "GLM53_ZC_STATS", "GLM53_NV_STORE")
 # deliberate changes since the reference runs: the planner's NVMe arrival model (nvlat, nvdeep; see TUNED_PLANNER), and
 # the exllamav3 1.5.1 runtime's own modules are gone with it (fused hyper-connection kernels, decode lookahead, Triton
 # pin, prompt / tail checkpoint patch): exllamav3's fused sites (EXL3_HC_FOLD) and the engine's prefill replace them
-CHANGED = {"nvme": {"GLM53_NV_POL": glm53.TUNED_PLANNER}, "nvme-exact": {}}
+CHANGED = {"nvme": {"GLM53_NV_POL": glm53.TUNED_PLANNER, "GLM53_EC_WARM_PREFILL": "0"}, "nvme-exact": {}}
 REMOVED = {"GLM53_K_HCFUSE", "GLM53_LA", "GLM53_LA_BTTRIM", "GLM53_TRITON_PIN", "GLM53_EXL3_PATCHES"}
 
 
@@ -124,3 +124,12 @@ def test_x16_layers(tmp_path, monkeypatch):
     assert not any("NV_X16" in k for k in spec.env)
     with pytest.raises(ValueError):
         glm53.GLM53Options(x16_layers=2.5).validate()
+
+
+def test_warm_prefill_off_by_default(tmp_path, monkeypatch):
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme")
+    assert spec.env["GLM53_EC_WARM_PREFILL"] == "0"
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", warm_prefill=True)
+    assert spec.env["GLM53_EC_WARM_PREFILL"] == "1"
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme-exact", warm_prefill=True)
+    assert "GLM53_EC_WARM_PREFILL" not in spec.env   # exact mode prefills exactly
