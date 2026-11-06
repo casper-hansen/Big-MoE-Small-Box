@@ -74,8 +74,8 @@ class GLM53Options:
     cpu_cache_gb: float = None
     disk_cache: str = None
     # mode nvme: the first x16_layers MoE layers keep the CPU lane on its bit-exact X16 path (engine/x16.py); 0 = off.
-    # 21 (measured 2026-11-05): forced-token top-1 agreement with exact decode 99.0 % (mean KL 0.0013) instead of 97.2 %
-    # (0.012), decode -12 % (bigmoe verify: 9.7-10.3 tok/s instead of 11.2-11.5)
+    # 21 (exllamav3 1.6.6, 2026-11-06): forced-token top-1 agreement with exact decode 99.2 % (mean KL 0.0011) instead of
+    # 97.3 % (0.0096), decode -13 % (8k prompt: 9.85 tok/s instead of 11.28)
     x16_layers: int = 0
     # mode nvme: warm prefill (engine/warm_prefill.py), staged prefill on the VRAM / RAM experts plus each layer's 64
     # heaviest NVMe-only ones. Off for GLM: its answers react more to approximate prefill (teacher-forced top-1 94.5 %

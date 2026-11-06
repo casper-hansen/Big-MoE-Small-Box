@@ -8,11 +8,6 @@ from bigmoe.models import glm53
 
 BASE = Path(glm53.__file__).parent / "baselines"
 PATHS = ("GLM53_EC_WARM", "GLM53_ZC_STATS", "GLM53_NV_STORE")
-# deliberate changes since the reference runs: the planner's NVMe arrival model (nvlat, nvdeep; see TUNED_PLANNER), and
-# the exllamav3 1.5.1 runtime's own modules are gone with it (fused hyper-connection kernels, decode lookahead, Triton
-# pin, prompt / tail checkpoint patch): exllamav3's fused sites (EXL3_HC_FOLD) and the engine's prefill replace them
-CHANGED = {"nvme": {"GLM53_NV_POL": glm53.TUNED_PLANNER, "GLM53_EC_WARM_PREFILL": "0"}, "nvme-exact": {}}
-REMOVED = {"GLM53_K_HCFUSE", "GLM53_LA", "GLM53_LA_BTTRIM", "GLM53_TRITON_PIN", "GLM53_EXL3_PATCHES"}
 
 
 class FakeRuntime:
@@ -34,11 +29,10 @@ def spec_for(tmp_path, monkeypatch, mode, flags=frozenset({"avx2", "fma", "f16c"
 
 @pytest.mark.parametrize("mode,fname", [("nvme", "longctx_nvme.json"), ("nvme-exact", "longctx_exact.json")])
 def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
-    # the reference runs were measured with the old 52 GiB cap and a 1376-slot expert cache: pass them explicitly
-    box, spec = spec_for(tmp_path, monkeypatch, mode, memory_gb=52.0, vram_expert_slots=1376)
-    ref = dict(json.loads((BASE / fname).read_text())["env"], **CHANGED[mode])
-    ref = {k: v for k, v in ref.items() if k not in REMOVED}
-    ours = {k: v for k, v in spec.env.items() if k.startswith("GLM53_") and not k.endswith("_BUILD")}
+    # the reference runs (bigmoe verify, 2026-11-06) were measured with the defaults on an AVX-512 VBMI CPU
+    box, spec = spec_for(tmp_path, monkeypatch, mode, flags=glm53.VBMI_FLAGS | {"avx2", "fma", "f16c"})
+    glm = lambda env: {k: v for k, v in env.items() if k.startswith("GLM53_") and not k.endswith("_BUILD")}
+    ref, ours = glm(json.loads((BASE / fname).read_text())["env"]), glm(spec.env)
     assert set(ours) == set(ref)
     for k, v in ref.items():
         if k in PATHS:
