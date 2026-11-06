@@ -52,6 +52,12 @@ class DSV41Options:
     slim: bool = True
     verify_weights: bool = True
     prefix_cache_gb: float = 0.5   # exllamav3's SWA-layer state checkpoints in host RAM (-rcs, GiB)
+    # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
+    # 64k-token GPU cache evicts (one long conversation evicts every other) are restored from it instead of prefilled
+    # again. disk_cache: a directory for exllamav3's persistent third tier behind it (pages and checkpoints survive
+    # restarts; needs cpu_cache_gb > 0); written only when pages leave the GPU or the server goes idle.
+    cpu_cache_gb: float = 0.0
+    disk_cache: str = None
     # DSpark speculative decoding (the checkpoint's own MTP block drafter, exllamav3 -mtp): drafts up to 5 tokens per
     # step, cut where its confidence head drops below dspark_conf; the target verifies the block in one forward.
     # Measured in mode nvme: +12.5 % (0.5: 75 % of drafted tokens accepted, 2.83 tokens per verify), 0.25 no gain.
@@ -72,6 +78,10 @@ class DSV41Options:
             raise ValueError("chunk_size and max_batch_size must be positive")
         if not 0.0 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0..64, got {self.prefix_cache_gb!r}")
+        if not 0.0 <= float(self.cpu_cache_gb) <= 64:
+            raise ValueError(f"cpu_cache_gb must be 0..64, got {self.cpu_cache_gb!r}")
+        if self.disk_cache and not float(self.cpu_cache_gb) > 0:
+            raise ValueError("disk_cache needs cpu_cache_gb > 0 (exllamav3's disk tier sits behind the CPU tier)")
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
             raise ValueError("cpus must be 'auto', a CpuLayout or a dict(main=, controller=, lane=, readers=)")
 
@@ -255,7 +265,9 @@ class DSV41(ModelBackend):
         env.update({k_: str(v) for k_, v in box.env.items()})
         argv = [str(box.runtime.python), "-m", "bigmoe.models.dsv41.engine.server", "-m", str(self.model_dir(box)),
                 "-cs", str(box.context), "--max-batch-size", str(o.max_batch_size), "-chunk_size", str(o.chunk_size),
-                "-ccs", "0", "-rcs", f"{float(o.prefix_cache_gb):g}"]
+                "-ccs", f"{float(o.cpu_cache_gb):g}", "-rcs", f"{float(o.prefix_cache_gb):g}"]
+        if o.disk_cache:
+            argv += ["-dcd", str(Path(o.disk_cache).expanduser())]
         if o.cache_quant:
             argv += ["-cq", str(o.cache_quant)]
         if o.speculation == "dspark":   # the checkpoint's MTP block drafter (mtp.* tensors, never slimmed: not in the store)

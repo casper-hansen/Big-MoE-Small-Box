@@ -14,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from bigmoe import serving
 from bigmoe.kernels import install_prebuilt_loader
 from bigmoe.models.dsv41.toolcalls import ToolStream, normalize_messages, parse_tool_calls
 
@@ -21,6 +22,7 @@ install_prebuilt_loader()  # AutoBox prebuilt the kernels into the DSV41_*_BUILD
 
 app = FastAPI()
 G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
+serving.install(app, lambda: G["gen"], "dsv41")   # JSON errors, liveness-aware /health, exit on a dead generator
 KL = {"on": os.environ.get("DSV41_KL_CAPTURE") == "1", "prompt": None, "gen": [], "steps": []}
 BOS, USER, ASSISTANT, SYSTEM = "<｜begin▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "<｜System｜>"
 
@@ -131,7 +133,11 @@ async def startup():
                               draft_model=draft_model, draft_cache=draft_cache,
                               num_draft_tokens=args.num_draft_tokens, dynamic_draft_tokens=args.dynamic_draft,
                               draft_confidence=args.draft_confidence, ngram_match_min=args.ngram_match_min,
-                              record_draft_stats=bool(draft_model is not None or args.ngram_match_min))
+                              record_draft_stats=bool(draft_model is not None or args.ngram_match_min),
+                              # -rcs (prefix_cache_gb): the RAM the engine reserved for prefix checkpoints; without it
+                              # exllamav3 allows 4 GiB (~36 MB per DeepSeek checkpoint) beyond the server's memory plan
+                              recurrent_cache_size=int(args.recurrent_cache_size * 1024 ** 3),
+                              **serving.prefix_cache_tiers(args))
     _kl_install()
 
 
@@ -144,22 +150,30 @@ def ids_of(body):
 FORCE = {"ids": None}
 
 
-async def run_job(ids, sp, stop_strings=None):
-    """Yields (text so far, completion tokens, finish or None) once per generator step."""
+def run_job(ids, sp, stop_strings=None):
+    """Creates the job right away, so a prompt that does not fit the cache raises serving.RequestError (400
+    context_length_exceeded) before a response is started, and returns an async iterator of (text so far, completion
+    tokens, finish or None), one per generator step. Call it outside a StreamingResponse body."""
     gen = G["gen"]
-    max_new = sp.get("max_new_tokens")
-    room = CTX - ids.shape[-1] - (args.num_draft_tokens or 8) - 2
-    max_new = room if max_new is None else min(int(max_new), room)
+    P = ids.shape[-1]
+    max_new = serving.output_budget(P, CTX, (args.num_draft_tokens or 8) + 2, sp.get("max_new_tokens"))
     rq = int(os.environ.get("DSV41_MAX_RQ_TOKENS", "0")) or None
-    job = AsyncJob(gen, input_ids=ids, max_new_tokens=max(1, max_new), sampler=make_sampler(sp),
-                   stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
-                   **({"max_rq_tokens": rq} if rq else {}))
+    try:
+        job = AsyncJob(gen, input_ids=ids, max_new_tokens=max_new, sampler=make_sampler(sp),
+                       stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
+                       **({"max_rq_tokens": rq} if rq else {}))
+    except Exception as e:   # exllamav3 asserts when the job cannot get its cache pages
+        raise serving.as_request_error(e, P, CTX) from e
     if KL["on"]:
         KL["prompt"] = [int(x) for x in ids.flatten().tolist()]
         KL["gen"], KL["steps"] = [], []
     if FORCE["ids"] is not None:   # /kl_force: the decode path runs on these output tokens
         job.constrain_output_now(torch.tensor([FORCE["ids"]], dtype=torch.long))
         FORCE["ids"] = None
+    return _iter_job(job)
+
+
+async def _iter_job(job):
     G["stats"]["requests"] += 1
     n, text, done = 0, "", False
     try:
@@ -186,8 +200,10 @@ async def run_job(ids, sp, stop_strings=None):
                         sd["windows"][str(win)] = sd["windows"].get(str(win), 0) + 1
                         sd["accepted_hist"][str(acc)] = sd["accepted_hist"].get(str(acc), 0) + 1
                 reason = r.get("eos_reason")
-                fin = {"type": "length" if reason == "max_new_tokens" else "stop", "reason": str(reason)}
+                fin = {"type": "length" if reason == "max_new_tokens" else "stop", "reason": str(reason),
+                       "timings": serving.job_timings(r)}
                 G["stats"]["completion_tokens"] += n
+                serving.log_request(int(r.get("prompt_tokens") or 0), n, fin)
                 done = True
             yield text, n, fin
         done = True
@@ -238,7 +254,7 @@ def watch_disconnect(req):
 
 @app.post("/generate")
 async def generate(req: Request):
-    body = await req.json()
+    body = await serving.read_json(req)
     sp = body.get("sampling_params") or {}
     ids = ids_of(body)
     if body.get("return_logprob"):
@@ -252,8 +268,9 @@ async def generate(req: Request):
         return JSONResponse({"text": "", "output_ids": [r["next_token"]], "meta_info": meta})
     P = ids.shape[-1]
     if body.get("stream"):
+        g = run_job(ids, sp)
+
         async def events():
-            g = run_job(ids, sp)
             gone, wt = watch_disconnect(req)
             try:
                 async for text, n, fin in g:
@@ -264,7 +281,7 @@ async def generate(req: Request):
             finally:
                 gone.set(); wt.cancel()
                 await g.aclose()
-        return StreamingResponse(events(), media_type="text/event-stream")
+        return StreamingResponse(serving.guard_stream(events()), media_type="text/event-stream")
     text, n, fin = "", 0, None
     async for text, n, fin in run_job(ids, sp):
         pass
@@ -296,7 +313,7 @@ def split_reasoning(text):
 
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
-    body = await req.json()
+    body = await serving.read_json(req, require=("messages",))
     kw = dict(body.get("chat_template_kwargs") or {})
     thinking = bool(kw.get("enable_thinking", kw.get("thinking", False)))
     # the template renders the tools and the model calls them in DSML (../toolcalls.py parses the calls back)
@@ -305,8 +322,9 @@ async def chat(req: Request):
     sp, stops = openai_sp(body), stops_of(body)
     cid, created, P = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), ids.shape[-1]
     if body.get("stream"):
+        g = run_job(ids, sp, stops)   # before the response starts: a context error is a 400, not a torn stream
+
         async def events():
-            g = run_job(ids, sp, stops)
             gone, wt = watch_disconnect(req)
             sent, in_think = 0, thinking
             ts = ToolStream(tools) if tools else None
@@ -346,13 +364,13 @@ async def chat(req: Request):
                     if calls:
                         reason = "tool_calls"
                         yield sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]}, "finish_reason": None}]))
-                usage = {"prompt_tokens": P, "completion_tokens": n, "total_tokens": P + n}
+                usage = serving.usage(P, n, fin)
                 yield sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": reason}], usage=usage))
                 yield "data: [DONE]\n\n"
             finally:
                 gone.set(); wt.cancel()
                 await g.aclose()
-        return StreamingResponse(events(), media_type="text/event-stream")
+        return StreamingResponse(serving.guard_stream(events()), media_type="text/event-stream")
     text, n, fin = "", 0, None
     async for text, n, fin in run_job(ids, sp, stops):
         pass
@@ -369,12 +387,12 @@ async def chat(req: Request):
     return JSONResponse({"id": cid, "object": "chat.completion", "created": created, "model": args.served_name,
                          "choices": [{"index": 0, "message": msg,
                                       "finish_reason": "tool_calls" if calls else (fin or {}).get("type")}],
-                         "usage": {"prompt_tokens": P, "completion_tokens": n, "total_tokens": P + n}})
+                         "usage": serving.usage(P, n, fin)})
 
 
 @app.post("/v1/completions")
 async def completions(req: Request):
-    body = await req.json()
+    body = await serving.read_json(req, require=("prompt",))
     prompt = body["prompt"] if isinstance(body["prompt"], str) else body["prompt"][0]
     ids = tok.encode(prompt, encode_special_tokens=True)
     sp, stops = openai_sp(body), stops_of(body)
@@ -384,7 +402,7 @@ async def completions(req: Request):
     async for text, n, fin in run_job(ids, sp, stops):
         pass
     return JSONResponse(dict(base, choices=[{"index": 0, "text": text, "finish_reason": (fin or {}).get("type")}],
-                             usage={"prompt_tokens": P, "completion_tokens": n, "total_tokens": P + n}))
+                             usage=serving.usage(P, n, fin)))
 
 
 @app.get("/v1/models")
@@ -405,6 +423,7 @@ async def server_info():
 @app.get("/stats")
 async def stats():
     st = dict(G["stats"])
+    st["recurrent_cache"] = serving.recurrent_cache_stats(G["gen"])
     if os.environ.get("DSV41_NV_STORE"):
         from bigmoe.engine import tiers
         st["tiers"] = tiers.summary()
@@ -481,12 +500,14 @@ async def kl_force(req: Request):
     KL["on"] = True
     t0 = time.time()
     n = 0
+    fin = None
     try:
         async for _text, n, _fin in run_job(ids, {"temperature": 0, "max_new_tokens": len(b["ref"])}):
-            pass
+            fin = _fin or fin
     finally:
         KL["on"] = on
-    d = {"n": n, "secs": time.time() - t0, "prompt": KL["prompt"], "gen": KL["gen"], "steps": KL["steps"]}
+    d = {"n": n, "secs": time.time() - t0, "prompt": KL["prompt"], "gen": KL["gen"], "steps": KL["steps"],
+         "timings": (fin or {}).get("timings")}
     KL["steps"] = []
     return JSONResponse(d)
 
@@ -508,9 +529,7 @@ async def kl_teacher(req: Request):
                          "ix": ix.tolist()})
 
 
-@app.get("/health")
-async def health():
-    return JSONResponse({"ok": True})
+# GET /health: serving.install() (503 while starting or once the generator loop died)
 
 
 def main():

@@ -64,6 +64,12 @@ class GLM53Options:
     # exllamav3's recurrent-state prefix cache in host RAM (-rcs, GiB; ~143 MB per checkpoint). Every GiB left to the RAM
     # expert tier instead is ~110 more cached experts: 4 -> 1 GiB measured +5 % decode (fewer NVMe reads)
     prefix_cache_gb: float = 1.0
+    # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
+    # GPU cache evicts are restored from it instead of prefilled again. disk_cache: a directory for exllamav3's
+    # persistent third tier behind it (pages and checkpoints survive restarts; needs cpu_cache_gb > 0); written only
+    # when pages leave the GPU or the server goes idle.
+    cpu_cache_gb: float = 0.0
+    disk_cache: str = None
 
     def validate(self):
         if self.mode not in MODES:
@@ -78,6 +84,10 @@ class GLM53Options:
             raise ValueError("chunk_size and max_batch_size must be positive")
         if not 0.25 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0.25..64, got {self.prefix_cache_gb!r}")
+        if not 0.0 <= float(self.cpu_cache_gb) <= 64:
+            raise ValueError(f"cpu_cache_gb must be 0..64, got {self.cpu_cache_gb!r}")
+        if self.disk_cache and not float(self.cpu_cache_gb) > 0:
+            raise ValueError("disk_cache needs cpu_cache_gb > 0 (exllamav3's disk tier sits behind the CPU tier)")
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
             raise ValueError("cpus must be 'auto', a CpuLayout or a dict(main=, controller=, lane=, readers=)")
 
@@ -297,6 +307,10 @@ class GLM53(ModelBackend):
         argv = [str(box.runtime.python), "-m", "bigmoe.models.glm53.engine.server", "-m", str(self.model_dir(box)),
                 "-cs", str(box.context), "--max-batch-size", str(o.max_batch_size), "-chunk_size", str(o.chunk_size),
                 *mode_args, *small]
+        if o.cpu_cache_gb:
+            argv += ["-ccs", f"{float(o.cpu_cache_gb):g}"]
+        if o.disk_cache:
+            argv += ["-dcd", str(Path(o.disk_cache).expanduser())]
         if o.cache_quant:
             argv += ["-cq", str(o.cache_quant)]
         if o.speculation == "ngram":   # n-gram drafts + exact verification; user extra args come after and can override

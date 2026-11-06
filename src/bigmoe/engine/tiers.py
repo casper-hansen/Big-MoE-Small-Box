@@ -114,12 +114,15 @@ _log = log
 
 
 def _rcs_bytes():
-    """exllamav3's recurrent / SWA state checkpoints in host RAM (-rcs GiB), left out of the RAM tier."""
-    a, v = sys.argv, 0.5
+    """exllamav3's host-RAM caches, left out of the RAM tier: recurrent / SWA state checkpoints (-rcs GiB, default
+    0.5) and the second-tier K/V page cache in pinned memory (-ccs GiB, default 0)."""
+    a, rcs, ccs = sys.argv, 0.5, 0.0
     for i, x in enumerate(a):
         if x in ("-rcs", "--recurrent_cache_size") and i + 1 < len(a):
-            v = float(a[i + 1])
-    return int(v * GiB)
+            rcs = float(a[i + 1])
+        if x in ("-ccs", "--cpu_cache_size") and i + 1 < len(a):
+            ccs = float(a[i + 1])
+    return int((rcs + ccs) * GiB)
 
 
 class HostArena:

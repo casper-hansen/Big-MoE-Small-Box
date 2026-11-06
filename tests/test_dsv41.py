@@ -52,6 +52,25 @@ def test_launch_exact(tmp_path, monkeypatch):
     assert "-ccs" in spec.argv and spec.memory_gb == 56.0
 
 
+def test_prefix_cache_tiers(tmp_path, monkeypatch):
+    arg = lambda spec, k: spec.argv[spec.argv.index(k) + 1] if k in spec.argv else None
+    _, spec = spec_for(tmp_path, monkeypatch)
+    assert (arg(spec, "-ccs"), arg(spec, "-rcs"), arg(spec, "-dcd")) == ("0", "0.5", None)
+    _, spec = spec_for(tmp_path, monkeypatch, prefix_cache_gb=1, cpu_cache_gb=1, disk_cache="~/pc")
+    assert (arg(spec, "-ccs"), arg(spec, "-rcs")) == ("1", "1")
+    assert arg(spec, "-dcd") == str(Path("~/pc").expanduser())
+    with pytest.raises(ValueError):   # the disk tier sits behind the CPU tier
+        spec_for(tmp_path, monkeypatch, disk_cache="/x")
+
+
+def test_engine_reserves_host_caches(monkeypatch):
+    from bigmoe.engine import tiers
+    monkeypatch.setattr(tiers.sys, "argv", ["server", "-rcs", "1", "-ccs", "2"])
+    assert tiers._rcs_bytes() == 3 * 1024 ** 3
+    monkeypatch.setattr(tiers.sys, "argv", ["server"])
+    assert tiers._rcs_bytes() == int(0.5 * 1024 ** 3)
+
+
 def test_dspark_default_and_off(tmp_path, monkeypatch):
     box, spec = spec_for(tmp_path, monkeypatch)
     assert box.options.speculation == "dspark" and box.options.dspark_conf == 0.5
