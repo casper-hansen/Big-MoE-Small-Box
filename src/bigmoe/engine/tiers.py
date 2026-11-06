@@ -17,11 +17,13 @@ EC_STAGE_MIN (picks per layer call that stage, 8192), EC_ELASTIC_GB (0 = off), E
 EC_ACT_MB_PER_TOK (0.6), EC_COPY_GRID, EC_WARM (JSON {layer key: [score x E]}), EC_WARM_PREFILL (0; mode nvme only).
 """
 import ctypes
+import gc
 import json
 import mmap
 import os
 import sys
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -565,12 +567,17 @@ def _hook_prefill(cls):
                     p._elastic_enter(n)
             try:
                 return _orig(self, input_ids, params)
-            except BaseException:
+            except BaseException as e:
                 # a failed forward (e.g. CUDA out of memory) ends the prefill: free the staging buffers and take the
-                # flex chunks back now instead of holding them until the next request's first small forward
-                for p in POOLS:
-                    if p.in_prefill:
-                        p._elastic_exit()
+                # flex chunks back now. First release the failed forward's activations, which the finished frames in
+                # the traceback still hold: reallocating the chunks next to them failed and lost cache slots
+                if any(p.in_prefill for p in POOLS):
+                    traceback.clear_frames(e.__traceback__)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    for p in POOLS:
+                        if p.in_prefill:
+                            p._elastic_exit()
                 raise
         setattr(cls, name, wrapped)
     cls._bigmoe_prefill_hooked = True

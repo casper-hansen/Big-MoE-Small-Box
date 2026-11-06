@@ -158,19 +158,25 @@ def run_job(ids, sp, stop_strings=None):
     P = ids.shape[-1]
     max_new = serving.output_budget(P, CTX, (args.num_draft_tokens or 8) + 2, sp.get("max_new_tokens"))
     rq = int(os.environ.get("DSV41_MAX_RQ_TOKENS", "0")) or None
-    try:
-        job = AsyncJob(gen, input_ids=ids, max_new_tokens=max_new, sampler=make_sampler(sp),
-                       stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
-                       **({"max_rq_tokens": rq} if rq else {}))
-    except Exception as e:   # exllamav3 asserts when the job cannot get its cache pages
-        raise serving.as_request_error(e, P, CTX) from e
+    force, FORCE["ids"] = FORCE["ids"], None   # /kl_force: the decode path runs on these output tokens
+
+    def make():
+        try:
+            job = AsyncJob(gen, input_ids=ids, max_new_tokens=max_new, sampler=make_sampler(sp),
+                           stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
+                           **({"max_rq_tokens": rq} if rq else {}))
+        except Exception as e:   # exllamav3 asserts when the job cannot get its cache pages
+            raise serving.as_request_error(e, P, CTX) from e
+        if force is not None:
+            job.constrain_output_now(torch.tensor([force], dtype=torch.long))
+        return job
+
+    job = make()
     if KL["on"]:
         KL["prompt"] = [int(x) for x in ids.flatten().tolist()]
         KL["gen"], KL["steps"] = [], []
-    if FORCE["ids"] is not None:   # /kl_force: the decode path runs on these output tokens
-        job.constrain_output_now(torch.tensor([FORCE["ids"]], dtype=torch.long))
-        FORCE["ids"] = None
-    return _iter_job(job)
+    # a CUDA out-of-memory failure frees what it held; before the first token the job runs again, smaller chunks
+    return _iter_job(serving.RetryingJob(job, make, gen.generator))
 
 
 async def _iter_job(job):
@@ -194,7 +200,7 @@ async def _iter_job(job):
                                                          "accepted_hist": {}})
                     sd["accepted"] += int(r.get("accepted_draft_tokens") or 0)
                     sd["rejected"] += int(r.get("rejected_draft_tokens") or 0)
-                    inner = getattr(job, "job", None)
+                    inner = getattr(job.job, "job", None)   # RetryingJob -> AsyncJob -> exllamav3 Job
                     for _pos, win, acc in (getattr(inner, "draft_stats", None) or []):
                         sd["rounds"] += 1
                         sd["windows"][str(win)] = sd["windows"].get(str(win), 0) + 1

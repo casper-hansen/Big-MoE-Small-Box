@@ -234,20 +234,26 @@ def run_job(ids, sp, stop_strings=None):
     # that many tokens and keeps going; NOT an output cap). Without it every job reserves pages for the whole remaining
     # context, so a second concurrent job never starts and C2/C4 run one stream after another.
     rq = int(os.environ.get("GLM53_MAX_RQ_TOKENS", "0")) or None
-    try:
-        job = AsyncJob(gen, input_ids=ids, max_new_tokens=max_new, sampler=make_sampler(sp),
-                       stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
-                       **({"max_rq_tokens": rq} if rq else {}))
-    except Exception as e:   # exllamav3 asserts when the job cannot get its cache pages
-        raise serving.as_request_error(e, P, CTX) from e
+    force, BCP["force"] = BCP["force"], None
+
+    def make():
+        try:
+            job = AsyncJob(gen, input_ids=ids, max_new_tokens=max_new, sampler=make_sampler(sp),
+                           stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
+                           **({"max_rq_tokens": rq} if rq else {}))
+        except Exception as e:   # exllamav3 asserts when the job cannot get its cache pages
+            raise serving.as_request_error(e, P, CTX) from e
+        if force is not None:
+            job.constrain_output_now(torch.tensor([force], dtype=torch.long))
+        return job
+
+    job = make()
     if KL["on"]:
         KL["prompt"] = [int(x) for x in ids.flatten().tolist()]
         KL["gen"] = []
         KL["steps"] = []
-    if BCP["force"] is not None:
-        job.constrain_output_now(torch.tensor([BCP["force"]], dtype=torch.long))
-        BCP["force"] = None
-    return _iter_job(job)
+    # a CUDA out-of-memory failure frees what it held; before the first token the job runs again, smaller chunks
+    return _iter_job(serving.RetryingJob(job, make, gen.generator))
 
 
 async def _iter_job(job):

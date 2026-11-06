@@ -12,8 +12,13 @@ What it guards against:
 - A dead generator loop (an exception in Generator.iterate, e.g. CUDA out of memory). exllamav3 then fails every later
   job while the process stays up and /health kept answering ok. /health now reports 503 and, after a short grace for
   in-flight requests to get their error, the process exits so a supervisor can start a fresh one.
+- A job that runs out of GPU memory (exllamav3 contains it to that job). The exception's traceback keeps the failed
+  forward's activations alive (GBs), in reference cycles only a full garbage collection frees, so every later request
+  ran out of memory too until a restart. RetryingJob frees them, and a failure before the first token re-runs the job
+  once with half-size prefill chunks, so the client gets its answer instead of an error.
 """
 import asyncio
+import gc
 import json
 import os
 import sys
@@ -182,6 +187,65 @@ def recurrent_cache_stats(gen) -> dict | None:
     n = len(rc)
     return {"checkpoints": n, "bytes": int(rc.current_size), "max_bytes": int(rc.max_size),
             "bytes_per_checkpoint": int(rc.current_size / n) if n else None, **dict(getattr(rc, "metrics", {}))}
+
+
+def is_cuda_oom(exc: BaseException) -> bool:
+    return type(exc).__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(exc)
+
+
+def release_failed(exc: BaseException):
+    """Free what a failed forward left behind: the locals of the finished frames in the exception's traceback (and in
+    its causes), whatever only cyclic garbage collection reclaims, and torch's cached blocks."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        traceback.clear_frames(exc.__traceback__)
+        exc = exc.__cause__ or exc.__context__
+    gc.collect()
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+class RetryingJob:
+    """Iterates an exllamav3 AsyncJob's results. A CUDA out-of-memory failure frees what the failed forward held; one
+    that comes before the first token re-runs the job (remake() builds an identical one) with the generator's prefill
+    chunks halved until that job's prefill is done. A second failure, or one after tokens were streamed, is raised."""
+
+    def __init__(self, job, remake, generator, log=print):
+        self.job, self.remake, self.generator, self.log = job, remake, generator, log
+        self.retried = False
+
+    async def cancel(self):
+        await self.job.cancel()
+
+    async def __aiter__(self):
+        started, restore = False, None
+        try:
+            while True:
+                try:
+                    async for r in self.job:
+                        if not started and r.get("stage") == "streaming":
+                            started = True
+                            if restore is not None:   # the retried prefill is done: full chunks again
+                                self.generator.max_chunk_size, restore = restore, None
+                        yield r
+                    return
+                except Exception as e:
+                    if not is_cuda_oom(e):
+                        raise
+                    release_failed(e)
+                    if started or self.retried:
+                        raise
+                    self.retried = True
+                    restore = self.generator.max_chunk_size
+                    self.generator.max_chunk_size = max(256, restore // 2 // 256 * 256)
+                    self.log(f" !! out of GPU memory before the first token; retrying the request with "
+                             f"{self.generator.max_chunk_size}-token prefill chunks")
+                    self.job = self.remake()
+        finally:
+            if restore is not None:
+                self.generator.max_chunk_size = restore
 
 
 def gpu_memory_stats() -> dict | None:

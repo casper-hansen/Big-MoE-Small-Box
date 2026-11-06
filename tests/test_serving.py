@@ -164,3 +164,76 @@ def test_gpu_memory_stats():
     else:
         assert set(s) == {"allocated_mib", "reserved_mib", "peak_allocated_mib", "free_mib", "total_mib"}
         assert 0 <= s["free_mib"] <= s["total_mib"]
+
+
+class OutOfMemoryError(RuntimeError):   # stands in for torch.OutOfMemoryError (matched by name)
+    pass
+
+
+class FakeAsyncJob:
+    def __init__(self, script):
+        self.script, self.cancelled = script, False
+
+    async def __aiter__(self):
+        for item in self.script:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    async def cancel(self):
+        self.cancelled = True
+
+
+def collect(rj):
+    async def run():
+        return [r async for r in rj]
+    return asyncio.run(run())
+
+
+STREAM = {"stage": "streaming", "text": "ok"}
+
+
+def test_retrying_job_retries_oom_before_the_first_token():
+    gen = type("G", (), {"max_chunk_size": 8192})()
+    chunks, logs = [], []
+    jobs = [FakeAsyncJob([OutOfMemoryError("CUDA out of memory")]), FakeAsyncJob([{"stage": "prefill"}, STREAM])]
+
+    def remake():
+        chunks.append(gen.max_chunk_size)
+        return jobs.pop(0)
+    rj = serving.RetryingJob(jobs.pop(0), remake, gen, log=logs.append)
+    assert collect(rj) == [{"stage": "prefill"}, STREAM]
+    assert chunks == [4096] and gen.max_chunk_size == 8192 and rj.retried and "4096-token" in logs[0]
+
+
+def test_retrying_job_gives_up():
+    gen = type("G", (), {"max_chunk_size": 8192})()
+    twice = [FakeAsyncJob([OutOfMemoryError("CUDA out of memory")]), FakeAsyncJob([OutOfMemoryError("again")])]
+    rj = serving.RetryingJob(twice.pop(0), lambda: twice.pop(0), gen, log=lambda m: None)
+    with pytest.raises(OutOfMemoryError):
+        collect(rj)
+    assert gen.max_chunk_size == 8192            # restored after the failed retry
+    late = serving.RetryingJob(FakeAsyncJob([STREAM, OutOfMemoryError("mid-stream")]), lambda: 1 / 0, gen)
+    with pytest.raises(OutOfMemoryError):        # tokens were streamed: no retry
+        collect(late)
+    other = serving.RetryingJob(FakeAsyncJob([ValueError("bad")]), lambda: 1 / 0, gen)
+    with pytest.raises(ValueError):
+        collect(other)
+
+
+def test_release_failed_clears_the_failed_frames():
+    pytest.importorskip("torch")
+
+    def forward():
+        activations = bytearray(10)   # what a failed forward holds
+        raise OutOfMemoryError("CUDA out of memory")
+    try:
+        forward()
+    except OutOfMemoryError as e:
+        err = e
+    tb = err.__traceback__
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    assert "activations" in tb.tb_frame.f_locals
+    serving.release_failed(err)
+    assert "activations" not in tb.tb_frame.f_locals
