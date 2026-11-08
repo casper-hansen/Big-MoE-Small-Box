@@ -17,13 +17,13 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from bigmoe import serving
+from bigmoe import multimodal, serving
 from bigmoe.kernels import install_prebuilt_loader
 
 install_prebuilt_loader()  # AutoBox prebuilt the kernels into the GLM53_*_BUILD dirs: no toolchain at runtime
 
 app = FastAPI()
-G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
+G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}, "vision": None}
 serving.install(app, lambda: G["gen"], "glm53")   # JSON errors, liveness-aware /health, exit on a dead generator
 
 # upstream modules not included here
@@ -58,6 +58,9 @@ def load():
     model, config, cache, tok, draft_model, _draft_config, draft_cache = model_init.init(args)
     if engine is not None:
         engine.attach(model)   # pool + nv2 + routing hooks + bounce proxies + startup verify
+    # image input (bigmoe/multimodal.py): the vision tower is not resident; it is loaded per request that brings new
+    # images, in VRAM lent by the expert cache, and unloaded before the request is queued
+    G["vision"] = multimodal.create(config, tok)
     t_load = time.time() - t_load
     print(f" -- loaded in {t_load:.1f} s", flush=True)
 
@@ -119,7 +122,7 @@ def chat_prompt(messages, enable_thinking=True, tools=None, template_kwargs=None
         return p
     p = "[gMASK]<sop>"
     for m in messages:
-        p += f"<|{m['role']}|>{m.get('content') or ''}"
+        p += f"<|{m['role']}|>{multimodal.text_of(m.get('content'))}"
     return p + ("<|assistant|><think>" if enable_thinking else "<|assistant|><think></think>")
 
 
@@ -223,7 +226,7 @@ def ids_of(body):
     return tok.encode(body["text"], encode_special_tokens=True)
 
 
-def run_job(ids, sp, stop_strings=None):
+def run_job(ids, sp, stop_strings=None, embeddings=None):
     """Creates the job right away, so a prompt that does not fit the cache raises serving.RequestError (400
     context_length_exceeded) before a response is started, and returns an async iterator of (text so far, completion
     tokens, finish or None), one per generator step. Call it outside a StreamingResponse body."""
@@ -240,7 +243,7 @@ def run_job(ids, sp, stop_strings=None):
         try:
             job = AsyncJob(gen, input_ids=ids, max_new_tokens=max_new, sampler=make_sampler(sp),
                            stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
-                           **({"max_rq_tokens": rq} if rq else {}))
+                           embeddings=embeddings or None, **({"max_rq_tokens": rq} if rq else {}))
         except Exception as e:   # exllamav3 asserts when the job cannot get its cache pages
             raise serving.as_request_error(e, P, CTX) from e
         if force is not None:
@@ -406,11 +409,14 @@ async def chat(req: Request):
         kw.setdefault("reasoning_effort", body["reasoning_effort"])
     thinking = kw.get("enable_thinking", True)
     tools = body.get("tools") if body.get("tool_choice") != "none" else None
-    ids = tok.encode(chat_prompt(body["messages"], thinking, tools, kw), encode_special_tokens=True)
+    # images: encoded (or found in the embedding cache) before the job is created; text-only requests skip this
+    messages, embs = await multimodal.prepare_chat(G["vision"], body["messages"])
+    prompt = chat_prompt(messages, thinking, tools, kw)
+    ids, embs = multimodal.encode_prompt(tok, prompt, embs)
     sp, stops = openai_sp(body), stops_of(body)
     cid, created, P = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), ids.shape[-1]
     if body.get("stream"):
-        g = run_job(ids, sp, stops)   # before the response starts: a context error is a 400, not a torn stream
+        g = run_job(ids, sp, stops, embs)   # before the response starts: a context error is a 400, not a torn stream
 
         async def events():
             gone, wt = watch_disconnect(req)
@@ -460,7 +466,7 @@ async def chat(req: Request):
                 await g.aclose()
         return StreamingResponse(serving.guard_stream(events()), media_type="text/event-stream")
     text, n, fin = "", 0, None
-    async for text, n, fin in run_job(ids, sp, stops):
+    async for text, n, fin in run_job(ids, sp, stops, embs):
         pass
     if thinking:
         reasoning, content = split_reasoning(text)
@@ -516,7 +522,8 @@ async def completions(req: Request):
 @app.get("/v1/models")
 async def models():
     return JSONResponse({"object": "list", "data": [{"id": args.served_name, "object": "model", "owned_by": "local",
-                                                     "max_model_len": CTX}]})
+                                                     "max_model_len": CTX,
+                                                     **multimodal.model_card_fields(G["vision"])}]})
 
 
 @app.get("/server_info")
@@ -533,6 +540,7 @@ async def stats():
     st = dict(G["stats"])
     st["recurrent_cache"] = serving.recurrent_cache_stats(G["gen"])
     st["gpu"] = serving.gpu_memory_stats()
+    st["vision"] = G["vision"].summary() if G["vision"] is not None else None
     if os.environ.get("GLM53_NV") == "2":
         from bigmoe.engine import tiers as engine
         st["expert_cache"] = engine.POOLS[0].summary() if engine.POOLS else None

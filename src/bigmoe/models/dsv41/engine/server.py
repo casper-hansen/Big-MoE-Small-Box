@@ -14,14 +14,14 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from bigmoe import serving
+from bigmoe import multimodal, serving
 from bigmoe.kernels import install_prebuilt_loader
 from bigmoe.models.dsv41.toolcalls import ToolStream, normalize_messages, parse_tool_calls
 
 install_prebuilt_loader()  # AutoBox prebuilt the kernels into the DSV41_*_BUILD dirs: no toolchain at runtime
 
 app = FastAPI()
-G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
+G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}, "vision": None}
 serving.install(app, lambda: G["gen"], "dsv41")   # JSON errors, liveness-aware /health, exit on a dead generator
 KL = {"on": os.environ.get("DSV41_KL_CAPTURE") == "1", "prompt": None, "gen": [], "steps": []}
 BOS, USER, ASSISTANT, SYSTEM = "<｜begin▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "<｜System｜>"
@@ -47,6 +47,18 @@ def load():
     model, config, cache, tok, draft_model, _draft_config, draft_cache = model_init.init(args)
     if tiers is not None:
         tiers.attach(model)
+    # image input (bigmoe/multimodal.py): the vision tower is not resident; it is loaded per request that brings new
+    # images, in VRAM lent by the expert cache, and unloaded before the request is queued
+    G["vision"] = multimodal.create(config, tok)
+    if G["vision"] is not None and model.caps.get("mm_exact_chunks"):
+        # exllamav3 1.6.6 sets mm_exact_chunks on every DeepSeek-V4-family model with a vision tower; it is for
+        # V4-Flash-Vision-Exp, whose image span attends bidirectionally and must be one chunk. V4.1's trunk stays causal
+        # over an image span (DeepseekV41Model.prepare_inputs: no chunk check, no nc_chunk; its Engram layers carry the
+        # substituted ids in their state), so any chunking is exact. With the cap on, prefill chunks were cut at both
+        # span edges (two extra staged forwards per image), no page-aligned checkpoint survived past an image (a
+        # follow-up turn re-prefilled from the last checkpoint before it), and a cached prefix ending inside an image
+        # span failed the request ("prefill would start inside an image span").
+        model.caps["mm_exact_chunks"] = False
     t_load = time.time() - t_load
     print(f" -- loaded in {t_load:.1f} s", flush=True)
 
@@ -85,13 +97,13 @@ def chat_prompt(messages, enable_thinking=False, tools=None, template_kwargs=Non
             print(f" !! chat template failed ({e}); built-in template", flush=True)
     p, sys_p = BOS, ""
     for m in messages:
-        c = m.get("content") or ""
+        c = multimodal.text_of(m.get("content"))
         if m["role"] == "system":
             sys_p += c
     if sys_p:
         p += SYSTEM + sys_p
     for m in messages:
-        c = m.get("content") or ""
+        c = multimodal.text_of(m.get("content"))
         if m["role"] == "user":
             p += USER + c
         elif m["role"] == "assistant":
@@ -150,7 +162,7 @@ def ids_of(body):
 FORCE = {"ids": None}
 
 
-def run_job(ids, sp, stop_strings=None):
+def run_job(ids, sp, stop_strings=None, embeddings=None):
     """Creates the job right away, so a prompt that does not fit the cache raises serving.RequestError (400
     context_length_exceeded) before a response is started, and returns an async iterator of (text so far, completion
     tokens, finish or None), one per generator step. Call it outside a StreamingResponse body."""
@@ -164,7 +176,7 @@ def run_job(ids, sp, stop_strings=None):
         try:
             job = AsyncJob(gen, input_ids=ids, max_new_tokens=max_new, sampler=make_sampler(sp),
                            stop_conditions=list(EOS) + list(stop_strings or []), decode_special_tokens=False,
-                           **({"max_rq_tokens": rq} if rq else {}))
+                           embeddings=embeddings or None, **({"max_rq_tokens": rq} if rq else {}))
         except Exception as e:   # exllamav3 asserts when the job cannot get its cache pages
             raise serving.as_request_error(e, P, CTX) from e
         if force is not None:
@@ -334,11 +346,14 @@ async def chat(req: Request):
     thinking = bool(kw.get("enable_thinking", kw.get("thinking", False)))
     # the template renders the tools and the model calls them in DSML (../toolcalls.py parses the calls back)
     tools = body.get("tools") if body.get("tool_choice") != "none" else None
-    ids = tok.encode(chat_prompt(body["messages"], thinking, tools, kw), encode_special_tokens=True)
+    # images: encoded (or found in the embedding cache) before the job is created; text-only requests skip this
+    messages, embs = await multimodal.prepare_chat(G["vision"], body["messages"])
+    prompt = chat_prompt(messages, thinking, tools, kw)
+    ids, embs = multimodal.encode_prompt(tok, prompt, embs)
     sp, stops = openai_sp(body), stops_of(body)
     cid, created, P = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), ids.shape[-1]
     if body.get("stream"):
-        g = run_job(ids, sp, stops)   # before the response starts: a context error is a 400, not a torn stream
+        g = run_job(ids, sp, stops, embs)   # before the response starts: a context error is a 400, not a torn stream
 
         async def events():
             gone, wt = watch_disconnect(req)
@@ -388,7 +403,7 @@ async def chat(req: Request):
                 await g.aclose()
         return StreamingResponse(serving.guard_stream(events()), media_type="text/event-stream")
     text, n, fin = "", 0, None
-    async for text, n, fin in run_job(ids, sp, stops):
+    async for text, n, fin in run_job(ids, sp, stops, embs):
         pass
     if thinking:
         reasoning, content = split_reasoning(text)
@@ -424,7 +439,8 @@ async def completions(req: Request):
 @app.get("/v1/models")
 async def models():
     return JSONResponse({"object": "list", "data": [{"id": args.served_name, "object": "model", "owned_by": "local",
-                                                     "max_model_len": CTX}]})
+                                                     "max_model_len": CTX,
+                                                     **multimodal.model_card_fields(G["vision"])}]})
 
 
 @app.get("/server_info")
@@ -441,6 +457,7 @@ async def stats():
     st = dict(G["stats"])
     st["recurrent_cache"] = serving.recurrent_cache_stats(G["gen"])
     st["gpu"] = serving.gpu_memory_stats()
+    st["vision"] = G["vision"].summary() if G["vision"] is not None else None
     if os.environ.get("DSV41_NV_STORE"):
         from bigmoe.engine import tiers
         st["tiers"] = tiers.summary()

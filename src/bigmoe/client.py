@@ -1,4 +1,8 @@
+import base64
+import io
 import json
+import mimetypes
+import os
 import urllib.error
 import urllib.request
 
@@ -17,8 +21,36 @@ def _sse(resp):
             yield json.loads(body)
 
 
-def _messages(messages):
-    return [{"role": "user", "content": messages}] if isinstance(messages, str) else list(messages)
+def _messages(messages, images=None):
+    msgs = [{"role": "user", "content": messages}] if isinstance(messages, str) else list(messages)
+    if images:
+        if not msgs or msgs[-1].get("role") != "user":
+            msgs.append({"role": "user", "content": []})
+        last = dict(msgs[-1])
+        c = last.get("content")
+        blocks = [{"type": "text", "text": c}] if isinstance(c, str) and c else list(c or [])
+        last["content"] = [image_block(i) for i in images] + blocks
+        msgs[-1] = last
+    return msgs
+
+
+def image_block(image) -> dict:
+    """An OpenAI image_url content block for a file path, raw bytes, a PIL image or an http(s) / data URL."""
+    if isinstance(image, (bytes, bytearray)):
+        data, mime = bytes(image), "image/png"
+    elif hasattr(image, "save") and hasattr(image, "size"):          # PIL image
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        data, mime = buf.getvalue(), "image/png"
+    elif isinstance(image, (str, os.PathLike)) and str(image).startswith(("http://", "https://", "data:")):
+        return {"type": "image_url", "image_url": {"url": str(image)}}
+    elif isinstance(image, (str, os.PathLike)):
+        with open(os.path.expanduser(str(image)), "rb") as f:
+            data = f.read()
+        mime = mimetypes.guess_type(str(image))[0] or "image/png"
+    else:
+        raise TypeError(f"unsupported image {type(image).__name__}: a path, bytes, a PIL image or a URL")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64," + base64.b64encode(data).decode()}}
 
 
 class Client:
@@ -65,7 +97,8 @@ class Client:
         return self.request("/tokenize", {"prompt": text})["tokens"]
 
     def _chat_body(self, messages, *, thinking, max_tokens, temperature, extra):
-        body = {"model": self.model or "default", "messages": _messages(messages), "temperature": temperature}
+        images = extra.pop("images", None)   # paths / bytes / PIL images / URLs, put before the last user message's text
+        body = {"model": self.model or "default", "messages": _messages(messages, images), "temperature": temperature}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         kw = dict(extra.pop("chat_template_kwargs", None) or {})

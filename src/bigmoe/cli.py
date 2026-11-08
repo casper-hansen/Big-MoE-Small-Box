@@ -133,14 +133,16 @@ def cmd_chat(a):
     c = Client(_server(a).url)
     if not c.health():
         raise BoxError(f"no server at {c.url} (bigmoe start)")
+    from .client import image_block
     kw = dict(thinking=a.thinking, temperature=a.temperature, max_tokens=a.max_tokens)
     if a.prompt:
-        for piece in c.chat(" ".join(a.prompt), stream=True, **kw):
+        for piece in c.chat(" ".join(a.prompt), stream=True, images=a.image or None, **kw):
             print(piece, end="", flush=True)
         print()
         return
-    print(f"chatting with {c.url} (/reset clears the history, Ctrl-D quits)")
-    history = []
+    print(f"chatting with {c.url} (/image PATH attaches an image to the next message, /reset clears the history, "
+          f"Ctrl-D quits)")
+    history, pending = [], [image_block(i) for i in a.image or ()]
     while True:
         try:
             q = input("> ").strip()
@@ -150,9 +152,16 @@ def cmd_chat(a):
         if not q:
             continue
         if q == "/reset":
-            history = []
+            history, pending = [], []
             continue
-        history.append({"role": "user", "content": q})
+        if q.startswith("/image "):
+            try:
+                pending.append(image_block(q[7:].strip()))
+            except (OSError, TypeError) as e:
+                print(f"cannot attach {q[7:].strip()}: {e}")
+            continue
+        history.append({"role": "user", "content": pending + [{"type": "text", "text": q}] if pending else q})
+        pending = []
         answer = ""
         for piece in c.chat(history, stream=True, **kw):
             answer += piece
@@ -227,6 +236,8 @@ def main(argv=None):
     p.add_argument("--thinking", action="store_true", help="let the model think first (reasoning is not printed)")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int)
+    p.add_argument("--image", action="append", metavar="PATH_OR_URL",
+                   help="attach an image (file, http(s) or data URL); repeatable")
     p.set_defaults(fn=cmd_chat)
     p = sub.add_parser("bench", help="long-context and cached-prefix prefill benchmark (starts the server if needed)")
     _add_box_args(p)

@@ -302,6 +302,8 @@ class Pool:
         self.flex = list(self.flex_all)
         self.in_prefill = False
         self.elastic_stats = {"enter": 0, "exit": 0, "realloc_fail": 0}
+        self.lend_stats = {"lends": 0, "chunks": 0, "wb": 0, "realloc_fail": 0}
+        self.lost = []            # lent chunks a give_back() could not reallocate (retried by the next one)
         L = len(mods)
         i32 = dict(dtype=torch.int32, device=device)
         self.slotof = torch.full((L, self.E), -1, **i32)
@@ -491,12 +493,64 @@ class Pool:
         self.in_prefill = False
         self.elastic_stats["exit"] += 1
 
+    # ---- VRAM lent to side work (the vision tower) between forwards ---------------------------------------------------
+    def lend(self, nbytes):
+        """Hand at least `nbytes` of the VRAM cache back to torch for work that runs between forward passes (a vision
+        encode): the last allocated chunks are written back to the RAM tier, taken out of the CLOCK and freed, as the
+        elastic prefill does with its flex chunks. Returns the chunk indices for give_back(). Chunks the elastic prefill
+        already holds (in_prefill) are skipped: their memory is torch's already."""
+        if nbytes <= 0:
+            return []
+        take, got = [], 0
+        for c in range(len(self.chunks) - 1, -1, -1):
+            if got >= nbytes:
+                break
+            if self.chunks[c] is not None:
+                take.append(c)
+                got += self.spc * self.rec
+        if not take:
+            return []
+        e = _ext()
+        if self.nv2 is not None:
+            self.lend_stats["wb"] += self.nv2.elastic_writeback(take)
+        for c in take:
+            e.ec_evict(c * self.spc, (c + 1) * self.spc, 1, self.E, self.owner, self.slotof, self.home, self.tabs,
+                       self.refb, self.pin)
+        torch.cuda.synchronize(self.device)
+        for c in take:
+            self.chunks[c] = None
+        self.lend_stats["lends"] += 1
+        self.lend_stats["chunks"] += len(take)
+        return take
+
+    def give_back(self, take):
+        """Reallocate the chunks lend() handed out and put their slots (empty) back into the CLOCK."""
+        take = [c for c in list(take) + self.lost if self.chunks[c] is None and not (self.in_prefill and c in self.flex)]
+        self.lost = []
+        if not take:
+            return
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        e = _ext()
+        for c in take:
+            try:
+                t = torch.empty((self.spc, self.rec), dtype=torch.uint8, device=self.device)
+            except torch.OutOfMemoryError:
+                self.lend_stats["realloc_fail"] += 1
+                self.lost.append(c)
+                continue
+            self.chunks[c] = t
+            self.cbase[c] = t.data_ptr()
+            e.ec_evict(c * self.spc, (c + 1) * self.spc, 0, self.E, self.owner, self.slotof, self.home, self.tabs,
+                       self.refb, self.pin)
+
     def summary(self):
         s = self.stats.tolist()
         return {"device": str(self.device), "layers": len(self.mods), "slots": self.S, "slot_bytes": self.rec,
                 "arena_gb": round(self.S * self.rec / 1e9, 2), "uniform_geometry": self.uniform,
                 "elastic": dict(self.elastic_stats, flex_chunks=len(self.flex), in_prefill=self.in_prefill)
                 if self.elastic else None,
+                "lent": dict(self.lend_stats, lost_chunks=len(self.lost)),
                 "hits": s[0], "misses": s[1], "admitted": s[2], "no_victim": s[3], "evictions": s[4],
                 "hit_rate": round(s[0] / max(1, s[0] + s[1]), 4),
                 "stage": dict(self.stage_stats, per_buffer=self.stage_n) if self.stage_n else None,

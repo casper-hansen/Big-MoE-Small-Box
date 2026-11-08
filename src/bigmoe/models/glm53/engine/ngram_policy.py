@@ -24,6 +24,7 @@ LONG = int(os.environ.get("GLM53_NG_LONG", "12"))
 ALPHA = float(os.environ.get("GLM53_NG_ALPHA", "0.3"))
 KEEP = float(os.environ.get("GLM53_NG_KEEP", "0.5"))
 ACC_LONG = float(os.environ.get("GLM53_NG_ACC_LONG", "0.35"))   # a long match probes only above this acceptance
+MM_FIRST = 1_000_000_000   # exllamav3 FIRST_MM_EMBEDDING_INDEX: image placeholder ids
 PROBE = int(os.environ.get("GLM53_NG_PROBE", "2"))               # draft length of a probe
 RECOVER = float(os.environ.get("GLM53_NG_RECOVER", "0.01"))      # acceptance recovery per matched step without a draft
 STATS = {"calls": 0, "matched": 0, "drafted": 0, "draft_tokens": 0, "steps": 0, "accepted": 0, "rejected": 0,
@@ -70,6 +71,9 @@ def install(generator_cls, job_cls):
                 self._ng_acc = min(0.5, p + RECOVER)   # slow recovery: a rejected streak does not disarm the job for good
             return empty
         draft = seq[:, end:end + k]
+        mm = (draft[0] >= MM_FIRST).nonzero()    # an image's placeholder ids are never sampled: draft up to them
+        if mm.numel():
+            draft = draft[:, :int(mm[0])]
         if draft.shape[-1]:
             STATS["drafted"] += 1
             STATS["draft_tokens"] += int(draft.shape[-1])

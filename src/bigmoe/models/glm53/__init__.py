@@ -18,6 +18,7 @@ from ...registry import ModelBackend, register_backend
 from ...steps import Step
 from ..prefix_cache import cpu_tier_gb
 from ..runtime import DESCRIPTION as RUNTIME, runtime_spec
+from ..multimodal_env import multimodal_env
 from ...store import ExpertStore, compare, pack, punch_experts
 from ...store.slim import expert_ranges
 
@@ -81,6 +82,14 @@ class GLM53Options:
     # heaviest NVMe-only ones. Off for GLM: its answers react more to approximate prefill (teacher-forced top-1 94.5 %
     # against exact prefill, DeepSeek 100 %); on, a cached-prefix step with 120-2000 new tokens takes ~5-7 s instead of ~9
     warm_prefill: bool = False
+    # image input (bigmoe/multimodal.py), on by default: OpenAI / Anthropic image blocks in chat messages. The vision tower
+    # is not resident (no VRAM, no RAM while no image comes in); a request with new images loads it from the checkpoint
+    # on NVMe into VRAM lent by the expert cache, encodes them and unloads it. Embeddings are cached by image content
+    # (RAM, then mm_cache_mb on the SSD), so a resent image keeps its token ids and the prefix cache reuses it.
+    # image_tokens caps the tokens per image (None: the model's own budget); False turns image input off (400).
+    multimodal: bool = True
+    image_tokens: int = None
+    mm_cache_mb: int = 2048
 
     def validate(self):
         if self.mode not in MODES:
@@ -100,6 +109,10 @@ class GLM53Options:
             raise ValueError(f"cpu_cache_gb must be 0..64, got {self.cpu_cache_gb!r}")
         if self.disk_cache and self.cpu_cache_gb is not None and not float(self.cpu_cache_gb) > 0:
             raise ValueError("disk_cache needs cpu_cache_gb > 0 (exllamav3's disk tier sits behind the CPU tier)")
+        if self.image_tokens is not None and not 16 <= int(self.image_tokens) <= 16384:
+            raise ValueError(f"image_tokens must be 16..16384 or None, got {self.image_tokens!r}")
+        if int(self.mm_cache_mb) < 0:
+            raise ValueError(f"mm_cache_mb must be >= 0, got {self.mm_cache_mb!r}")
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
             raise ValueError("cpus must be 'auto', a CpuLayout or a dict(main=, controller=, lane=, readers=)")
 
@@ -316,6 +329,7 @@ class GLM53(ModelBackend):
             env[spec.env_var] = str(box.runtime.kernel_dirs([spec], box.arch)[spec.name])
         if not system.systemd_scope_available():  # no cgroup cap to size the RAM tier from: give it explicitly
             env["GLM53_NV_RAM_GB"] = f"{max(4.0, box.memory_gb - 12.5):.1f}"
+        env.update(multimodal_env(box, self.name))
         env["PATH"] = f"{box.runtime.python.parent}:{os.environ.get('PATH', '')}"
         env.update({k_: str(v) for k_, v in box.env.items()})
         argv = [str(box.runtime.python), "-m", "bigmoe.models.glm53.engine.server", "-m", str(self.model_dir(box)),
