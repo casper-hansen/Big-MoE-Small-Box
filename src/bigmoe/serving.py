@@ -140,18 +140,63 @@ def sse_error(exc: BaseException) -> str:
     return "data: " + json.dumps(as_request_error(exc).body()) + "\n\n"
 
 
-async def guard_stream(chunks):
+KEEPALIVE_S = 15.0
+SSE_KEEPALIVE = ": keepalive\n\n"   # an SSE comment: clients skip it, but it is traffic on the connection
+
+
+async def guard_stream(chunks, keepalive_s: float = KEEPALIVE_S):
     """Pass SSE chunks through. Once a response has started its status cannot change, so an exception becomes an
-    in-band error event (OpenAI SDKs raise it as an APIError) followed by [DONE], instead of a torn connection."""
+    in-band error event (OpenAI SDKs raise it as an APIError) followed by [DONE], instead of a torn connection.
+
+    While no chunk comes for keepalive_s (queued behind other jobs, a long prefill), an SSE comment goes out instead:
+    Node's fetch (undici) drops a response body that is silent for 300 s with "terminated", and agent clients retried
+    the whole request, prefill again included. Clients' own idle watchdogs see events, not comments, so they still
+    catch a server that has really stopped.
+
+    The source runs in one pump task that queues its chunks; this side sends everything queued at once. exllamav3's
+    AsyncGenerator runs each forward pass synchronously on the event loop and yields to it once per step, so every
+    task hop a chunk takes costs a whole step: a task per chunk (waiting on each __anext__ with a timeout) made the
+    stream fall behind the decode by 2/3, the backlog arriving only once generation ended."""
+    q = asyncio.Queue()
+    end = object()
+
+    async def pump():
+        try:
+            async for c in chunks:
+                q.put_nowait(c)
+        except Exception as e:
+            q.put_nowait(e)
+            return
+        q.put_nowait(end)
+
+    task = asyncio.create_task(pump())
     try:
-        async for c in chunks:
-            yield c
+        while True:
+            try:
+                async with asyncio.timeout(keepalive_s):
+                    item = await q.get()
+            except TimeoutError:
+                yield SSE_KEEPALIVE
+                continue
+            while True:
+                if item is end:
+                    return
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+                if q.empty():
+                    break
+                item = q.get_nowait()
     except Exception as e:
         err = as_request_error(e)
         if err.status >= 500:
             traceback.print_exception(e)
         yield sse_error(e)
         yield "data: [DONE]\n\n"
+    finally:
+        if not task.done():                 # the client went away: stop the source (its finally cancels the job)
+            task.cancel()
+            await asyncio.wait({task})
 
 
 def generator_failure(gen):

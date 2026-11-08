@@ -73,6 +73,70 @@ def test_guard_stream_turns_a_late_failure_into_an_error_event():
     assert json.loads(out[1][len("data: "):])["error"]["code"] == "context_length_exceeded"
 
 
+def test_guard_stream_sends_keepalives_while_the_source_is_silent():
+    async def chunks():
+        yield "data: 1\n\n"
+        await asyncio.sleep(0.25)          # a long prefill
+        yield "data: 2\n\n"
+
+    async def collect():
+        return [c async for c in serving.guard_stream(chunks(), keepalive_s=0.1)]
+    out = asyncio.run(collect())
+    assert out[0] == "data: 1\n\n" and out[-1] == "data: 2\n\n"
+    assert out[1:-1] and set(out[1:-1]) == {serving.SSE_KEEPALIVE}
+
+
+def test_guard_stream_keeps_up_with_a_generator_that_blocks_the_event_loop():
+    """exllamav3's AsyncGenerator runs each forward pass synchronously on the loop and yields once per step: a chunk
+    must reach the client within a step or two, not fall further behind with every token."""
+    import time
+    N, step = 40, 0.03
+
+    async def run():
+        jobq, made, lags = asyncio.Queue(), {}, []
+
+        async def iteration():
+            for i in range(N):
+                time.sleep(step)                 # the forward pass
+                made[i] = time.perf_counter()
+                jobq.put_nowait(i)
+                await asyncio.sleep(0)
+
+        async def chunks():
+            for _ in range(N):
+                yield await jobq.get()
+        it = asyncio.create_task(iteration())
+        async for i in serving.guard_stream(chunks()):
+            lags.append(time.perf_counter() - made[i])
+        await it
+        return lags
+    lags = asyncio.run(run())
+    assert len(lags) == N and max(lags) < 3 * step, f"stream fell behind the decode by {max(lags):.2f}s"
+
+
+def test_guard_stream_closed_mid_wait_cancels_and_closes_the_source():
+    seen = []
+
+    async def chunks():
+        try:
+            yield "data: 1\n\n"
+            await asyncio.sleep(10)
+            yield "data: never\n\n"
+        except asyncio.CancelledError:
+            seen.append("cancelled")
+            raise
+        finally:
+            seen.append("closed")          # where the server cancels the job
+
+    async def run():
+        g = serving.guard_stream(chunks(), keepalive_s=0.05)
+        assert await g.__anext__() == "data: 1\n\n"
+        assert await g.__anext__() == serving.SSE_KEEPALIVE
+        await g.aclose()                   # the client disconnected
+    asyncio.run(run())
+    assert seen == ["cancelled", "closed"]
+
+
 class FakeTask:
     def __init__(self, done=False, exc=None):
         self._done, self._exc = done, exc

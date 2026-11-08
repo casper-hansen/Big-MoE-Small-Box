@@ -246,6 +246,16 @@ def sse(obj):
     return "data: " + json.dumps(obj) + "\n\n"
 
 
+def delta_sse(base, content, tool_calls):
+    """SSE events for a piece of answer text and ToolStream's tool_calls deltas ("" if there is neither)."""
+    ev = ""
+    if content:
+        ev += sse(dict(base, choices=[{"index": 0, "delta": {"content": content}, "finish_reason": None}]))
+    if tool_calls:
+        ev += sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": tool_calls}, "finish_reason": None}]))
+    return ev
+
+
 def watch_disconnect(req):
     gone = asyncio.Event()
 
@@ -356,20 +366,20 @@ async def chat(req: Request):
                                 break
                             in_think, new = False, rest
                         else:
-                            out = ts.feed(new) if ts else new
-                            if out:
-                                yield sse(dict(base, choices=[{"index": 0, "delta": {"content": out}, "finish_reason": None}]))
+                            ev = delta_sse(base, *(ts.feed(new) if ts else (new, [])))
+                            if ev:
+                                yield ev
                             break
                     if fin is None and gone.is_set():
                         break
                 reason = (fin or {}).get("type", "stop")
                 if ts:
-                    content, calls = ts.finish()
-                    if content:
-                        yield sse(dict(base, choices=[{"index": 0, "delta": {"content": content}, "finish_reason": None}]))
-                    if calls:
+                    out, calls, called = ts.finish()
+                    ev = delta_sse(base, out, calls)
+                    if ev:
+                        yield ev
+                    if called:
                         reason = "tool_calls"
-                        yield sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]}, "finish_reason": None}]))
                 usage = serving.usage(P, n, fin)
                 yield sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": reason}], usage=usage))
                 yield "data: [DONE]\n\n"
