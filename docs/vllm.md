@@ -276,3 +276,32 @@ Each idea was measured on this box before it was kept. Quality is measured again
   advantage is drafting from earlier *requests*, while what agents here repeat is within the context (files read, then
   written), which DSpark and GLM's n-gram policy already draft; and vLLM's proposer is tied to its own model runner.
 
+## Agent-turn quality (DeepSeek, mode `nvme`, 2026-11-09)
+
+The README's DeepSeek top-1 (99.6 %) is `kl_force` on six short chat prompts: the decode path on a reference answer,
+with almost no prefill. An agent turn also prefills its new tokens, and DeepSeek's mode `nvme` prefills through warm
+prefill (on by default since before the vLLM migration), so it agrees less with exact. Measured with
+`resume_kl.py`: six ~600-token answers, then a ~630-token second turn whose 128-token answer is teacher-forced along
+the exact (`nvme-exact`, full prefill) answer, so every position is compared on the same token path, 719 positions.
+The old engine is commit f9f7285 with `frontend=native`, run on the same day.
+
+| configuration | second-turn top-1 | mean KL | 6 turns | README test (`kl_force`, 1,110 positions) |
+|---|---|---|---|---|
+| old engine | 98.33 % | 0.0150 | 82.9 s | 99.46 %, KL 0.00156 |
+| vLLM, re-prefill | 98.33 % | 0.0149 | 82.5 s | 99.55-99.73 %, KL 0.00066-0.00093 |
+| vLLM, resumed from decode-time checkpoint (default) | 98.75 % | 0.0059 | 61.3 s | |
+| vLLM, re-prefill, `warm_fetch=128` | 98.75 % | 0.0057 | 101.5 s | |
+| vLLM, re-prefill, `warm_fetch=192` | 99.30 % | 0.0041 | 103.4 s | |
+| vLLM, resumed, `warm_fetch=192` | 98.89 % | 0.0048 | 61.5 s | |
+| vLLM, re-prefill, `warm_prefill=False` | 99.44 % | 0.0030 | 145.0 s | |
+
+Free-running instead of forced (both answers generated, compared up to their first difference): the old engine
+96.65 %, vLLM re-prefill 98.40 %, vLLM resumed 99.01 %.
+
+So vLLM matches the old engine on both tests, and its default (resuming from decode-time checkpoints) is better and
+faster than either. The remaining distance to the decode-only figure is warm prefill: re-prefilling exactly restores
+99.44 % at 76 % more time per turn, and reading more NVMe-only experts per layer (`warm_fetch`, default 64 of 384) buys
+most of it back at 25 % more time on fresh prompts. On resumed turns, whose short chunks route few cold experts,
+`warm_fetch=192` costs nothing measurable but gains little; long chunks (file reads, first turns) pay the most. Both
+knobs stay at their defaults; set `-o warm_fetch=192` or `-o warm_prefill=false` to trade prefill time for agreement.
+

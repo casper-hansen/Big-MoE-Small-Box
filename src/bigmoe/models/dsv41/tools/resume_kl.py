@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--force-turn1", action="store_true",
                     help="with --from: decode turn 1's answer from --from forced (/kl_force), so this configuration "
                          "stashes its own decode-time checkpoints along the same tokens")
+    ap.add_argument("--forced-ref", help="decode turn 2 forced along this run's turn-2 tokens (/kl_force): every position "
+                                         "on the same token path, comparable with kl_force's numbers")
     ap.add_argument("--prime", type=int, default=0,
                     help="before turn 2, prefill the first N tokens of the sequence (one output token): with N just past "
                          "a page boundary the last-page split stashes a prefill-time checkpoint there (the reference "
@@ -43,6 +45,7 @@ def main():
     a = ap.parse_args()
     tok = lambda text: post(a.url + "/tokenize", {"prompt": text, "add_special_tokens": False})["tokens"]
     src = json.load(open(a.src)) if a.src else {}
+    forced = json.load(open(a.forced_ref)) if a.forced_ref else None
     res = {}
     for i, topic in enumerate(TOPICS):
         name = f"t{i}"
@@ -63,12 +66,16 @@ def main():
         if a.prime:
             post(a.url + "/generate", {"input_ids": seq[:a.prime], "sampling_params": {
                 "temperature": 0, "max_new_tokens": 1}})
-        get(a.url + "/kl_capture?on=1")
-        get(a.url + "/kl_capture")
         t0 = time.time()
-        r = post(a.url + "/generate", {"input_ids": seq + follow, "sampling_params": {
-            "temperature": 0, "max_new_tokens": a.decode}})
-        cap = get(a.url + "/kl_capture?on=0")
+        if forced is not None:
+            cap = post(a.url + "/kl_force", {"prompt": seq + follow, "ref": forced[name]["gen"]})
+            cap["prompt"], cap["gen"], r = seq + follow, forced[name]["gen"], {}
+        else:
+            get(a.url + "/kl_capture?on=1")
+            get(a.url + "/kl_capture")
+            r = post(a.url + "/generate", {"input_ids": seq + follow, "sampling_params": {
+                "temperature": 0, "max_new_tokens": a.decode}})
+            cap = get(a.url + "/kl_capture?on=0")
         res[name] = {"seq": seq, "gen": cap["gen"], "prompt_len": len(seq + follow), "secs": round(time.time() - t0, 2),
                      "cached": ((r.get("meta_info") or {}).get("finish_reason") or {}).get("timings", {}).get(
                          "cached_tokens"),

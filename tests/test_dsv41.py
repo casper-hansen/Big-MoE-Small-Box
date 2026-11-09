@@ -148,7 +148,9 @@ def test_store_v2_mixed_sizes(odirect_dir, tmp_path):
 
 def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch)
-    assert spec.env["DSV41_EC_WARM_PREFILL"] == "1"
+    assert spec.env["DSV41_EC_WARM_PREFILL"] == "1" and spec.env["DSV41_EC_WARM_FETCH"] == "64"
+    _, spec = spec_for(tmp_path, monkeypatch, warm_fetch=192)
+    assert spec.env["DSV41_EC_WARM_FETCH"] == "192"
     _, spec = spec_for(tmp_path, monkeypatch, warm_prefill=False)
     assert spec.env["DSV41_EC_WARM_PREFILL"] == "0"
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")

@@ -62,7 +62,7 @@ exllamav3's fused hyper-connection sites (`EXL3_HC_FOLD=1`) replace the custom d
 
 ## DeepSeek-V4.1-Flash
 
-`bigmoe bench` prompts, greedy, 128k context, FP16 KV cache, DSpark speculative decoding (`bigmoe verify`, 2026-11-06). KL and top-1: mean per-token KL divergence from exact single-token decode (`nvme-exact`, no speculation) and the share of positions with the same most likely token, on the same forced tokens, six chat prompts, 1,110 positions; with DSpark even `nvme-exact` differs slightly, because the verify forwards round in other GEMM shapes.
+`bigmoe bench` prompts, greedy, 128k context, FP16 KV cache, DSpark speculative decoding (`bigmoe verify`, 2026-11-06). KL and top-1: mean per-token KL divergence from exact single-token decode (`nvme-exact`, no speculation) and the share of positions with the same most likely token, on the same forced tokens, six chat prompts, 1,110 positions; with DSpark even `nvme-exact` differs slightly, because the verify forwards round in other GEMM shapes. This is the decode path on short prompts; an agent turn that also prefills new tokens through warm prefill agrees less (98.3-98.8 % top-1 on the same test for the old engine and vLLM, 99.4 % with `-o warm_prefill=false` at 76 % more time per turn; [docs/vllm.md](docs/vllm.md#agent-turn-quality-deepseek-mode-nvme-2026-11-09)).
 
 | mode | prompt tokens | prefill | decode | KL | top-1 |
 |---|---|---|---|---|---|

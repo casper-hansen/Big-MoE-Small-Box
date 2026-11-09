@@ -81,6 +81,9 @@ class DSV41Options:
     # mode nvme: warm prefill (engine/warm_prefill.py), staged prefill on the VRAM / RAM experts plus each layer's 64
     # heaviest NVMe-only ones; measured top-1 99.7 % against exact prefill on an agent turn, one-forward step 15 -> 9 s
     warm_prefill: bool = True
+    # warm prefill: NVMe-only experts read per layer of a staged forward (the heaviest by routing weight; the other cold
+    # picks are dropped). More is closer to exact prefill and slower on long chunks (docs/vllm.md, "Agent-turn quality").
+    warm_fetch: int = 64
     # image input (bigmoe/multimodal.py), on by default: OpenAI / Anthropic image blocks in chat messages. The vision tower
     # is not resident (no VRAM, no RAM while no image comes in); a request with new images loads it from the checkpoint
     # on NVMe into VRAM lent by the expert cache, encodes them and unloads it. Embeddings are cached by image content
@@ -96,6 +99,8 @@ class DSV41Options:
     mm_cache_mb: int = 2048
 
     def validate(self):
+        if not 1 <= int(self.warm_fetch) <= 384:
+            raise ValueError(f"warm_fetch must be 1..384, got {self.warm_fetch!r}")
         if not 0.0 <= float(self.frontend_extra_ram_gb) <= 8.0:
             raise ValueError(f"frontend_extra_ram_gb must be 0..8, got {self.frontend_extra_ram_gb!r}")
         if self.mode not in MODES:
@@ -299,6 +304,8 @@ class DSV41(ModelBackend):
         if env["DSV41_NV_CPU"] == "1":
             env["DSV41_NV_CPU_CPUS"] = format_cpus(lay.lane)
             env["DSV41_EC_WARM_PREFILL"] = "1" if o.warm_prefill else "0"
+            if o.warm_prefill:
+                env["DSV41_EC_WARM_FETCH"] = str(int(o.warm_fetch))
             env.update(engine.x16_env("DSV41_", o.x16_layers))
         for spec in self.kernel_specs(box):
             env[spec.env_var] = str(box.runtime.kernel_dirs([spec], box.arch)[spec.name])

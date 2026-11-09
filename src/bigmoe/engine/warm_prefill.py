@@ -21,7 +21,10 @@ import time
 import numpy as np
 import torch
 
-FETCH_PER_LAYER = 64      # cold experts read per layer of a staged forward (64 of 384: ~7 % of the routing weight left)
+from .env import env
+
+# cold experts read per layer of a staged forward (64 of 384: ~7 % of the routing weight left); EC_WARM_FETCH overrides
+FETCH_PER_LAYER = int(env("EC_WARM_FETCH", "64"))
 READERS = 16              # parallel store reads (the NVMe needs a deep queue for its full bandwidth)
 BATCH = 16                # experts per read batch; two batches of pinned slots alternate (read one, copy the other)
 RAM_RESIDENT = 2          # nv2 host state of an expert in the RAM tier (KS_RES)
