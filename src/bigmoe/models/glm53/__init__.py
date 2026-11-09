@@ -17,7 +17,7 @@ from ...launcher import LaunchSpec
 from ...registry import ModelBackend, register_backend
 from ...steps import Step
 from ..prefix_cache import cpu_tier_gb
-from ..runtime import DESCRIPTION as RUNTIME, runtime_spec
+from ..runtime import FRONTENDS, description as runtime_description, runtime_spec
 from ..multimodal_env import multimodal_env
 from ...store import ExpertStore, compare, pack, punch_experts
 from ...store.slim import expert_ranges
@@ -87,11 +87,21 @@ class GLM53Options:
     # on NVMe into VRAM lent by the expert cache, encodes them and unloads it. Embeddings are cached by image content
     # (RAM, then mm_cache_mb on the SSD), so a resent image keeps its token ids and the prefix cache reuses it.
     # image_tokens caps the tokens per image (None: the model's own budget); False turns image input off (400).
+    # "vllm" (default): vLLM's OpenAI server and scheduler in front of the same exllamav3 + shared-engine compute
+    # (bigmoe/vllm); "native": the exllamav3 AsyncGenerator server this backend shipped with
+    frontend: str = "vllm"
+    # extra cgroup RAM for vLLM's separate API/detokenizer process; without it nv2 silently shrinks the RAM expert
+    # tier by the frontend's footprint (~1.3 GiB measured), which costs decode speed. 0 keeps the native memory cap.
+    frontend_extra_ram_gb: float = 1.5
     multimodal: bool = True
     image_tokens: int = None
     mm_cache_mb: int = 2048
 
     def validate(self):
+        if self.frontend not in FRONTENDS:
+            raise ValueError(f"frontend must be one of {FRONTENDS}, got {self.frontend!r}")
+        if not 0.0 <= float(self.frontend_extra_ram_gb) <= 8.0:
+            raise ValueError(f"frontend_extra_ram_gb must be 0..8, got {self.frontend_extra_ram_gb!r}")
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
         if self.speculation not in SPECULATION:
@@ -173,7 +183,8 @@ class GLM53(ModelBackend):
         return ExpertStore(d, STORE_NAME)
 
     def runtime_spec(self, box):
-        return runtime_spec("glm53", "import torch, exllamav3; from exllamav3.ext import exllamav3_ext")
+        return runtime_spec("glm53", "import torch, exllamav3; from exllamav3.ext import exllamav3_ext",
+                            box.options.frontend)
 
     def kernel_specs(self, box) -> list:
         from ... import engine
@@ -190,7 +201,7 @@ class GLM53(ModelBackend):
             return all(is_built(s, dirs[s.name]) for s in specs)
 
         steps = [
-            Step("runtime", f"create the server's Python environment ({RUNTIME})", rt.is_ready,
+            Step("runtime", f"create the server's Python environment ({runtime_description(o.frontend)})", rt.is_ready,
                  lambda: rt.ensure(box.arch), detail=lambda: str(rt.path)),
             Step("kernels", "compile the torch extensions (shared engine: expert pool, nv2 + CPU lane; GLM: "
                  "hyper-connections)", kernels_done, lambda: rt.build_kernels(specs, box.arch),
@@ -332,7 +343,8 @@ class GLM53(ModelBackend):
         env.update(multimodal_env(box, self.name))
         env["PATH"] = f"{box.runtime.python.parent}:{os.environ.get('PATH', '')}"
         env.update({k_: str(v) for k_, v in box.env.items()})
-        argv = [str(box.runtime.python), "-m", "bigmoe.models.glm53.engine.server", "-m", str(self.model_dir(box)),
+        server = ["bigmoe.vllm.serve", "--backend", "glm53"] if o.frontend == "vllm" else ["bigmoe.models.glm53.engine.server"]
+        argv = [str(box.runtime.python), "-m", *server, "-m", str(self.model_dir(box)),
                 "-cs", str(box.context), "--max-batch-size", str(o.max_batch_size), "-chunk_size", str(o.chunk_size),
                 *mode_args, *small]
         ccs = cpu_tier_gb(o.cpu_cache_gb, o.disk_cache, box.context, KV_BYTES_PER_TOKEN)
@@ -350,7 +362,8 @@ class GLM53(ModelBackend):
         # ambient engine variables would silently change the configuration: only the ones set here reach the server
         unset = tuple(v for v in os.environ if v.startswith(("GLM53_", "BIGMOE_", "EXL3_", "EXLLAMAV3_")) and v not in env)
         unset += ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
-        return LaunchSpec(argv=argv, env=env, host=box.host, port=box.port, memory_gb=box.memory_gb, unset=unset,
+        return LaunchSpec(argv=argv, env=env, host=box.host, port=box.port, memory_gb=box.memory_gb + (float(o.frontend_extra_ram_gb) if o.frontend == "vllm" else 0.0),
+                          unset=unset,
                           served_name=box.served_name, files={str(tune): str(DATA / "coop_autotune_1gpu.bin")},
                           record={"backend": self.name, "model": box.ref.label, "commit": box.commit,
                                   "context": box.context, "options": {k_: str(v) for k_, v in

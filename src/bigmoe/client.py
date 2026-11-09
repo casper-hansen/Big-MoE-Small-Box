@@ -94,7 +94,8 @@ class Client:
         return self.request("/stats", timeout=30)
 
     def tokenize(self, text: str) -> list:
-        return self.request("/tokenize", {"prompt": text})["tokens"]
+        # the text carries its own special tokens (vLLM's /tokenize would add a BOS; the native servers ignore the flag)
+        return self.request("/tokenize", {"prompt": text, "add_special_tokens": False})["tokens"]
 
     def _chat_body(self, messages, *, thinking, max_tokens, temperature, extra):
         images = extra.pop("images", None)   # paths / bytes / PIL images / URLs, put before the last user message's text

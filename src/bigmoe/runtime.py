@@ -38,15 +38,25 @@ class RuntimeSpec:
     source_builds: tuple = ()
     cuda_subdir: str = "nvidia/cu13"  # where the pip CUDA wheels install inside site-packages
     smoke_test: str = "import torch"
+    # installed with --no-deps after `requirements` (vLLM: its wheel pins a torch the runtime does not use)
+    nodeps_requirements: Path = None
+    # a runtime with the same torch whose source-build wheels this one reuses (the vLLM runtimes reuse the native
+    # runtimes' exllamav3 build instead of compiling it again)
+    wheels_like: "RuntimeSpec" = None
 
     def key(self) -> str:
         h = hashlib.sha256()
         parts = [self.name, self.python, _pins(self.requirements), _pins(self.build_requirements), self.index_url or "",
                  " ".join(self.extra_index_urls), self.index_strategy or ""]
         parts += [f"{s.name}=={s.version}@{s.url}" for s in self.source_builds]
+        if self.nodeps_requirements is not None:
+            parts.append(_pins(self.nodeps_requirements))
         for p in parts:
             h.update(p.encode() + b"\0")
         return h.hexdigest()[:10]
+
+    def wheel_key(self) -> str:
+        return self.wheels_like.key() if self.wheels_like is not None else self.key()
 
 
 def _pins(path) -> str:
@@ -117,16 +127,38 @@ def _site_packages(env: Path) -> Path:
     return found[0]
 
 
+PLUGIN_DIST = "bigmoe_vllm_plugin-0.1.0.dist-info"
+PLUGIN_ENTRY_POINTS = ("[vllm.general_plugins]\nbigmoe = bigmoe.vllm:register\n\n"
+                       "[vllm.endpoint_plugins]\nbigmoe_routes = bigmoe.vllm.routes:BigmoeRoutes\n")
+
+
+def link_vllm_plugin(env: Path):
+    """The symlinked package has no dist-info, so vLLM (which finds plugins by entry point) would not see it: a minimal
+    dist-info declares bigmoe.vllm:register as a vllm.general_plugins entry point (vLLM calls it in every process it
+    starts) and the extra HTTP routes as a vllm.endpoint_plugins one (loaded once VLLM_PLUGINS allowlists it, which
+    bigmoe.vllm.serve does). Harmless in an environment without vLLM."""
+    d = _site_packages(env) / PLUGIN_DIST
+    want = {"METADATA": "Metadata-Version: 2.1\nName: bigmoe-vllm-plugin\nVersion: 0.1.0\n",
+            "entry_points.txt": PLUGIN_ENTRY_POINTS, "RECORD": ""}
+    d.mkdir(exist_ok=True)
+    for name, text in want.items():
+        p = d / name
+        if not p.is_file() or p.read_text() != text:
+            p.write_text(text)
+
+
 def link_bigmoe(env: Path):
     pkg = Path(__file__).resolve().parent
     link = _site_packages(env) / "bigmoe"
     if link.is_symlink():
-        if link.resolve() == pkg:
-            return
-        link.unlink()
+        if link.resolve() != pkg:
+            link.unlink()
+            link.symlink_to(pkg, target_is_directory=True)
     elif link.exists():
-        return  # bigmoe was installed into that environment on purpose
-    link.symlink_to(pkg, target_is_directory=True)
+        pass  # bigmoe was installed into that environment on purpose; only add the plugin's dist-info
+    else:
+        link.symlink_to(pkg, target_is_directory=True)
+    link_vllm_plugin(env)
 
 
 class Runtime:
@@ -198,6 +230,9 @@ class Runtime:
         t0 = time.time()
         log.info("creating the %s runtime environment %s", self.spec.name, self.path)
         self._create(self.path, [self.spec.requirements])
+        if self.spec.nodeps_requirements is not None:
+            self._uv("pip", "install", "--python", self.python, "--no-deps", "-r", self.spec.nodeps_requirements,
+                     *self._index_args())
         wheels = [self.wheel(sb, arch) for sb in self.spec.source_builds]
         if wheels:
             self._uv("pip", "install", "--python", self.python, "--no-deps", *wheels)
@@ -262,7 +297,7 @@ class Runtime:
         return env
 
     def wheel(self, sb: SourceBuild, arch: str) -> Path:
-        key = hashlib.sha256(f"{self.spec.key()}|{sb.name}|{sb.version}|{sb.url}|{arch}".encode()).hexdigest()[:10]
+        key = hashlib.sha256(f"{self.spec.wheel_key()}|{sb.name}|{sb.version}|{sb.url}|{arch}".encode()).hexdigest()[:10]
         out = Path(self.home.wheels) / f"{sb.name}-{sb.version}-{key}"
         found = sorted(out.glob("*.whl")) if out.is_dir() else []
         if found:

@@ -390,6 +390,13 @@ class EmbeddingCache:
 # --------------------------------------------------------------------------------------------------------------------
 # the vision tower, loaded per encode batch
 # --------------------------------------------------------------------------------------------------------------------
+class _Sized:
+    """Stands in for the PIL image where the tower only reads its size (embedding metadata)."""
+
+    def __init__(self, size):
+        self.size = tuple(size)
+
+
 class Vision:
     """On-demand vision tower + embedding cache for one server."""
 
@@ -596,6 +603,36 @@ class Vision:
         self.log(f" -- images: {len(order)} ({len(order) - len(todo)} cached), {n_tok} tokens, decode/resize "
                  f"{t_cpu:.2f} s, tower load + encode {t_gpu:.2f} s [{time.strftime('%H:%M:%S')}]")
         return with_aliases(messages, [e.text_alias for e in order]), uniq, info
+
+    def embed_prepped(self, items):
+        """[MMEmbedding] for [(content key, (width, height) of the original image, preprocessed tensors)] that the
+        caller decoded and preprocessed already (the vLLM processor, bigmoe/vllm/mm.py, runs preprocess() in the API
+        server). Cached embeddings (RAM, then disk) skip the tower; the rest are encoded in one tower load. Each key keeps
+        its placeholder ids for the process lifetime, as in prepare()."""
+        t0 = time.perf_counter()
+        embs, todo = {}, []
+        for key, size, prepped in items:
+            if key in embs or any(k == key for k, _, _ in todo):
+                continue
+            mme = self.cache.get(key)
+            if mme is not None:
+                embs[key] = mme
+            else:
+                todo.append((key, _Sized(size), prepped))
+        if todo:
+            for key, mme in self._encode_now(todo):
+                embs[key] = self.cache.put(key, mme)
+                self.stats["encoded"] += 1
+                if self.cache.disk_dir:
+                    self.pool.submit(self.cache.write_disk, key, mme)
+        order = [embs[k] for k, _, _ in items]
+        n_tok = sum(len(e.token_list) for e in order)
+        self.stats["requests"] += 1
+        self.stats["images"] += len(order)
+        self.stats["image_tokens"] += n_tok
+        self.log(f" -- images: {len(order)} ({len(order) - len(todo)} cached), {n_tok} tokens, tower load + encode "
+                 f"{time.perf_counter() - t0:.2f} s [{time.strftime('%H:%M:%S')}]")
+        return order
 
     def self_test(self):
         """Startup check of the whole path on a synthetic image, while torch's free VRAM covers it (no lending): loads

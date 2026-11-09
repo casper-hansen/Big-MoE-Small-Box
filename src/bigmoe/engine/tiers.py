@@ -116,10 +116,14 @@ def log(msg):
 _log = log
 
 
+# the server's exllamav3 command line when it is not the process's own (the vLLM worker: bigmoe.vllm.engine sets it)
+ARGV = None
+
+
 def _rcs_bytes():
     """exllamav3's host-RAM caches, left out of the RAM tier: recurrent / SWA state checkpoints (-rcs GiB, default
     0.5) and the second-tier K/V page cache in pinned memory (-ccs GiB, default 0)."""
-    a, rcs, ccs = sys.argv, 0.5, 0.0
+    a, rcs, ccs = ARGV if ARGV is not None else sys.argv, 0.5, 0.0
     for i, x in enumerate(a):
         if x in ("-rcs", "--recurrent_cache_size") and i + 1 < len(a):
             rcs = float(a[i + 1])

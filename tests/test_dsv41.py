@@ -47,9 +47,9 @@ def test_launch_exact(tmp_path, monkeypatch):
     assert e["DSV41_NV_STORE"].endswith(dsv41.STORE_NAME + ".bin")
     assert e["BIGMOE_ENGINE_PREFIX"] == "DSV41_"
     assert {e["BIGMOE_EC_BUILD"], e["BIGMOE_NV2_BUILD"]} == {"/k/bigmoe_ec-key", "/k/bigmoe_nv2-key"}
-    assert spec.argv[:3] == ["/envs/dsv41/bin/python", "-m", "bigmoe.models.dsv41.engine.server"]
+    assert spec.argv[:5] == ["/envs/dsv41/bin/python", "-m", "bigmoe.vllm.serve", "--backend", "dsv41"]
     assert spec.argv[spec.argv.index("-chunk_size") + 1] == "8192" and spec.argv[spec.argv.index("-cs") + 1] == "131072"
-    assert "-ccs" in spec.argv and spec.memory_gb == 56.0
+    assert "-ccs" in spec.argv and spec.memory_gb == 60.5   # 56 GiB engine + DeepSeek's vLLM runtime allowance
 
 
 def test_prefix_cache_tiers(tmp_path, monkeypatch):
@@ -153,3 +153,17 @@ def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
     assert spec.env["DSV41_EC_WARM_PREFILL"] == "0"
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
     assert "DSV41_EC_WARM_PREFILL" not in spec.env
+
+
+def test_native_frontend(tmp_path, monkeypatch):
+    _box, spec = spec_for(tmp_path, monkeypatch, frontend="native")
+    assert spec.argv[:3] == ["/envs/dsv41/bin/python", "-m", "bigmoe.models.dsv41.engine.server"]
+    _box, vspec = spec_for(tmp_path, monkeypatch)
+    assert vspec.argv[5:] == spec.argv[3:]
+    assert {k: v for k, v in vspec.env.items() if k != "DSV41_NV_RAM_GB"} == spec.env
+    assert vspec.env["DSV41_NV_RAM_GB"] == "46.0"   # deterministic native-sized tier, unlike the native auto-sizing
+    assert vspec.memory_gb == spec.memory_gb + 4.5
+    _box, spec = spec_for(tmp_path, monkeypatch, frontend_extra_ram_gb=0)
+    assert spec.memory_gb == 56.0
+    with pytest.raises(ValueError):
+        AutoBox("deepseek-v4.1-flash", home=tmp_path, frontend="sglang").options.validate()

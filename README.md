@@ -1,6 +1,6 @@
 # Big MoE, Small Box
 
-Big MoE, Small Box serves Mixture-of-Experts models that are far larger than the GPU from one 24 GB card, 64 GB of RAM and an NVMe drive: [GLM-5.3-Flash](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3) (321B parameters, EXL3 3.05 bpw, 125 GB) and [DeepSeek-V4.1-Flash](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3) (EXL3 2.25 bpw, 361 GB including 203 GB of Engram tables), each behind an OpenAI-compatible server on [exllamav3](https://github.com/turboderp-org/exllamav3) 1.6.6 (one release for both, `models/runtime.py`). A token only uses a few routed experts per MoE layer (8 of 288 for GLM, 6 of 384 for DeepSeek), so the routed experts, which are most of the weights, live in three tiers and every layer is served from wherever its experts are:
+Big MoE, Small Box serves Mixture-of-Experts models that are far larger than the GPU from one 24 GB card, 64 GB of RAM and an NVMe drive: [GLM-5.3-Flash](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3) (321B parameters, EXL3 3.05 bpw, 125 GB) and [DeepSeek-V4.1-Flash](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3) (EXL3 2.25 bpw, 361 GB including 203 GB of Engram tables). By default each is served by vLLM 0.33.0's OpenAI-compatible frontend and scheduler, with [exllamav3](https://github.com/turboderp-org/exllamav3) 1.6.6 running the model math (one release for both, `models/runtime.py`; `frontend="native"` selects the previous standalone server). A token only uses a few routed experts per MoE layer (8 of 288 for GLM, 6 of 384 for DeepSeek), so the routed experts, which are most of the weights, live in three tiers and every layer is served from wherever its experts are:
 
 - **Expert store.** The routed experts are packed into one file of fixed-size records per layer and read with `O_DIRECT`; the checkpoint keeps everything else and its expert bytes are punched out after the store is verified. The loader never reads the experts from the checkpoint: every expert tensor starts as a view of one VRAM bounce slot.
 - **Three tiers, exllamav3's own math.** A CLOCK cache of uniform slots fills all free VRAM (layers with different expert sizes share it, each in its own compact layout); a pinned, GPU-mapped RAM tier holds the experts that are not in VRAM; the rest stays on NVMe. exllamav3's kernels read every expert through its live pointer tables, which the engine points at the expert's current home, so the bytes and the arithmetic are exllamav3's own.
@@ -24,6 +24,10 @@ box.stop()
 ```
 
 The offloading and scheduling engine started as 0xSero's [glm-flash-lite](https://github.com/sybil-solutions/glm-flash-lite) (MIT, `LICENSE.glm-flash-lite`); this package is Apache-2.0 (`LICENSE`).
+
+## Serving frontend
+
+vLLM 0.33.0 supplies the OpenAI/Anthropic API server, chat renderer, tool and reasoning parsers, detokenizer, stop handling and multimodal input pipeline. An out-of-tree plugin (`bigmoe.vllm`) connects its EngineCore scheduler to exllamav3's generator, so the EXL3 kernels, nv2 expert tiers, prefix caches, speculative decoding and lazy vision towers remain the measured ones. vLLM 0.33 cannot execute either model's attention on sm86 and has no EXL3 quantization, which is why this is a frontend migration rather than a replacement of the compute kernels. Architecture, compatibility notes and verification results: [docs/vllm.md](docs/vllm.md).
 
 ## Build
 
