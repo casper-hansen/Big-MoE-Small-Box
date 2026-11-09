@@ -8,6 +8,7 @@ Configured through the environment the serve entry point (serve.py) sets before 
 """
 import json
 import os
+import time
 
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -35,6 +36,7 @@ class BoxWorker(WorkerBase):
             self.device = torch.device("cuda:0")
             torch.cuda.set_device(self.device)
         self.engine = None
+        self.t_end = None
 
     def load_model(self, *, load_dummy_weights: bool = False):
         # serve.py pinned the API server (and so this process) to the main CPUs; loading uses every core, and the
@@ -101,7 +103,18 @@ class BoxWorker(WorkerBase):
         for verification, the grammar rows of structured-output requests."""
         scheduler_output, plan = self.step
         self.step = None
+        t0 = time.perf_counter()
         result = self.engine.execute(plan, scheduler_output.scheduled_spec_decode_tokens, grammar_output)
+        t1 = time.perf_counter()
+        st = getattr(self.engine, "stats", {}).get("scheduler")
+        if st is not None:
+            # where a busy step's time goes: the engine's execute vs vLLM between two executes (update_from_output,
+            # schedule, output processing); gaps over a second are idle time, not overhead
+            st["execute_s"] = st.get("execute_s", 0.0) + (t1 - t0)
+            if self.t_end is not None and t0 - self.t_end < 1.0:
+                st["between_s"] = st.get("between_s", 0.0) + (t0 - self.t_end)
+                st["between_n"] = st.get("between_n", 0) + 1
+        self.t_end = t1
         req_ids = list(plan)
         sampled = [result[rid][0] if rid in result else [] for rid in req_ids]
         state.put_progress({rid: result[rid][1] for rid in req_ids if rid in result})

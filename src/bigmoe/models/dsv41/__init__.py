@@ -40,6 +40,9 @@ SPECULATION = ("dspark", "none")
 TUNED_PLANNER = "0.17,0.023,0.36,0.145,0.42,0.12,0.40,0.25,1.36,0.75"
 
 
+RC_NVME = 256   # rc_interval in mode nvme when the option is left at None (see Options.rc_interval)
+
+
 @dataclasses.dataclass
 class DSV41Options:
     # "nvme" (default): CPU lane on, near-exact (forced-token mean KL 0.0011 vs nvme-exact); "nvme-exact": every expert
@@ -54,6 +57,11 @@ class DSV41Options:
     slim: bool = True
     verify_weights: bool = True
     prefix_cache_gb: float = 0.5   # exllamav3's SWA-layer state checkpoints in host RAM (-rcs, GiB)
+    # recurrent-state checkpoints while decoding, every rc_interval tokens (a multiple of the 256-token page), so an
+    # agent's next turn, which extends this answer, resumes inside it instead of re-prefilling it (docs/vllm.md,
+    # "Decode-time checkpoints"). None: RC_NVME in mode nvme, exllamav3's own schedule (2048) in nvme-exact, which
+    # stays bit-exact; 0: exllamav3's schedule. Checkpoints share prefix_cache_gb (LRU).
+    rc_interval: int = None
     # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
     # GPU cache evicts (one long conversation evicts every other) are restored from it instead of prefilled
     # again. disk_cache: a directory for exllamav3's persistent third tier behind it (pages and checkpoints survive
@@ -100,6 +108,8 @@ class DSV41Options:
             raise ValueError(f"cache_quant must be 2..8 bits or None, got {self.cache_quant!r}")
         if int(self.chunk_size) <= 0 or int(self.max_batch_size) <= 0:
             raise ValueError("chunk_size and max_batch_size must be positive")
+        if self.rc_interval is not None and (int(self.rc_interval) < 0 or int(self.rc_interval) % 256):
+            raise ValueError(f"rc_interval must be 0, a multiple of 256 or None, got {self.rc_interval!r}")
         if not 0.0 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0..64, got {self.prefix_cache_gb!r}")
         if self.cpu_cache_gb is not None and not 0.0 <= float(self.cpu_cache_gb) <= 64:
@@ -300,6 +310,9 @@ class DSV41(ModelBackend):
         elif not system.systemd_scope_available():
             env["DSV41_NV_RAM_GB"] = f"{max(4.0, box.memory_gb - 12.5):.1f}"
         env.update(multimodal_env(box, self.name))
+        rc = o.rc_interval if o.rc_interval is not None else (RC_NVME if o.mode == "nvme" else None)
+        if rc:
+            env["DSV41_RC_INTERVAL"] = str(int(rc))
         env["PATH"] = f"{box.runtime.python.parent}:{os.environ.get('PATH', '')}"
         env.update({k_: str(v) for k_, v in box.env.items()})
         argv = [str(box.runtime.python), "-m", "bigmoe.vllm.serve", "--backend", "dsv41", "-m", str(self.model_dir(box)),

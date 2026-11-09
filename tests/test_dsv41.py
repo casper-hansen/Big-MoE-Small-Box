@@ -166,3 +166,16 @@ def test_vllm_is_the_only_server(tmp_path, monkeypatch):
         AutoBox("deepseek-v4.1-flash", home=tmp_path, frontend="native")
     with pytest.raises(ValueError):   # the disk tier sits behind the CPU tier
         spec_for(tmp_path, monkeypatch, "nvme", cpu_cache_gb=0, disk_cache="/x")
+
+
+def test_decode_time_checkpoints(tmp_path, monkeypatch):
+    _, spec = spec_for(tmp_path, monkeypatch)                       # mode nvme: every 256 tokens
+    assert spec.env["DSV41_RC_INTERVAL"] == "256"
+    _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")    # bit-exact mode keeps exllamav3's schedule
+    assert "DSV41_RC_INTERVAL" not in spec.env
+    _, spec = spec_for(tmp_path, monkeypatch, rc_interval=0)
+    assert "DSV41_RC_INTERVAL" not in spec.env
+    _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact", rc_interval=512)
+    assert spec.env["DSV41_RC_INTERVAL"] == "512"
+    with pytest.raises(ValueError):
+        spec_for(tmp_path, monkeypatch, rc_interval=300)

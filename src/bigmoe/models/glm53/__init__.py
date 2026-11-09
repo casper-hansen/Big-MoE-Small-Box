@@ -50,6 +50,9 @@ KV_BYTES_PER_TOKEN = 17609   # measured: a 4,507,871-byte disk page image, 256 t
 SPECULATION = ("none", "ngram")
 
 
+RC_NVME = None   # rc_interval in mode nvme when the option is left at None (see Options.rc_interval)
+
+
 @dataclasses.dataclass
 class GLM53Options:
     mode: str = "nvme"
@@ -67,6 +70,11 @@ class GLM53Options:
     # exllamav3's recurrent-state prefix cache in host RAM (-rcs, GiB; ~143 MB per checkpoint). Every GiB left to the RAM
     # expert tier instead is ~110 more cached experts: 4 -> 1 GiB measured +5 % decode (fewer NVMe reads)
     prefix_cache_gb: float = 1.0
+    # recurrent-state checkpoints while decoding, every rc_interval tokens (a multiple of the 256-token page), so an
+    # agent's next turn, which extends this answer, resumes inside it instead of re-prefilling it (docs/vllm.md,
+    # "Decode-time checkpoints"). None: RC_NVME in mode nvme, exllamav3's own schedule (2048) in nvme-exact, which
+    # stays bit-exact; 0: exllamav3's schedule. Checkpoints share prefix_cache_gb (LRU).
+    rc_interval: int = None
     # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
     # GPU cache evicts are restored from it instead of prefilled again. disk_cache: a directory for exllamav3's
     # persistent third tier behind it (pages and checkpoints survive restarts); written only when pages leave the GPU
@@ -108,6 +116,8 @@ class GLM53Options:
         if int(self.chunk_size) <= 0 or int(self.max_batch_size) <= 0:
             raise ValueError("chunk_size and max_batch_size must be positive")
         engine.check_x16_layers(self.x16_layers)
+        if self.rc_interval is not None and (int(self.rc_interval) < 0 or int(self.rc_interval) % 256):
+            raise ValueError(f"rc_interval must be 0, a multiple of 256 or None, got {self.rc_interval!r}")
         if not 0.25 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0.25..64, got {self.prefix_cache_gb!r}")
         if self.cpu_cache_gb is not None and not 0.0 <= float(self.cpu_cache_gb) <= 64:
@@ -335,6 +345,9 @@ class GLM53(ModelBackend):
         if not system.systemd_scope_available():  # no cgroup cap to size the RAM tier from: give it explicitly
             env["GLM53_NV_RAM_GB"] = f"{max(4.0, box.memory_gb - 12.5):.1f}"
         env.update(multimodal_env(box, self.name))
+        rc = o.rc_interval if o.rc_interval is not None else (RC_NVME if o.mode == "nvme" else None)
+        if rc:
+            env["GLM53_RC_INTERVAL"] = str(int(rc))
         env["PATH"] = f"{box.runtime.python.parent}:{os.environ.get('PATH', '')}"
         env.update({k_: str(v) for k_, v in box.env.items()})
         argv = [str(box.runtime.python), "-m", "bigmoe.vllm.serve", "--backend", "glm53", "-m", str(self.model_dir(box)),

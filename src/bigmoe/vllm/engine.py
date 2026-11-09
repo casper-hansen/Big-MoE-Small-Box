@@ -326,6 +326,7 @@ class ExlEngine:
                              ngram_match_min=a.ngram_match_min, hybrid_draft_tokens=a.hybrid_draft_tokens,
                              record_draft_stats=bool(self.draft_model is not None or a.ngram_match_min),
                              recurrent_cache_size=int(a.recurrent_cache_size * 1024 ** 3),
+                             recurrent_checkpoint_interval=int(os.environ.get(f"{self.prefix}RC_INTERVAL", "0")) or None,
                              **serving.prefix_cache_tiers(a))
         if self.backend == "glm53" and a.ngram_match_min and os.environ.get("GLM53_NG_POLICY", "1") == "1":
             from exllamav3.generator.generator import Generator as G
@@ -709,8 +710,17 @@ class ExlEngine:
         if draft_tokens is None or [id(j) for j in jobs] != self.draft_rows:
             g._draft_conf_round = None           # the calibrator labels only the round it drafted
         t0 = time.perf_counter()
-        with self._only(jobs):
-            g.iterate_gen(results, draft_tokens)
+        try:
+            with self._only(jobs):
+                g.iterate_gen(results, draft_tokens)
+        except Exception as e:
+            # a failed sampling forward ends the requests in it, not the engine (exllamav3's own loop contains only
+            # prefill failures): their pages go back, the other requests go on
+            self.log(f" !! sampling forward failed for {[r.req_id for r in rows]}: {type(e).__name__}: {e}")
+            for r in rows:
+                if r.job in g.active_jobs:
+                    g.reap_failed_job(r.job, e, results)
+            return
         if draft_tokens is not None:
             self.stats["scheduler"]["verify_steps"] += 1
             if g.sparse_head is not None:

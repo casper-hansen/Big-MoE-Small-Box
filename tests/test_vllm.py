@@ -28,7 +28,7 @@ def test_vllm_argv():
     get = lambda k: argv[argv.index(k) + 1]
     assert get("--max-model-len") == "131072" and get("--max-num-seqs") == "4"
     assert int(get("--max-num-batched-tokens")) == 8192 + 4 * (1 + 8)  # one chunk beside every decode + drafts
-    assert get("--long-prefill-token-threshold") == "8192"
+    assert get("--long-prefill-token-threshold") == "8192" and get("--scheduling-policy") == "priority"
     spec = json.loads(get("--speculative-config"))                       # vLLM schedules the engine's drafts
     assert spec["method"] == "ngram" and spec["num_speculative_tokens"] == 8
     assert get("--worker-cls") == "bigmoe.vllm.worker.BoxWorker"
@@ -411,7 +411,7 @@ def test_context_room(monkeypatch):
         TokenizeParams._bigmoe_room = None
 
 
-def fake_llm(monkeypatch, *, chunk=64, batch=4, spec=0, **cfg):
+def fake_llm(monkeypatch, *, chunk=64, batch=4, spec=0, policy="fcfs", **cfg):
     """vLLM's LLM (in-process EngineCore) with BoxScheduler + BoxWorker over a FakeEngine, configured as serve.py
     configures the real servers (budget: one chunk beside every decode and its drafts)."""
     pytest.importorskip("vllm")
@@ -434,7 +434,7 @@ def fake_llm(monkeypatch, *, chunk=64, batch=4, spec=0, **cfg):
               distributed_executor_backend="uni", max_model_len=4096, max_num_seqs=batch,
               max_num_batched_tokens=chunk + batch * (1 + spec), long_prefill_token_threshold=chunk,
               enforce_eager=True, async_scheduling=False, enable_prefix_caching=False, tokenizer_mode="hf",
-              gpu_memory_utilization=0.01, skip_mm_profiling=True, **kw)
+              gpu_memory_utilization=0.01, skip_mm_profiling=True, scheduling_policy=policy, **kw)
     return llm, state.engine(), state
 
 
@@ -569,3 +569,40 @@ def test_executor_fails_a_request_that_cannot_progress():
     for _ in range(E.STALL_STEPS):
         _toks, p = e.execute({"r": (0, 100, 700)}, {})["r"]     # never a whole page: Job.prefill computes nothing
     assert p.finished == "error" and "no progress" in p.error
+
+
+def test_priority_orders_the_waiting_queue(monkeypatch):
+    """One sequence at a time (as DeepSeek's single recurrent slot): queued requests start by priority (lower
+    first), equal priorities in arrival order."""
+    from vllm import SamplingParams
+    llm, eng, state = fake_llm(monkeypatch, chunk=64, batch=1, answer=4, page=16, policy="priority")
+    outs = llm.generate(prompts((10, 40), (100, 130), (200, 230), (300, 330)),
+                        SamplingParams(temperature=0, max_tokens=4), priority=[0, 5, -3, 0])
+    first = []
+    for st in eng.trace():
+        for rid in st:
+            if rid not in first:
+                first.append(rid)
+    order = [int(rid.split("-")[0]) for rid in first]
+    assert order == [2, 0, 3, 1] and all(len(o.outputs[0].token_ids) == 4 for o in outs)
+
+
+def test_a_failed_sampling_forward_ends_its_requests_not_the_engine():
+    from bigmoe.vllm.engine import Request
+    gen = FakeGen()
+    e = exl_engine(gen)
+    job = FakeJob()
+    r = e.reqs["r"] = Request("r", [1, 2], SimpleNamespace(), job=job)
+    e.by_job[id(job)] = r
+    gen.active_jobs.append(job)
+    gen._draft_conf_round = None
+
+    def boom(results, draft_tokens):
+        raise AssertionError("speculative pass of 4 tokens x 1 rows exceeds the cache's max_history 0")
+    gen.iterate_gen = boom
+    gen.reap_failed_job = lambda job, err, results: (gen.active_jobs.remove(job),
+                                                     results.append({"job": job, "stage": "error", "error": err}))
+    results = []
+    e._sample([r], {}, results)
+    e._results(results)
+    assert r.finished == "error" and "max_history" in r.error and not gen.active_jobs

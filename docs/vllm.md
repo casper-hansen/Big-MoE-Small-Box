@@ -90,11 +90,11 @@ An explicit `DSV41_NV_RAM_GB` wins; `frontend_extra_ram_gb=0` sizes the tier aut
   vLLM admits the request. A repeated image keeps its placeholder IDs, so the prefix cache reuses the prompt through it.
 - **Prefix caching.** The GPU page cache, pinned-RAM tier, disk tier and recurrent checkpoints are exllamav3's; vLLM's
   block-hash cache stays off (`--disable-prefix-caching`) and vLLM asks `BoxKVCacheManager` instead. Models with
-  recurrent state reuse a prefix only up to a checkpoint: a chunk end, a short last page, or exllamav3's checkpoint
-  interval while decoding. `/stats` exposes `prefix_cache` occupancy and hit counters. Idle disk flushes continue
-  between requests.
+  recurrent state reuse a prefix only up to a checkpoint: a chunk end, a short last page, or a page boundary while
+  decoding (every 256 tokens for DeepSeek in mode `nvme`, `rc_interval`; exllamav3's 2,048 otherwise). `/stats`
+  exposes `prefix_cache` occupancy and hit counters. Idle disk flushes continue between requests.
 - **Operational behavior.** `/health`, `/stats` (with `scheduler`: steps, reservations, page refusals, verify steps,
-  corrections), `/server_info`, `/generate`, `/tokenize`, `/kl_capture`, `/kl_force`, `/kl_teacher`, `/nv_verify`,
+  corrections, time in the executor and between steps), `/server_info`, `/generate`, `/tokenize`, `/kl_capture`, `/kl_force`, `/kl_teacher`, `/nv_verify`,
   `/nv2_rate` and `/cpu` are available. Streaming responses receive an SSE comment after 15 silent seconds.
   Context-length admission reserves min(`max_tokens`, 1024) output tokens plus the drafter window and answers 400
   `context_length_exceeded`. A CUDA OOM before the first token frees the failed forward and retries once with half-size
@@ -187,23 +187,92 @@ two of the tasks with two agents at once. Baselines: `models/*/baselines/agent_n
 
 | | tasks solved | turns | tool calls (malformed) | wall | prefix reuse after turn 1 | mean time to first token |
 |---|---|---|---|---|---|---|
-| DeepSeek, one agent | 3 / 3 | 14 | 13 (0) | 175 s | 59 % | 7.0 s |
-| DeepSeek, two agents | 2 / 2 | 10 | 10 (0) | 87 s | 68 % | 14.6 s |
+| DeepSeek, one agent | 3 / 3 | 14 | 13 (0) | 165 s | 80 % | 5.7 s |
+| DeepSeek, two agents | 2 / 2 | 10 | 10 (0) | 84 s | 84 % | 14.1 s |
 | GLM, one agent | 3 / 3 | 21 | 28 (0) | 376 s | 21 % | 9.3 s |
 | GLM, two agents | 2 / 2 | 13 | 17 (0) | 217 s | 44 % | 11.4 s |
 | GLM `speculation="ngram"`, one agent | 3 / 3 | 23 | 27 (0) | 443 s | 62 % | 10.2 s |
 
-`scheduler.corrections` stayed empty in every run (vLLM's counts and the engine's never differed), with no page
+DeepSeek's rows are with decode-time checkpoints (its default in mode `nvme`, see below); before them: 175 s, 59 %,
+7.0 s and 87 s, 68 %, 14.6 s. `scheduler.corrections` stayed empty in every run (vLLM's counts and the engine's never differed), with no page
 refusals and no dropped drafts. What the benchmark shows about these models on this box:
 
 - **Prefix reuse is bounded by recurrent checkpoints.** Both models have recurrent state, so a conversation resumes
-  only from a checkpoint: a chunk end, a page boundary at least 2,048 tokens past the last checkpoint, or a prompt
+  only from a checkpoint: a chunk end, a page boundary at least `rc_interval` tokens (exllamav3: 2,048) past the last
+  checkpoint, or a prompt
   whose tail past its last page boundary is short enough to split off cheaply (`engine/last_page.py`: 85 tokens for
   DeepSeek, 63 for GLM). Short agent conversations (all of these stay under 3k tokens) therefore reuse only what their
   earlier prompts' lengths happened to checkpoint: GLM's runs range from 0 % to 70 % per task for that reason alone.
   Splitting every tail would not pay on this box: a staged GLM forward costs ~8.8 s whatever its length, about what
-  the re-prefill it would save costs. Long agent sessions get a checkpoint at every 8,192-token chunk end.
+  the re-prefill it would save costs. Long agent sessions get a checkpoint at every 8,192-token chunk end. For
+  DeepSeek, decode-time checkpoints now also put one every 256 tokens inside each answer.
 - **Concurrency.** DeepSeek has one recurrent-state slot, so vLLM runs one sequence and queues the other; two agents
   still finish in 87 s instead of 113 s because one's prefill and decode overlap the other's tool execution and client
   time. GLM has four slots (`-ambs 4`), so vLLM batches both agents; steps that carry the other agent's 8.8 s prefill
   chunk stall the decode beside it, and two GLM agents took 217 s against 191 s for the same tasks one after the other.
+
+## What running on vLLM made possible (tried and measured, 2026-11-09)
+
+Each idea was measured on this box before it was kept. Quality is measured against exact references (mode
+`nvme-exact`, full prefill): answer identity, top-1 agreement and mean KL per position (`models/dsv41/tools/kl_force.py`,
+`turn_kl.py`, `resume_kl.py`).
+
+### Kept
+
+- **Decode-time recurrent checkpoints (DeepSeek, mode `nvme`: `rc_interval=256`, the default).** An agent's next turn
+  extends its previous answer, but both models have recurrent state, so a prompt resumes only from a checkpoint, and
+  exllamav3 checkpoints a decode only every 2,048 tokens: most turns re-prefilled the previous answer. With a checkpoint
+  every 256 decoded tokens the next turn resumes inside the answer.
+  - Quality, six ~600-token answers each followed by a ~630-token second turn that resumes at token 512, against the
+    exact full prefill: in mode `nvme`, re-prefilling (warm prefill) gives 98.40 % top-1, mean KL 0.0142 in 82.8 s;
+    resuming gives **99.01 %, 0.0044 in 61.6 s**. Faster and closer to exact: the resumed state comes from the near-exact
+    decode path, a re-prefill goes through warm prefill.
+  - Agent benchmark, mode `nvme`: 175.2 s -> **165.3 s**, prefix reuse 59 % -> **80 %**, mean time to first token per
+    task 6.8-7.1 s -> 4.6-6.4 s; two agents 86.8 s -> 84.0 s (reuse 68 % -> 84 %). Mode `nvme-exact` (deterministic,
+    same trajectories), where it was tested before being restricted to `nvme`: 423 s -> 359 s, reuse 71 % -> 79 %,
+    turns that resumed inside the previous answer 31.6 s -> 16.5 s and 31.7 s -> 2.7 s.
+  - Cost: none measured. Decode at 32k in back-to-back pairs: 16.54 / 17.42 tok/s with it, 16.43 / 17.42 without; the
+    verify run: 170.7 / 17.21, 667.8 / 20.03, 717.4 / 17.63 tok/s at 1k / 8k / 32k (baseline 174.1 / 17.54,
+    679.6 / 20.19, 724.8 / 19.03). Forced decode 99.55 % top-1, mean KL 0.00093 (earlier runs 99.55-99.73 %). A
+    checkpoint is 36 MB; `prefix_cache_gb` (0.5 GiB) holds 14 and evicts the oldest.
+  - Mode `nvme-exact` keeps exllamav3's schedule, because there a decode-time checkpoint is not bit-identical to what
+    a prefill computes (KL 0.0039 against 0 for a prefill-time checkpoint at the same position), and the stop at each
+    checkpoint boundary moves DSpark's verify windows (a 1k answer changed). `nvme-exact` answers stay identical.
+- **Priority scheduling** (`--scheduling-policy priority`). A request's `priority` (lower first) orders vLLM's waiting
+  queue; equal priorities stay first-come first-served, so default traffic is scheduled exactly as before, and a
+  non-zero `priority` is no longer refused. Preemption still happens only when pages run out (with one sequence at a
+  time, DeepSeek, a priority request waits for the running one, then goes first). `tests/test_vllm.py` checks the order
+  on vLLM's real scheduler.
+- **A failed sampling forward no longer kills the engine.** exllamav3's loop contained prefill failures only; an
+  exception in the batched sample / verify forward (found while testing grammar drafts: GLM's KDA layers cannot rewind a
+  speculative pass without draft history) took the EngineCore down and every request with it. It now ends the requests
+  in that forward with an error and the server goes on.
+
+### Measured, not kept
+
+- **Async scheduling.** vLLM's time between two engine steps (update_from_output, schedule, outputs) is 0.2 ms per
+  step, 0.2 % of a DeepSeek decode (463 tokens, 303 steps, 28.2 s in the executor, 0.06 s between). Nothing to hide.
+- **GLM one sequence at a time (`-ambs 1` instead of 4).** The extra recurrent slots do not come out of the expert cache
+  (1,472 VRAM slots either way) and single-sequence speed is unchanged (111.0 / 10.86 tok/s at 1k against 110.1 / 10.81).
+  Two agents at once took 224 s against 227 s for the same tasks run one after the other: GLM's tool time is too short
+  to overlap, and batching (217 s against 191 s with `-ambs 4`) is within the run-to-run spread of agent trajectories.
+  No change.
+- **Grammar-forced draft tokens.** With vLLM's tool-call grammar in the sampler, the text the grammar forces could be
+  drafted for free. It is short: xgrammar constrains text, not token splits, so no position allows a single token, and
+  the forced text (`find_jump_forward_string`) is about two tokens per argument (`</arg_key><arg_value>`) for GLM;
+  DeepSeek's parser attaches no tool grammar unless a tool is `strict`. GLM without a drafter keeps no draft history and
+  cannot verify drafts at all. With `speculation="ngram"` it drafted 21 tokens in four replayed agent turns, the turns
+  took 28.61 / 21.98 / 44.74 / 12.62 s against 28.27 / 22.78 / 44.24 / 12.71 s, and one `nvme-exact` answer changed (a
+  verify window flips a near-tie, as DSpark's do). Removed.
+- **Decode-time checkpoints for GLM** (opt-in: `-o rc_interval=256`). The same six turns as for DeepSeek (below), GLM
+  mode `nvme`, against the exact full prefill: re-prefilling 98.47 % top-1, mean KL 0.0029, 126.9 s; resuming from the
+  decode-time checkpoint 99.04 %, 0.0034, 119.5 s (-6 %). GLM's prefill is near-exact already (no warm prefill by
+  default) and a staged GLM forward costs about the same whatever its length, so the remainder after the checkpoint
+  costs nearly what the whole turn did. Quality is a wash and the saving small, so GLM keeps exllamav3's schedule.
+  (In `nvme-exact`: resuming from a decode-time checkpoint 98.64 %, 0.0031 against 98.97 %, 0.0021 for resuming from a
+  prefill-time one at the same position.) Single-request answers stay byte-identical with it (no drafter), decode
+  speed unchanged.
+- **Suffix decoding** (vLLM's `suffix` method, Arctic Inference; `arctic-inference` 0.3.0 installs). Not tried: its
+  advantage is drafting from earlier *requests*, while what agents here repeat is within the context (files read, then
+  written), which DSpark and GLM's n-gram policy already draft; and vLLM's proposer is tied to its own model runner.
+

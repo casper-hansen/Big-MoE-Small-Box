@@ -94,8 +94,8 @@ def split_argv(argv):
 
 
 def draft_window(a) -> int:
-    """The most draft tokens the engine verifies per step (0: no drafting): -ndt (else exllamav3's default, at most
-    8 for the backends' drafters) or the hybrid window, whichever is larger."""
+    """The most draft tokens a step verifies (0: no drafting): -ndt (else exllamav3's default, at most 8 for the
+    backends' drafters) or the hybrid window, whichever is larger."""
     if not (a.mtp or a.draft_model_dir or a.ngram_match_min or a.hybrid_draft_tokens):
         return 0
     return max(int(a.num_draft_tokens or 8), int(a.hybrid_draft_tokens or 0))
@@ -121,6 +121,9 @@ def vllm_argv(backend: str, a, extra: list, tokenizer: str = None) -> list:
             # other requests running, a long prefill takes at most one chunk per step
             "--max-num-batched-tokens", str(chunk + batch * (1 + k)), "--enable-chunked-prefill",
             "--long-prefill-token-threshold", str(chunk),
+            # a request's `priority` (lower first) orders vLLM's waiting queue; equal priorities stay first-come
+            # first-served, so default traffic is scheduled exactly as with "fcfs"
+            "--scheduling-policy", "priority",
             # vLLM's block-hash prefix cache stays off: BoxKVCacheManager answers prefix lookups from exllamav3's
             "--no-async-scheduling", "--enforce-eager", "--disable-prefix-caching",
             "--tokenizer-mode", tok_mode, "--trust-remote-code",
