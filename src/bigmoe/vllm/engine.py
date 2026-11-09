@@ -446,6 +446,10 @@ class ExlEngine:
         """Walk the job past every cached prefix page now (Job.prefill with a zero-token chunk skips cached pages within
         its window and runs no forward), so the position vLLM learns at admission is where computing starts."""
         seq = job.sequences[0]
+        # A prompt cached up to its last token (a checkpoint at its final page boundary: a resent request) is done at
+        # allocation, so Job.prefill, which stamps time_first_prefill, never runs and the job's first emit failed on it
+        if getattr(job, "time_first_prefill", False) is None and job.is_prefill_done():
+            job.time_first_prefill = time.time()
         while not job.is_prefill_done():
             pos = seq.kv_position
             job.prefill([], 0)
@@ -877,6 +881,16 @@ class ExlEngine:
         from ..engine import nv2
         nv2.ext().set_read_rate(float(mbps))
         return {"read_rate_mbps": mbps}
+
+    def warm_prefill_switch(self, on: int = 1) -> dict:
+        """Runtime switch of warm prefill itself (quality A/B: an exact prefix on a warm-prefill server)."""
+        if self.tiers is None:
+            return {"error": "the shared engine is off"}
+        from ..engine import tiers
+        pools = [p for p in tiers.POOLS if p.warm_prefill is not None]
+        if not pools:
+            return {"error": "warm prefill is not configured on this server (warm_prefill=False or mode nvme-exact)"}
+        return {"warm_prefill": [p.warm_prefill.set_enabled(bool(on)) for p in pools]}
 
     def warm_ahead(self, on: int = 1, n: int = 0) -> dict:
         """Runtime switch of warm prefill's read-ahead (A/B runs on one server)."""

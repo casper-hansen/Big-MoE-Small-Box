@@ -130,6 +130,20 @@ def test_before_stage_drains_only_a_conflicting_buffer(monkeypatch):
     assert wp.ahead is None and a.fut.calls == 1 and cur.waits == [a.event]
 
 
+def test_runtime_switch_restores_the_borrowed_prefill_ring(monkeypatch):
+    import sys
+    import types
+    calls = []
+    fake_nv2 = types.SimpleNamespace(ext=lambda: types.SimpleNamespace(set_ring_borrow=calls.append))
+    monkeypatch.setitem(sys.modules, "bigmoe.engine.nv2", fake_nv2)
+    monkeypatch.setattr(warm, "nv2", fake_nv2, raising=False)
+    wp = _prefill_for_take()
+    wp.ahead = None
+    wp.pool = types.SimpleNamespace(device="cpu", nv2=types.SimpleNamespace(ring_borrow=True, ring_pf=128))
+    assert wp.set_enabled(False) is False and calls == [128]    # exact staging: the ring borrows RAM slots again
+    assert wp.set_enabled(True) is True and calls == [128, 0]   # warm prefill: no ring borrowing
+
+
 def test_mismatched_ahead_still_finishes_old_copies_before_returning():
     wp = _prefill_for_take()
     a = _ahead(wp, done={1: 4}, inflight={2: 5}, queue=[(3, 6)], layer=9)

@@ -430,7 +430,7 @@ class Pool:
             if self.elastic and not self.in_prefill:
                 self._elastic_enter(n_picks // self.topk)
             self.slot_np = self.slotof.cpu().numpy()    # stable during prefill (no admission)
-            if self.warm_prefill is not None:
+            if self.warm_prefill is not None and self.warm_prefill.enabled:
                 self.slot_np = self.warm_prefill.begin(e, self.slot_np)
             e.stage_begin(torch.from_numpy(np.ascontiguousarray(self.slot_np)), li)
             self._st_open = True
@@ -702,7 +702,7 @@ def attach(model):
             _m._x16 = None
             if not params.get("autosplit_measure") and not params.get("tp_warmup"):
                 pool, li = _m._ec
-                staged = pool.warm_prefill is not None and sel.numel() >= pool.stage_min
+                staged = pool.warm_prefill is not None and pool.warm_prefill.enabled and sel.numel() >= pool.stage_min
                 # X16 lane: a single-token call of one of its layers keeps the original selection for the reduction
                 x16 = nv.x16 is not None and bsz == 1 and li < nv.x16_hi
                 orig_sw = (sel.clone(), w.clone(), z) if x16 else None

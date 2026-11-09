@@ -203,7 +203,7 @@ class Nv2:
         self.home = self.ct[self.off["home"]: self.off["home"] + self.K * 24].view(torch.int64)
         self.res = self.ct[self.off["res"]: self.off["res"] + self.K * 4].view(torch.int32)
         # ---- RAM tier + prefill ring sizes
-        ring_pf = int(g("NV_PF_RING", "128"))
+        ring_pf = self.ring_pf = int(g("NV_PF_RING", "128"))
         # the prefill ring borrows RAM-tier slots for the duration of a staged prefill instead of owning its own memory
         self.ring_borrow = g("NV_PF_RING_BORROW", "1") == "1"
         ring_own = 1 if self.ring_borrow else ring_pf

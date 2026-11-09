@@ -606,3 +606,22 @@ def test_a_failed_sampling_forward_ends_its_requests_not_the_engine():
     e._sample([r], {}, results)
     e._results(results)
     assert r.finished == "error" and "max_history" in r.error and not gen.active_jobs
+
+
+def test_a_prompt_cached_up_to_its_last_token_gets_its_prefill_time():
+    """exllamav3 restores such a prompt complete at allocation, so Job.prefill never stamps time_first_prefill and
+    the job's first emit raised TypeError (found resending an 8,193-token prompt cached to its 8,192-token boundary)."""
+    gen = FakeGen()
+    e = exl_engine(gen)
+
+    class CachedJob(FakeJob):
+        time_first_prefill = None
+
+        def is_prefill_done(self):
+            return True
+
+        def prefill(self, results, chunk_size):
+            raise AssertionError("nothing left to prefill")
+    e._make_job = lambda r: CachedJob()
+    e.reserve(vreq("r", [1, 2, 3]))
+    assert gen.active_jobs[0].time_first_prefill is not None

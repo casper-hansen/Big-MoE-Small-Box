@@ -350,3 +350,44 @@ within noise), and the two-agent run solved 2/2 in 83.7 s. There were no malform
 corrections. GLM warm prefill remains off by default; with `-o warm_prefill=true`, its off/on teacher-forced check was
 also **1,200/1,200 bit-identical, KL 0**, and took 9.11 s -> 7.33 s.
 
+
+## Warm prefill on small agent steps (DeepSeek, mode `nvme`, 2026-11-09)
+
+An agent step adds a tool result of N tokens to a cached conversation. `models/dsv41/tools/warm_kl.py` measures what
+warm-prefilling only those N tokens costs. On both servers, the same 8,192-token prefix was computed exactly and is
+cached. Each sample then adds N new tokens of its own (a file excerpt plus the assistant turn's opening) and a greedy
+128-token answer. The answer is generated with warm prefill off and forced along the same tokens with it on. Decode runs
+on the bit-exact GPU path on both (`/cpu?on=0`), so the N-token prefill is the only difference. Three samples per size,
+~360 answer positions each. Read-ahead does not apply below 1,024 rows. Prefill times are the engine's per-request log
+lines.
+
+| new tokens | prefill path | exact prefill | warm prefill | top-1 | mean KL |
+|---|---|---|---|---|---|
+| 8 | per pick (no staging) | 0.90 s | 0.90 s | 100 % | 0 (bit-identical) |
+| 20 | per pick | 1.87 s | 1.90 s | 100 % | 0 (bit-identical) |
+| 40 | per pick | 2.90 s | 2.90 s | 100 % | 0 (bit-identical) |
+| 60 | per pick | 4.23 s | 4.27 s | 100 % | 0 (bit-identical) |
+| 80 | per pick | 4.83 s | 4.83 s | 100 % | 0 (bit-identical) |
+| 100 | staged | 15.13 s | **4.47 s** | 98.5 % | 0.0035 |
+| 120 | staged | 15.17 s | **4.77 s** | 96.5 % | 0.0057 |
+| 160 | staged | 15.20 s | **4.93 s** | 98.1 % | 0.0051 |
+| 200 | staged | 15.17 s | **5.00 s** | 97.7 % | 0.0066 |
+| 300 | staged + tail forward | 20.27 s | **9.70 s** | 97.4 % | 0.0053 |
+| 400 | staged | 15.20 s | **5.20 s** | 96.4 % | 0.0082 |
+| 600 | staged | 15.20 s | **5.40 s** | 96.1 % | 0.0097 |
+| 800 | staged + tail forward | 19.13 s | **9.07 s** | 98.2 % | 0.0073 |
+| 1,000 | staged | 15.30 s | **5.70 s** | 97.8 % | 0.0070 |
+
+- Below 512 expert picks (N <= 86: the prefill forward holds N - 1 tokens, 6 experts each), neither exact nor warm
+  staging applies and every pick is served individually. Those sizes are the control: all 15 samples are bit-identical,
+  so the measurement has no noise floor.
+- From 100 to 1,000 new tokens, warm prefill saves about 10 s per step (15.2 s -> 4.5-5.7 s). Over the 3,344 staged
+  positions it agrees with exact prefill on 97.4 % of top-1 tokens, mean KL 0.0065, rising from 0.0035 at 100 tokens to
+  0.007-0.010 at 400-1,000. 84 of the 87 disagreements are near-ties: the exact model's own probability for its top-1
+  is within 0.2 of the token warm prefill picked. 3 are clear flips (largest: 0.905 vs 0.095, at 120 tokens).
+- 300 and 800 new tokens end 43 and 31 tokens past a page boundary. exllamav3 splits such a short tail into a forward of
+  its own, which checkpoints the recurrent state at the boundary (`engine/last_page.py`). That forward costs ~5 s in both
+  modes, so about a third of step sizes (tails of 1-85 tokens) pay twice.
+- A request whose prompt was cached up to its last token (a resent prompt ending one token past a checkpoint) failed
+  with a 500: exllamav3 restores it complete at allocation, so `Job.prefill`, which stamps the prefill start time, never
+  ran. The executor stamps it now (`tests/test_vllm.py`).

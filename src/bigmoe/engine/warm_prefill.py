@@ -110,9 +110,22 @@ class WarmPrefill:
         self.acc = torch.zeros(4, dtype=torch.float64, device=pool.device)   # picks, dropped, weight, dropped weight
         self.st = {"forwards": 0, "fetched": 0, "fetched_bytes": 0, "read_ms": 0.0, "ahead_read": 0, "ahead_hit": 0,
                    "ahead_wasted": 0, "ahead_wait_ms": 0.0, "ahead_ms": 0.0}
+        self.enabled = True          # runtime switch (set_enabled): off = exact staged prefill on this server
         self.ahead = None            # Ahead of the next layer
         self.flip = 0                # alternating half of the pinned arena
         self.ahead_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="warm-ahead")
+
+    def set_enabled(self, on: bool) -> bool:
+        """Runtime switch between forwards (quality A/B on one server): off stages every expert, exactly as a server
+        started with warm_prefill=False. The prefill ring borrows its RAM slots again while off (warm prefill keeps it
+        from evicting RAM experts that a forward counts as warm)."""
+        from . import nv2 as N2
+        self.drop_ahead()
+        self.enabled = bool(on)
+        nv = self.pool.nv2
+        if getattr(nv, "ring_borrow", False):
+            N2.ext().set_ring_borrow(0 if self.enabled else int(nv.ring_pf))
+        return self.enabled
 
     def begin(self, ext, slot_np: np.ndarray) -> np.ndarray:
         """Start of a staged forward: the cold set of every layer, and the residency snapshot for stage_begin /
