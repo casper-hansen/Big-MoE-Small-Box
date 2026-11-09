@@ -78,6 +78,9 @@ A 120,000-token prompt prefills at 657 tok/s (183 s) and decodes at 18.5 tok/s. 
 |---|---|---|---|---|---|---|---|---|
 | exact prefill | 0.7 s | 3.3 s | 14.8 s | 29.0 s | 17.2 s | 29.6 s | 29.8 s | 33.1 s |
 | warm prefill | 1.2 s | 3.3 s | 3.3 s | 5.4 s | 8.2 s | 6.9 s | 8.9 s | 18.6 s |
+| + next-layer read-ahead | 0.6 s | 4.1 s | 3.4 s | 5.5 s | 8.3 s | 6.3 s | 7.4 s | 16.5 s |
+
+For chunks of at least 1,024 rows, warm prefill now guesses the next layer's cold experts with that layer's own router and reads them while the current layer computes, then reads only what the real routing still needs. The fetched experts and outputs are unchanged (1,200/1,200 teacher-forced positions bit-identical, KL 0); long cached-prefix steps are 10-20 % faster on this box. Options: `warm_ahead`, `warm_ahead_n`; measurements and the matched-prompt A/B are in [docs/vllm.md](docs/vllm.md#warm-prefill-read-ahead-2026-11-09).
 
 ## Agentic benchmark
 

@@ -839,6 +839,9 @@ class ExlEngine:
         err = serving.as_request_error(exc, len(r.prompt), self.ctx)
         r.finished, r.error, r.status = "error", err.message, err.status
         self.log(f" !! request {r.req_id} failed: {err.message}")
+        if err.status >= 500 and exc.__traceback__ is not None:
+            import traceback
+            self.log("".join(traceback.format_exception(exc)).rstrip())
 
     # ---- diagnostics (RPC from the API server) -----------------------------------------------------------------
     def summary(self) -> dict:
@@ -874,6 +877,11 @@ class ExlEngine:
         from ..engine import nv2
         nv2.ext().set_read_rate(float(mbps))
         return {"read_rate_mbps": mbps}
+
+    def warm_ahead(self, on: int = 1, n: int = 0) -> dict:
+        """Runtime switch of warm prefill's read-ahead (A/B runs on one server)."""
+        from ..engine import warm_prefill
+        return warm_prefill.set_ahead(bool(on), int(n))
 
     def cpu_switch(self, on: int = 1) -> dict:
         """Runtime CPU-lane switch (mode nvme): on=0 puts every pick on the GPU path (bit-exact), for A/B runs."""

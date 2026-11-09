@@ -440,6 +440,8 @@ class Pool:
         if self.pending is None or self.pending[0] != li:
             if self.pending is not None:
                 self.nv2.stage_wait(self.pending)
+            if self.warm_prefill is not None:
+                self.warm_prefill.before_stage(li % 2)     # an out-of-order submit can reuse a read-ahead buffer
             self.pending = self.nv2.stage_submit(li, li % 2)
         h = self.pending
         self.nv2.stage_wait(h)
@@ -455,6 +457,8 @@ class Pool:
                 gu.index_copy_(0, idx, torch.stack([a, a + ou], 1))
             self.staged[li] = (b, idx)
         self.stage_stats["layers"] += 1; self.stage_stats["experts"] += len(take)
+        if self.warm_prefill is not None:
+            self.warm_prefill.before_stage((li + 1) % 2)   # drain only an out-of-order same-buffer read-ahead
         self.pending = self.nv2.stage_submit(li + 1, (li + 1) % 2)   # next layer, other buffer, overlaps this layer
 
     def _elastic_enter(self, ntok=None):
@@ -480,6 +484,8 @@ class Pool:
 
     def _elastic_exit(self):
         """Back to decode: free staging, reallocate the flex chunks, re-enable their slots (empty)."""
+        if self.warm_prefill is not None:
+            self.warm_prefill.drop_ahead()       # a read-ahead must not copy into staging memory that is freed now
         torch.cuda.synchronize(self.device)
         self.stage = None
         torch.cuda.empty_cache()
@@ -685,6 +691,7 @@ def attach(model):
     p.nv2.x16_setup()
     for m in mods:
         orig = m.routing_fn
+        m._bigmoe_route = orig     # the module's own router, unwrapped (warm prefill's read-ahead guesses with it)
 
         def routed(bsz, cfg, z, params, _orig=orig, _m=m):
             nv = _m._ec[0].nv2
@@ -701,7 +708,7 @@ def attach(model):
                 orig_sw = (sel.clone(), w.clone(), z) if x16 else None
                 sel, w, _m._nv2_cpu = nv.layer(li, sel, w, z, bsz)
                 if staged:   # warm prefill: staged (prefill) calls only, never a single-token X16 call
-                    sel, w = pool.warm_prefill.route(li, sel, w)
+                    sel, w = pool.warm_prefill.route(li, sel, w, z, params, bsz)
                 if x16 and nv.stepped and _m._nv2_cpu:
                     _m._x16 = (orig_sw, sel)
                     nv.x16_start(_m)

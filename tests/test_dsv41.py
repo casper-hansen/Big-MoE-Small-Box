@@ -149,10 +149,15 @@ def test_store_v2_mixed_sizes(odirect_dir, tmp_path):
 def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch)
     assert spec.env["DSV41_EC_WARM_PREFILL"] == "1" and spec.env["DSV41_EC_WARM_FETCH"] == "64"
-    _, spec = spec_for(tmp_path, monkeypatch, warm_fetch=192)
-    assert spec.env["DSV41_EC_WARM_FETCH"] == "192"
+    assert spec.env["DSV41_EC_WARM_AHEAD"] == "1" and "DSV41_EC_WARM_AHEAD_N" not in spec.env
+    _, spec = spec_for(tmp_path, monkeypatch, warm_fetch=192, warm_ahead_n=128)
+    assert spec.env["DSV41_EC_WARM_FETCH"] == "192" and spec.env["DSV41_EC_WARM_AHEAD_N"] == "128"
     _, spec = spec_for(tmp_path, monkeypatch, warm_prefill=False)
-    assert spec.env["DSV41_EC_WARM_PREFILL"] == "0"
+    assert spec.env["DSV41_EC_WARM_PREFILL"] == "0" and "DSV41_EC_WARM_AHEAD" not in spec.env
+    _, spec = spec_for(tmp_path, monkeypatch, warm_ahead=False)
+    assert spec.env["DSV41_EC_WARM_AHEAD"] == "0"
+    with pytest.raises(ValueError):
+        spec_for(tmp_path, monkeypatch, warm_ahead_n=385)
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
     assert "DSV41_EC_WARM_PREFILL" not in spec.env
 

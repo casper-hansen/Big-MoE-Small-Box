@@ -305,3 +305,48 @@ most of it back at 25 % more time on fresh prompts. On resumed turns, whose shor
 `warm_fetch=192` costs nothing measurable but gains little; long chunks (file reads, first turns) pay the most. Both
 knobs stay at their defaults; set `-o warm_fetch=192` or `-o warm_prefill=false` to trade prefill time for agreement.
 
+## Warm-prefill read-ahead (2026-11-09)
+
+Warm prefill used to wait for each layer's NVMe-only experts immediately before that layer's MoE. Now, for staged chunks
+of at least 1,024 rows, layer i + 1's router runs on layer i's router input while layer i computes. The predicted cold
+experts are read on a background thread into the next layer's staging buffer. Once the real routing is known, unread
+guesses are discarded and any missed experts are queued ahead of the remaining guesses. CUDA events order the copies
+before the MoE; pending reads are drained before staging memory returns to the decode pool. The actual fetched set is
+still the top `warm_fetch` experts by real routing weight, so read-ahead changes I/O timing, not the model's computation.
+It is on by default for DeepSeek warm prefill (`warm_ahead`), with 64 guesses per layer; `warm_ahead_n` can widen that
+window. Short chunks keep the old synchronous path (`EC_WARM_AHEAD_MIN`, default 1,024).
+
+Four matched-prompt repetitions per configuration (same token ids and lengths within each A/B cycle, unique prefix to
+prevent cache reuse) on DeepSeek, mode `nvme`:
+
+| prompt tokens | read-ahead off | 64 guesses | 96 guesses | 128 guesses |
+|---|---|---|---|---|
+| 460 | 5.52 s | 5.70 s (+3 %) | 5.76 s | 5.77 s |
+| 1,600 | 10.48 s | **8.70 s (-17 %)** | 10.90 s | 9.98 s |
+| 3,000 | 8.48 s | **6.37 s (-25 %)** | 6.42 s | 6.47 s |
+| 6,000 | 10.07 s | **8.19 s (-19 %)** | 8.82 s | 9.44 s |
+
+The default 64-expert window was best overall; wider windows added I/O without improving coverage enough. Below 1,024
+rows the default now avoids the +0.18 s seen at 460 tokens. On a fixed teacher-forced prompt, read-ahead off versus on
+produced **1,200/1,200 bit-identical positions, top-1 100 %, KL 0**, and took 6.67 s -> 5.43 s.
+
+Cached-prefix time to first token (8,192-token cached prefix, one run per size):
+
+| new tokens | 8 | 80 | 120 | 400 | 800 | 2,000 | 5,000 | 10,000 |
+|---|---|---|---|---|---|---|---|---|
+| read-ahead off | 0.87 s | 5.08 s | 3.50 s | 5.60 s | 8.28 s | 7.00 s | 9.24 s | 20.25 s |
+| read-ahead on | 0.62 s | 4.11 s | 3.38 s | 5.48 s | 8.32 s | 6.32 s | 7.42 s | 16.49 s |
+
+The 2,000-10,000-token steps are 10-20 % faster. Short-step differences are within the run-to-run spread documented
+above and below 1,024 rows the code path is unchanged. Cold-server forced second turns produced the same six answers
+with read-ahead off and on. The decode-only reference remained in its usual range: **99.64 % top-1, mean KL 0.000796**
+over 1,111 positions. The no-read-ahead agent baseline solved 3/3 tasks in 167.7 s.
+
+The full `bigmoe verify deepseek-v4.1-flash` run passed. In mode `nvme`, 1k / 8k / 32k prefill measured
+170.0 / **780.2** / **839.2 tok/s** against the 174.1 / 679.6 / 724.8 baselines: long-chunk prefill is 15-16 % faster,
+and decode is in the same range as the previous vLLM runs. Both `nvme-exact` answers are **byte-identical** (1k and 8k).
+The agent benchmark solved 3/3 tasks in 164.5 s with read-ahead versus 167.7 s without (mean TTFT 5.75 s versus 5.68 s,
+within noise), and the two-agent run solved 2/2 in 83.7 s. There were no malformed tool calls and no scheduler
+corrections. GLM warm prefill remains off by default; with `-o warm_prefill=true`, its off/on teacher-forced check was
+also **1,200/1,200 bit-identical, KL 0**, and took 9.11 s -> 7.33 s.
+

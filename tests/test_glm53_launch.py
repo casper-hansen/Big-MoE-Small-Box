@@ -125,8 +125,9 @@ def test_x16_layers(tmp_path, monkeypatch):
 def test_warm_prefill_off_by_default(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch, "nvme")
     assert spec.env["GLM53_EC_WARM_PREFILL"] == "0"
-    _, spec = spec_for(tmp_path, monkeypatch, "nvme", warm_prefill=True)
-    assert spec.env["GLM53_EC_WARM_PREFILL"] == "1"
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", warm_prefill=True, warm_ahead_n=96)
+    assert spec.env["GLM53_EC_WARM_PREFILL"] == "1" and spec.env["GLM53_EC_WARM_AHEAD"] == "1"
+    assert spec.env["GLM53_EC_WARM_AHEAD_N"] == "96"
     _, spec = spec_for(tmp_path, monkeypatch, "nvme-exact", warm_prefill=True)
     assert "GLM53_EC_WARM_PREFILL" not in spec.env   # exact mode prefills exactly
 

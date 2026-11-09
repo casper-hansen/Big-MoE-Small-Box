@@ -1,5 +1,5 @@
 {
- "started": "2026-11-09T15:48:24+0100",
+ "started": "2026-11-09T18:38:02+0100",
  "model": "deepseek-v4.1-flash",
  "parallel": 2,
  "thinking": false,
@@ -20,6 +20,8 @@
   "DSV41_NV_READER_CPUS": "7-11",
   "DSV41_NV_CPU_CPUS": "1-5",
   "DSV41_EC_WARM_PREFILL": "1",
+  "DSV41_EC_WARM_FETCH": "64",
+  "DSV41_EC_WARM_AHEAD": "1",
   "BIGMOE_EC_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_ec-84ade52388a34ad3",
   "BIGMOE_NV2_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_nv2-d269a250bb0b9dad",
   "BIGMOE_X16_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_x16-0c83594d32f7dd3a",
@@ -42,18 +44,18 @@
    "turns": 5,
    "tool_calls": 4,
    "invalid_tool_calls": 0,
-   "wall_s": 73.6,
+   "wall_s": 73.4,
    "prompt_tokens": 5508,
    "cached_tokens": 4352,
    "completion_tokens": 392,
    "cache_hit": 0.77,
    "mean_new_tokens": 287.5,
-   "mean_ttft_s": 13.51,
+   "mean_ttft_s": 13.46,
    "per_turn": [
     {
-     "ttft_s": 1.16,
-     "turn_s": 3.12,
-     "decode_tok_s": 25.64,
+     "ttft_s": 1.13,
+     "turn_s": 3.17,
+     "decode_tok_s": 26.79,
      "prompt_tokens": 518,
      "cached_tokens": 512,
      "completion_tokens": 51,
@@ -64,9 +66,9 @@
      ]
     },
     {
-     "ttft_s": 12.66,
-     "turn_s": 14.1,
-     "decode_tok_s": 39.94,
+     "ttft_s": 12.9,
+     "turn_s": 14.31,
+     "decode_tok_s": 41.23,
      "prompt_tokens": 796,
      "cached_tokens": 512,
      "completion_tokens": 46,
@@ -77,9 +79,9 @@
      ]
     },
     {
-     "ttft_s": 10.87,
-     "turn_s": 18.66,
-     "decode_tok_s": 23.83,
+     "ttft_s": 10.76,
+     "turn_s": 18.56,
+     "decode_tok_s": 23.86,
      "prompt_tokens": 1245,
      "cached_tokens": 768,
      "completion_tokens": 173,
@@ -90,9 +92,9 @@
      ]
     },
     {
-     "ttft_s": 19.31,
-     "turn_s": 20.63,
-     "decode_tok_s": 30.22,
+     "ttft_s": 19.32,
+     "turn_s": 20.67,
+     "decode_tok_s": 29.6,
      "prompt_tokens": 1438,
      "cached_tokens": 1280,
      "completion_tokens": 41,
@@ -103,9 +105,9 @@
      ]
     },
     {
-     "ttft_s": 11.19,
-     "turn_s": 17.05,
-     "decode_tok_s": 13.65,
+     "ttft_s": 10.86,
+     "turn_s": 16.63,
+     "decode_tok_s": 13.87,
      "prompt_tokens": 1511,
      "cached_tokens": 1280,
      "completion_tokens": 81,
@@ -122,18 +124,18 @@
    "turns": 5,
    "tool_calls": 6,
    "invalid_tool_calls": 0,
-   "wall_s": 83.9,
+   "wall_s": 83.7,
    "prompt_tokens": 5343,
    "cached_tokens": 4864,
    "completion_tokens": 517,
    "cache_hit": 0.909,
    "mean_new_tokens": 109.5,
-   "mean_ttft_s": 14.71,
+   "mean_ttft_s": 14.68,
    "per_turn": [
     {
-     "ttft_s": 5.57,
-     "turn_s": 7.32,
-     "decode_tok_s": 27.56,
+     "ttft_s": 5.64,
+     "turn_s": 7.54,
+     "decode_tok_s": 25.23,
      "prompt_tokens": 553,
      "cached_tokens": 512,
      "completion_tokens": 49,
@@ -144,22 +146,22 @@
      ]
     },
     {
-     "ttft_s": 12.79,
-     "turn_s": 14.2,
-     "decode_tok_s": 44.29,
+     "ttft_s": 12.8,
+     "turn_s": 14.16,
+     "decode_tok_s": 44.52,
      "prompt_tokens": 819,
      "cached_tokens": 768,
      "completion_tokens": 48,
      "finish": "tool_calls",
-     "arg_deltas": 3,
+     "arg_deltas": 2,
      "tools": [
       "bash"
      ]
     },
     {
-     "ttft_s": 18.16,
-     "turn_s": 27.87,
-     "decode_tok_s": 28.78,
+     "ttft_s": 18.1,
+     "turn_s": 27.9,
+     "decode_tok_s": 28.48,
      "prompt_tokens": 1076,
      "cached_tokens": 1024,
      "completion_tokens": 268,
@@ -172,9 +174,9 @@
      ]
     },
     {
-     "ttft_s": 11.0,
-     "turn_s": 12.81,
-     "decode_tok_s": 32.43,
+     "ttft_s": 10.95,
+     "turn_s": 12.5,
+     "decode_tok_s": 32.95,
      "prompt_tokens": 1400,
      "cached_tokens": 1280,
      "completion_tokens": 52,
@@ -186,8 +188,8 @@
     },
     {
      "ttft_s": 16.87,
-     "turn_s": 21.68,
-     "decode_tok_s": 20.59,
+     "turn_s": 21.52,
+     "decode_tok_s": 21.31,
      "prompt_tokens": 1495,
      "cached_tokens": 1280,
      "completion_tokens": 100,
@@ -201,11 +203,11 @@
  "summary": {
   "passed": 2,
   "tasks": 2,
-  "wall_s": 84.0,
+  "wall_s": 83.7,
   "turns": 10,
   "tool_calls": 10,
   "invalid_tool_calls": 0,
   "cache_hit": 0.838
  },
- "finished": "2026-11-09T15:49:48+0100"
+ "finished": "2026-11-09T18:39:26+0100"
 }
