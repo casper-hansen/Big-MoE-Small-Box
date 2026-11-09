@@ -1,35 +1,21 @@
-"""What the model servers (glm53, dsv41) share around exllamav3's AsyncGenerator: OpenAI-style errors, context checks,
-generator liveness, usage with prefix-cache hits and server-side timings, a log line per request, and the prefix-cache
-tiers. Stdlib only at import time (FastAPI is imported inside install()), so it is testable without the GPU stack.
+"""What the vLLM servers (bigmoe/vllm) share around the exllamav3 executor: OpenAI-style errors, the context rule,
+timings and a log line per request, the prefix-cache tiers, and out-of-GPU-memory cleanup. Stdlib only at import time,
+so it is testable without the GPU stack.
 
-What it guards against:
-- A prompt that does not fit the cache. exllamav3 asserts in Generator.enqueue ("Job requires N pages"); raised inside
-  a streaming response that tore the connection down mid-stream, so clients saw a transport error and retried the same
-  oversized request. Now it is a 400 `context_length_exceeded` before anything is streamed, worded the way OpenAI
-  words it, which agent clients (DeepSeek Harness) recognize and answer by compacting the conversation.
-- Any other failure before the first token: a JSON error with a status code instead of a dropped stream.
-- A failure after streaming started: an SSE `error` event (the OpenAI SDKs raise it as an APIError), then [DONE].
-- A dead generator loop (an exception in Generator.iterate, e.g. CUDA out of memory). exllamav3 then fails every later
-  job while the process stays up and /health kept answering ok. /health now reports 503 and, after a short grace for
-  in-flight requests to get their error, the process exits so a supervisor can start a fresh one.
-- A job that runs out of GPU memory (exllamav3 contains it to that job). The exception's traceback keeps the failed
+- A prompt that does not fit the cache is a 400 `context_length_exceeded`, worded the way OpenAI words it, before
+  anything is streamed; agent clients (DeepSeek Harness) recognize it and compact the conversation.
+- A job that runs out of GPU memory (exllamav3 contains it to that job): the exception's traceback keeps the failed
   forward's activations alive (GBs), in reference cycles only a full garbage collection frees, so every later request
-  ran out of memory too until a restart. RetryingJob frees them, and a failure before the first token re-runs the job
-  once with half-size prefill chunks, so the client gets its answer instead of an error.
+  ran out of memory too until a restart. release_failed frees them; the executor re-runs a job that failed before its
+  first token once with half-size prefill chunks (vllm/engine.py).
 """
-import asyncio
 import gc
-import json
-import os
-import sys
 import time
 import traceback
 
 # A job needs room for at least this many new tokens (or the requested max_tokens if smaller), else the request is
 # refused as too long: a 10-token answer cut off by the cache end helps nobody, a context error lets the client compact
 MIN_OUTPUT_TOKENS = 1024
-EXIT_CODE_GENERATOR_DEAD = 70
-EXIT_GRACE_S = 3.0          # in-flight requests get their error before a dead-generator exit
 GiB = 1024 ** 3
 
 
@@ -93,19 +79,6 @@ def log_request(prompt_tokens: int, completion_tokens: int, fin: dict = None):
           f"finish {(fin or {}).get('reason', '-')} [{time.strftime('%H:%M:%S')}]", flush=True)
 
 
-def usage(prompt_tokens: int, completion_tokens: int, fin: dict = None) -> dict:
-    """OpenAI usage plus prompt_tokens_details.cached_tokens (prefix-cache hits, shown by clients) and, non-standard
-    like llama.cpp's, `timings` (job_timings)."""
-    u = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-         "total_tokens": prompt_tokens + completion_tokens}
-    t = (fin or {}).get("timings")
-    if t:
-        if t.get("cached_tokens") is not None:
-            u["prompt_tokens_details"] = {"cached_tokens": int(t["cached_tokens"])}
-        u["timings"] = t
-    return u
-
-
 def as_request_error(exc: BaseException, prompt_tokens: int = None, context: int = None) -> RequestError:
     """Map an exception raised while creating or running a job to a RequestError."""
     if isinstance(exc, RequestError):
@@ -120,98 +93,6 @@ def as_request_error(exc: BaseException, prompt_tokens: int = None, context: int
         return RequestError(503, f"The server ran out of GPU memory for this request ({text})", type="server_error",
                             code="server_overloaded")
     return RequestError(500, text, type="server_error")
-
-
-async def read_json(req, require: tuple = ()) -> dict:
-    """The request body as a JSON object (400 if it is not one, or lacks a required field)."""
-    try:
-        body = await req.json()
-    except Exception as e:
-        raise RequestError(400, f"request body is not valid JSON ({type(e).__name__}: {e})")
-    if not isinstance(body, dict):
-        raise RequestError(400, "request body must be a JSON object")
-    for field in require:
-        if body.get(field) is None:
-            raise RequestError(400, f"missing required field {field!r}", param=field)
-    return body
-
-
-def sse_error(exc: BaseException) -> str:
-    return "data: " + json.dumps(as_request_error(exc).body()) + "\n\n"
-
-
-KEEPALIVE_S = 15.0
-SSE_KEEPALIVE = ": keepalive\n\n"   # an SSE comment: clients skip it, but it is traffic on the connection
-
-
-async def guard_stream(chunks, keepalive_s: float = KEEPALIVE_S):
-    """Pass SSE chunks through. Once a response has started its status cannot change, so an exception becomes an
-    in-band error event (OpenAI SDKs raise it as an APIError) followed by [DONE], instead of a torn connection.
-
-    While no chunk comes for keepalive_s (queued behind other jobs, a long prefill), an SSE comment goes out instead:
-    Node's fetch (undici) drops a response body that is silent for 300 s with "terminated", and agent clients retried
-    the whole request, prefill again included. Clients' own idle watchdogs see events, not comments, so they still
-    catch a server that has really stopped.
-
-    The source runs in one pump task that queues its chunks; this side sends everything queued at once. exllamav3's
-    AsyncGenerator runs each forward pass synchronously on the event loop and yields to it once per step, so every
-    task hop a chunk takes costs a whole step: a task per chunk (waiting on each __anext__ with a timeout) made the
-    stream fall behind the decode by 2/3, the backlog arriving only once generation ended."""
-    q = asyncio.Queue()
-    end = object()
-
-    async def pump():
-        try:
-            async for c in chunks:
-                q.put_nowait(c)
-        except Exception as e:
-            q.put_nowait(e)
-            return
-        q.put_nowait(end)
-
-    task = asyncio.create_task(pump())
-    try:
-        while True:
-            try:
-                async with asyncio.timeout(keepalive_s):
-                    item = await q.get()
-            except TimeoutError:
-                yield SSE_KEEPALIVE
-                continue
-            while True:
-                if item is end:
-                    return
-                if isinstance(item, Exception):
-                    raise item
-                yield item
-                if q.empty():
-                    break
-                item = q.get_nowait()
-    except Exception as e:
-        err = as_request_error(e)
-        if err.status >= 500:
-            traceback.print_exception(e)
-        yield sse_error(e)
-        yield "data: [DONE]\n\n"
-    finally:
-        if not task.done():                 # the client went away: stop the source (its finally cancels the job)
-            task.cancel()
-            await asyncio.wait({task})
-
-
-def generator_failure(gen):
-    """The exception that killed the exllamav3 AsyncGenerator's iteration loop, or None while it is alive."""
-    if gen is None:
-        return None
-    err = getattr(gen, "error", None)
-    if err is not None:
-        return err
-    task = getattr(gen, "iteration_task", None)
-    if task is not None and task.done():
-        if task.cancelled():
-            return RuntimeError("generator iteration task was cancelled")
-        return task.exception() or RuntimeError("generator iteration task ended")
-    return None
 
 
 def prefix_cache_tiers(args) -> dict:
@@ -252,47 +133,6 @@ def release_failed(exc: BaseException):
         torch.cuda.empty_cache()
 
 
-class RetryingJob:
-    """Iterates an exllamav3 AsyncJob's results. A CUDA out-of-memory failure frees what the failed forward held; one
-    that comes before the first token re-runs the job (remake() builds an identical one) with the generator's prefill
-    chunks halved until that job's prefill is done. A second failure, or one after tokens were streamed, is raised."""
-
-    def __init__(self, job, remake, generator, log=print):
-        self.job, self.remake, self.generator, self.log = job, remake, generator, log
-        self.retried = False
-
-    async def cancel(self):
-        await self.job.cancel()
-
-    async def __aiter__(self):
-        started, restore = False, None
-        try:
-            while True:
-                try:
-                    async for r in self.job:
-                        if not started and r.get("stage") == "streaming":
-                            started = True
-                            if restore is not None:   # the retried prefill is done: full chunks again
-                                self.generator.max_chunk_size, restore = restore, None
-                        yield r
-                    return
-                except Exception as e:
-                    if not is_cuda_oom(e):
-                        raise
-                    release_failed(e)
-                    if started or self.retried:
-                        raise
-                    self.retried = True
-                    restore = self.generator.max_chunk_size
-                    self.generator.max_chunk_size = max(256, restore // 2 // 256 * 256)
-                    self.log(f" !! out of GPU memory before the first token; retrying the request with "
-                             f"{self.generator.max_chunk_size}-token prefill chunks")
-                    self.job = self.remake()
-        finally:
-            if restore is not None:
-                self.generator.max_chunk_size = restore
-
-
 def gpu_memory_stats() -> dict | None:
     """GPU memory in MiB as torch sees it: held by live tensors, reserved by its caching allocator, the peak since the
     start, and what the device has free in total (torch imported here: this module stays stdlib-only at import)."""
@@ -303,59 +143,3 @@ def gpu_memory_stats() -> dict | None:
     mib = lambda b: round(b / 2 ** 20)
     return {"allocated_mib": mib(torch.cuda.memory_allocated()), "reserved_mib": mib(torch.cuda.memory_reserved()),
             "peak_allocated_mib": mib(torch.cuda.max_memory_allocated()), "free_mib": mib(free), "total_mib": mib(total)}
-
-
-def install(app, get_gen, name: str = "server", exit_on_dead: bool = True):
-    """Error handlers, a liveness-aware /health and the dead-generator exit for a FastAPI app. get_gen() returns the
-    AsyncGenerator (None until startup). Registers GET /health: define no other /health route. exit_on_dead=False
-    (tests) keeps the process alive when the generator loop dies."""
-    from fastapi import Request
-    from fastapi.exceptions import RequestValidationError
-    from fastapi.responses import JSONResponse
-
-    @app.exception_handler(RequestError)
-    async def _request_error(_req: Request, exc: RequestError):
-        return JSONResponse(exc.body(), status_code=exc.status)
-
-    @app.exception_handler(RequestValidationError)
-    async def _validation_error(_req: Request, exc: RequestValidationError):
-        return JSONResponse(RequestError(400, str(exc)).body(), status_code=400)
-
-    @app.exception_handler(Exception)
-    async def _any_error(_req: Request, exc: Exception):
-        err = as_request_error(exc)
-        if err.status >= 500:
-            traceback.print_exception(exc)
-        return JSONResponse(err.body(), status_code=err.status)
-
-    @app.get("/health")
-    async def health():
-        gen = get_gen()
-        if gen is None:
-            return JSONResponse({"ok": False, "status": "starting"}, status_code=503)
-        dead = generator_failure(gen)
-        if dead is not None:
-            return JSONResponse({"ok": False, "status": "generator dead", "error": f"{type(dead).__name__}: {dead}"},
-                                status_code=503)
-        return JSONResponse({"ok": True})
-
-    @app.on_event("startup")
-    async def _watch_generator():
-        if not exit_on_dead:
-            return
-
-        async def watch():
-            while True:
-                await asyncio.sleep(1.0)
-                dead = generator_failure(get_gen())
-                if dead is None:
-                    continue
-                print(f" !! {name}: the generator loop died ({type(dead).__name__}: {dead}); in-flight requests get "
-                      f"the error, exiting in {EXIT_GRACE_S:g} s so the server can be restarted", flush=True)
-                traceback.print_exception(dead)
-                await asyncio.sleep(EXIT_GRACE_S)
-                sys.stdout.flush()
-                sys.stderr.flush()
-                os._exit(EXIT_CODE_GENERATOR_DEAD)
-
-        app.state.generator_watch = asyncio.create_task(watch())

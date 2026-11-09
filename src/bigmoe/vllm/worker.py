@@ -1,14 +1,15 @@
-"""vLLM worker whose model runner is the exllamav3 engine (engine.py). Runs in the EngineCore process (UniProcExecutor).
+"""vLLM worker whose model runner is the exllamav3 executor (engine.py). Runs in the EngineCore process
+(UniProcExecutor).
 
 Configured through the environment the serve entry point (serve.py) sets before vLLM starts:
   BIGMOE_BACKEND        dsv41 | glm53
-  BIGMOE_EXL_ARGV       JSON list: the native server's command line (exllamav3 model_init arguments)
+  BIGMOE_EXL_ARGV       JSON list: the engine's command line (exllamav3 model_init arguments)
   BIGMOE_VLLM_ENGINE    exl (default) | fake (engine.FakeEngine: no GPU, for tests of the plumbing)
 """
 import json
 import os
 
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from . import state
@@ -34,8 +35,6 @@ class BoxWorker(WorkerBase):
             self.device = torch.device("cuda:0")
             torch.cuda.set_device(self.device)
         self.engine = None
-        self.pending: dict = {}      # req_id -> tokens sampled while the request was not in vLLM's batch
-        self.progress: dict = {}
 
     def load_model(self, *, load_dummy_weights: bool = False):
         # serve.py pinned the API server (and so this process) to the main CPUs; loading uses every core, and the
@@ -48,7 +47,7 @@ class BoxWorker(WorkerBase):
         return None
 
     def get_kv_cache_spec(self):
-        return {}                    # attention-free for vLLM: the K/V cache is exllamav3's
+        return {}                    # attention-free for vLLM: the K/V cache is exllamav3's (BoxKVCacheManager)
 
     def determine_available_memory(self) -> int:
         return 0
@@ -66,7 +65,11 @@ class BoxWorker(WorkerBase):
         return 0
 
     def take_draft_token_ids(self):
-        return None
+        """The drafter's tokens from the last step, which vLLM's scheduler verifies in the next one."""
+        drafts = self.engine.take_drafts() if self.engine is not None else {}
+        if not drafts:
+            return None
+        return DraftTokenIds(req_ids=list(drafts), draft_token_ids=[list(d) for d in drafts.values()])
 
     def reset_mm_cache(self) -> None:
         return None
@@ -78,37 +81,32 @@ class BoxWorker(WorkerBase):
         return None
 
     def execute_model(self, scheduler_output):
+        """Take the step vLLM scheduled; it runs in sample_tokens, which gets the step's grammar bitmask (vLLM
+        computes it for structured-output requests between the two calls). Admission and release already happened
+        through BoxKVCacheManager."""
         e = self.engine
         for rid in scheduler_output.finished_req_ids:
-            e.cancel(rid)
-            self.pending.pop(rid, None)
-            self.progress.pop(rid, None)
-        for nr in scheduler_output.scheduled_new_reqs:
-            e.add(nr.req_id, nr.prompt_token_ids, nr.sampling_params, self._mm_inputs(nr))
-        scheduled = scheduler_output.num_scheduled_tokens
-        if not scheduled:
+            e.release(rid)
+        plan = state.take_plan()
+        if not scheduler_output.num_scheduled_tokens:
             if getattr(e, "idle_pending", False):
                 e.idle()
             state.put_progress({})
             return EMPTY_MODEL_RUNNER_OUTPUT
-        for rid, (toks, prog) in e.step().items():
-            if toks:
-                self.pending.setdefault(rid, []).extend(toks)
-            self.progress[rid] = prog
-        req_ids = list(scheduled)
-        sampled = [self.pending.pop(rid, []) for rid in req_ids]
-        state.put_progress({rid: self.progress[rid] for rid in req_ids if rid in self.progress})
-        return ModelRunnerOutput(req_ids=req_ids, req_id_to_index={r: i for i, r in enumerate(req_ids)},
-                                 sampled_token_ids=sampled)
+        self.step = (scheduler_output, {rid: plan[rid] for rid in scheduler_output.num_scheduled_tokens})
+        return None
 
     def sample_tokens(self, grammar_output):
-        raise RuntimeError("bigmoe: execute_model always returns the output")
-
-    def _mm_inputs(self, nr):
-        if not nr.mm_features:
-            return []
-        from . import mm
-        return mm.features_of(nr)
+        """Run exactly the step vLLM scheduled: the ranges BoxScheduler.schedule recorded, the spec tokens it scheduled
+        for verification, the grammar rows of structured-output requests."""
+        scheduler_output, plan = self.step
+        self.step = None
+        result = self.engine.execute(plan, scheduler_output.scheduled_spec_decode_tokens, grammar_output)
+        req_ids = list(plan)
+        sampled = [result[rid][0] if rid in result else [] for rid in req_ids]
+        state.put_progress({rid: result[rid][1] for rid in req_ids if rid in result})
+        return ModelRunnerOutput(req_ids=req_ids, req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                                 sampled_token_ids=sampled)
 
     # ---- RPC targets for the API server's extra routes (routes.py), via collective_rpc ----
     def bigmoe_call(self, method: str, *args, **kwargs):

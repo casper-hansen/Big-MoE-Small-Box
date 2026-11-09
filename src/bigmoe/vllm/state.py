@@ -1,8 +1,13 @@
-"""Hand-off between BoxWorker and BoxScheduler. Both live in the EngineCore process (UniProcExecutor runs the worker
-in-process), and EngineCore calls them in turn on one thread: schedule -> execute_model -> update_from_output."""
+"""Hand-off between BoxScheduler / BoxKVCacheManager and BoxWorker. All of them live in the EngineCore process
+(UniProcExecutor runs the worker in-process), and EngineCore calls them in turn on one thread:
+schedule -> execute_model -> update_from_output -> take_draft_token_ids."""
+import collections
 
 _PROGRESS: dict = {}
+_PLAN: dict = {}
 _ENGINE = [None]
+# where vLLM's count of a request's computed tokens and the engine's differed after a step, by cause
+CORRECTIONS = collections.Counter()
 
 
 def set_engine(engine):
@@ -11,6 +16,17 @@ def set_engine(engine):
 
 def engine():
     return _ENGINE[0]
+
+
+def put_plan(plan: dict):
+    _PLAN.clear()
+    _PLAN.update(plan)
+
+
+def take_plan() -> dict:
+    p = dict(_PLAN)
+    _PLAN.clear()
+    return p
 
 
 def put_progress(progress: dict):

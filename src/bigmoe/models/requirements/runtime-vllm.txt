@@ -1,5 +1,5 @@
-# Runtime of the vLLM-fronted servers (Python 3.12): the native runtime (runtime.txt: torch 2.13 + CUDA 13, measured
-# on the RTX 3090 box) plus vLLM 0.33.0's frontend dependencies (its requirements/common.txt, resolved against torch
+# Runtime of the servers (Python 3.12): the torch 2.13 + CUDA 13 set the exllamav3 wheel is built against
+# (exllamav3-abi.txt, measured on the RTX 3090 box) plus vLLM 0.33.0's dependencies (its requirements/common.txt, resolved against torch
 # 2.13 with fastapi < 0.137), 2026-11-08. vLLM itself is installed without deps (runtime-vllm-nodeps.txt): its wheel pins
 # torch 2.14, but bigmoe uses only its server, scheduler and processors, never its kernels.
 agent-detector==2.0.0

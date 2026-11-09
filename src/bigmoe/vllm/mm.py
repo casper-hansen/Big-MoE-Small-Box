@@ -10,10 +10,10 @@ API server (vLLM's chat parsing / media loading -> this processor):
                    serve.py) -> <|image|> becomes t * h * w / merge^2 embedding rows between the real start / end tokens
   vLLM sends the preprocessed tensors (feature `bx_pixels` + `bx_meta`) and the item's content hash to the engine.
 
-Worker (engine.ExlEngine.add -> embed()): the content hash keys the embedding cache (RAM, then disk; multimodal.Vision);
-a miss loads the tower, encodes and unloads it (VRAM lent by the expert cache when short). The placeholder positions
-are replaced by the embedding's ids (fixed per content hash for the process lifetime), so a resent image gives the same
-token ids and the prefix cache reuses the prompt through it, as in the native servers.
+Executor (engine.ExlEngine.reserve, when vLLM admits the request -> embed()): the content hash keys the embedding
+cache (RAM, then disk; multimodal.Vision); a miss loads the tower, encodes and unloads it (VRAM lent by the expert
+cache when short). The placeholder positions are replaced by the embedding's ids (fixed per content hash for the process lifetime), so a resent image gives the same
+token ids and the prefix cache reuses the prompt through it.
 """
 import threading
 from collections.abc import Mapping

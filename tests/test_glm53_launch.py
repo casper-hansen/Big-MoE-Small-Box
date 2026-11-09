@@ -131,8 +131,8 @@ def test_warm_prefill_off_by_default(tmp_path, monkeypatch):
     assert "GLM53_EC_WARM_PREFILL" not in spec.env   # exact mode prefills exactly
 
 
-def test_native_frontend(tmp_path, monkeypatch):
-    _box, spec = spec_for(tmp_path, monkeypatch, "nvme", frontend="native")
-    assert spec.argv[:3] == ["/envs/glm53/bin/python", "-m", "bigmoe.models.glm53.engine.server"]
-    _box, vspec = spec_for(tmp_path, monkeypatch, "nvme")
-    assert vspec.argv[5:] == spec.argv[3:] and vspec.env == spec.env
+def test_vllm_is_the_only_server(tmp_path, monkeypatch):
+    _box, spec = spec_for(tmp_path, monkeypatch, "nvme")
+    assert spec.argv[:5] == ["/envs/glm53/bin/python", "-m", "bigmoe.vllm.serve", "--backend", "glm53"]
+    with pytest.raises(TypeError):
+        glm53.GLM53Options(frontend="native")

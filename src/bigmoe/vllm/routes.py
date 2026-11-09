@@ -1,4 +1,4 @@
-"""What the native servers served beside the OpenAI API, on vLLM's server (a vllm.endpoint_plugins entry point,
+"""The servers' routes beside the OpenAI API, on vLLM's server (a vllm.endpoint_plugins entry point,
 allowlisted by serve.py through VLLM_PLUGINS), plus the SSE keepalive middleware.
 
   /stats /server_info /v1/models    engine statistics (requests, draft acceptance, tiers, vision, GPU memory), the
@@ -83,8 +83,8 @@ keepalive_middleware = KeepaliveMiddleware
 
 
 class ModelAliasMiddleware:
-    """The native servers answered whatever `model` a request named (one model per server); vLLM answers 404 for a
-    name it does not serve. A JSON POST to /v1/... whose model is missing or unknown gets the served name."""
+    """One model per server: a request may name any `model` (agent clients send their own aliases); vLLM answers 404
+    for a name it does not serve. A JSON POST to /v1/... whose model is missing or unknown gets the served name."""
 
     def __init__(self, app):
         import os
@@ -134,7 +134,7 @@ model_alias_middleware = ModelAliasMiddleware
 
 
 class ContextErrorMiddleware:
-    """vLLM phrases overlong-prompt errors like the native server but uses numeric code 400. Restore the native
+    """vLLM phrases overlong-prompt errors like OpenAI but uses numeric code 400. Set OpenAI's
     `context_length_exceeded` code on small JSON 400 responses so OpenAI/agent clients can compact and retry."""
 
     def __init__(self, app):

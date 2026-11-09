@@ -155,15 +155,14 @@ def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
     assert "DSV41_EC_WARM_PREFILL" not in spec.env
 
 
-def test_native_frontend(tmp_path, monkeypatch):
-    _box, spec = spec_for(tmp_path, monkeypatch, frontend="native")
-    assert spec.argv[:3] == ["/envs/dsv41/bin/python", "-m", "bigmoe.models.dsv41.engine.server"]
-    _box, vspec = spec_for(tmp_path, monkeypatch)
-    assert vspec.argv[5:] == spec.argv[3:]
-    assert {k: v for k, v in vspec.env.items() if k != "DSV41_NV_RAM_GB"} == spec.env
-    assert vspec.env["DSV41_NV_RAM_GB"] == "46.0"   # deterministic native-sized tier, unlike the native auto-sizing
-    assert vspec.memory_gb == spec.memory_gb + 4.5
+def test_vllm_is_the_only_server(tmp_path, monkeypatch):
+    _box, spec = spec_for(tmp_path, monkeypatch)
+    assert spec.argv[:5] == ["/envs/dsv41/bin/python", "-m", "bigmoe.vllm.serve", "--backend", "dsv41"]
+    assert spec.env["DSV41_NV_RAM_GB"] == "46.0"   # a fixed RAM tier, not sized from the cgroup at start
+    assert spec.memory_gb == 56.0 + 4.5
     _box, spec = spec_for(tmp_path, monkeypatch, frontend_extra_ram_gb=0)
-    assert spec.memory_gb == 56.0
-    with pytest.raises(ValueError):
-        AutoBox("deepseek-v4.1-flash", home=tmp_path, frontend="sglang").options.validate()
+    assert spec.memory_gb == 56.0 and "DSV41_NV_RAM_GB" not in spec.env
+    with pytest.raises(TypeError):   # no other serving engine to select
+        AutoBox("deepseek-v4.1-flash", home=tmp_path, frontend="native")
+    with pytest.raises(ValueError):   # the disk tier sits behind the CPU tier
+        spec_for(tmp_path, monkeypatch, "nvme", cpu_cache_gb=0, disk_cache="/x")

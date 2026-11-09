@@ -1,4 +1,4 @@
-"""Image input for the model servers (glm53, dsv41): OpenAI / Anthropic image blocks -> exllamav3 MMEmbeddings.
+"""Image input for both servers (glm53, dsv41; bigmoe/vllm): OpenAI / Anthropic image blocks -> exllamav3 MMEmbeddings.
 
 The text-only path has to stay exactly as fast as before, so the vision tower costs nothing while no image comes in:
 
@@ -8,9 +8,9 @@ The text-only path has to stay exactly as fast as before, so the vision tower co
   tier and the decode path are the ones measured without images.
 - VRAM for the encode comes from what torch has free between forward passes (the EC_RESERVE_GB headroom the prefill
   activations use); when that is short (GLM's 1.5 GB headroom, large images) the expert pool lends chunks of its cache
-  (tiers.Pool.lend: written back to the RAM tier, freed, reallocated and re-enabled right after the encode). exllamav3's
-  AsyncGenerator runs every forward on the event loop and this runs synchronously between two of its steps, so no
-  forward ever sees the cache shrink.
+  (tiers.Pool.lend: written back to the RAM tier, freed, reallocated and re-enabled right after the encode). The
+  executor encodes when vLLM's scheduler admits the request (vllm/engine.py: reserve), on the EngineCore thread between
+  two steps, so no forward ever sees the cache shrink.
 - CPU work (download, base64 decode, PIL decode, resize / normalize) runs in a thread pool: the decode of other
   requests is not held up by it, only by the GPU encode itself (~0.2 s per 1280x960 image).
 - Content-addressed embeddings. Each image is keyed by a hash of its bytes (plus the model and the token budget); its

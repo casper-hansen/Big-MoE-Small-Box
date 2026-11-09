@@ -47,8 +47,8 @@ the same RAM from the RAM tier, which is decode speed. So nothing of the tower i
   prefill activations use: 3 GB for DeepSeek, 1.5 GB for GLM mode nvme). When that is short (large images, GLM's
   smaller headroom) the expert pool lends whole chunks of its VRAM cache (`tiers.Pool.lend`): their experts are written
   back to the RAM tier, the slots leave the CLOCK, the memory goes to torch; after the encode the chunks are
-  reallocated and their slots come back empty (`Pool.give_back`). exllamav3's AsyncGenerator runs every forward
-  synchronously on the event loop and the encode runs between two of its steps, so no forward sees the cache shrink.
+  reallocated and their slots come back empty (`Pool.give_back`). The encode runs when vLLM's scheduler admits the
+  request (`vllm/engine.py`: `reserve`), on the EngineCore thread between two steps, so no forward sees the cache shrink.
   `/stats` counts the lends (DeepSeek: `tiers[0].vram.lent`, GLM: `expert_cache.lent`). GLM mode nvme-exact (1 GB
   of headroom), a 1920x1080 screenshot: 4 chunks (1,152 MiB) lent, 123 experts written back, all reallocated, 1,536
   slots before and after.

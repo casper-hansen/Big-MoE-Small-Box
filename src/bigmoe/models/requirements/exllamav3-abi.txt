@@ -1,5 +1,6 @@
-# Runtime of both servers (Python 3.12): the exact package set measured on the RTX 3090 box, 2026-10-18/19.
-# exllamav3 is built from source on top (bigmoe/models/runtime.py: EXLLAMAV3) and installed without deps.
+# The package set (Python 3.12, torch 2.13 + CUDA 13, measured on the RTX 3090 box 2026-10-18/19) that the exllamav3
+# wheel is compiled against and keyed by (bigmoe/models/runtime.py: EXLLAMAV3_ABI). It is not a server environment:
+# the servers run in runtime-vllm.txt, which pins the same torch / CUDA and installs this wheel.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1

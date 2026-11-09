@@ -1,12 +1,15 @@
-"""Entry point of the vLLM-fronted servers: python -m bigmoe.vllm.serve --backend {dsv41,glm53} <native server args>.
+"""Entry point of the servers: python -m bigmoe.vllm.serve --backend {dsv41,glm53} <engine args>.
 
-Takes the native servers' command line (exllamav3's model_init arguments plus --host / --port / --served-name /
+Takes the engine's command line (exllamav3's model_init arguments plus --host / --port / --served-name /
 --max-batch-size), hands it to the worker through BIGMOE_EXL_ARGV and starts vLLM's OpenAI server with:
 
   the stub architecture of the backend (models.py, hf_overrides), BoxWorker / BoxScheduler, one in-process worker,
-  max_model_len = the exllamav3 cache (-cs), max_num_seqs = --max-batch-size, a token budget that never binds
-  (the engine chunks prefills itself), the backend's tool-call and reasoning parsers, the SSE keepalive middleware and
-  this package's extra routes (routes.py).
+  max_model_len = the exllamav3 cache (-cs), max_num_seqs = --max-batch-size, vLLM's chunked-prefill token budget
+  (one prefill chunk of -chunk_size tokens per step beside every running decode and its draft tokens; a long prefill
+  is capped at one chunk while other requests run), a speculative config when the engine drafts (DSpark / MTP, a
+  draft model, n-gram: vLLM schedules and accounts the drafts the engine proposes; "ngram" is only the config's
+  method name, vLLM runs no proposer of its own), the backend's tool-call and reasoning parsers, the SSE keepalive
+  middleware and this package's extra routes (routes.py).
 
 Extra vLLM arguments go after "--" (e.g. -- --enable-log-requests).
 """
@@ -22,20 +25,19 @@ PARSERS = {
     "dsv41": ("deepseek_v41", "deepseek_v41", "hf"),
     "glm53": ("glm47", "glm47", "hf"),
 }
-# the native servers' default: DeepSeek answers in chat mode (thinking on request), GLM-5.3 thinks
+# DeepSeek answers in chat mode (thinking on request), GLM-5.3 thinks
 CHAT_DEFAULTS = {"dsv41": {"enable_thinking": False}, "glm53": {}}
 
 
-# GLM-5.3's template has no thinking switch (its generation prompt always opens <think>); the native server closed the
-# block itself when a request turned thinking off. The overlay template does the same, and with "enable_thinking" in
+# GLM-5.3's template has no thinking switch (its generation prompt always opens <think>); the overlay template closes
+# the block when a request turns thinking off, and with "enable_thinking" in
 # the template vLLM's GLM parser honours the switch (vllm/parser/glm47_moe.py: _glm53_always_thinks).
 GLM_THINKING_OFF = ("\n{%- if add_generation_prompt and enable_thinking is defined and enable_thinking is not none "
                     "and not enable_thinking -%}</think>{%- endif -%}\n")
 
 
 # GLM-5.3's template renders an image block as a "you are unable to process this image" reminder (the checkpoint's
-# text-only default); with image input the block becomes the image's placeholder (bigmoe/vllm/mm.py), where the native
-# server put the image embedding's alias.
+# text-only default); with image input the block becomes the image's placeholder (bigmoe/vllm/mm.py).
 GLM_REMINDER = ('{{- "<reminder>You are unable to process this " ~ media_type ~ " because you don\'t have multi-modal '
                 'input ability. Try different methods.</reminder>" }}')
 GLM_IMAGE = ("{%- if media_type == 'image' -%}<|begin_of_image|><|image|><|end_of_image|>{%- else -%}" + GLM_REMINDER
@@ -91,10 +93,22 @@ def split_argv(argv):
     return argv, []
 
 
+def draft_window(a) -> int:
+    """The most draft tokens the engine verifies per step (0: no drafting): -ndt (else exllamav3's default, at most
+    8 for the backends' drafters) or the hybrid window, whichever is larger."""
+    if not (a.mtp or a.draft_model_dir or a.ngram_match_min or a.hybrid_draft_tokens):
+        return 0
+    return max(int(a.num_draft_tokens or 8), int(a.hybrid_draft_tokens or 0))
+
+
 def vllm_argv(backend: str, a, extra: list, tokenizer: str = None) -> list:
     tool, reasoning, tok_mode = PARSERS[backend]
     ctx = int(a.cache_size)
-    batch = int(a.max_batch_size)
+    # exllamav3 runs as many sequences at once as its cache has recurrent-state slots (-ambs, default 1; both
+    # models have recurrent layers), whatever --max-batch-size says: vLLM admits that many, the rest wait in its queue
+    batch = max(1, min(int(a.max_batch_size), int(a.autosplit_max_batch_size or 1)))
+    chunk = int(a.chunk_size)
+    k = draft_window(a)
     argv = ["serve", a.model_dir,
             "--served-model-name", a.served_name or backend,
             "--host", a.host, "--port", str(a.port),
@@ -103,11 +117,14 @@ def vllm_argv(backend: str, a, extra: list, tokenizer: str = None) -> list:
             "--scheduler-cls", "bigmoe.vllm.scheduler.BoxScheduler",
             "--distributed-executor-backend", "uni",
             "--max-model-len", str(ctx), "--max-num-seqs", str(batch),
-            # every running request is in every step; the engine decides how much of a prompt a step prefills
-            "--max-num-batched-tokens", str(ctx * batch), "--enable-chunked-prefill",
+            # vLLM's chunked prefill: a step holds one prefill chunk beside every running decode (+ its drafts); with
+            # other requests running, a long prefill takes at most one chunk per step
+            "--max-num-batched-tokens", str(chunk + batch * (1 + k)), "--enable-chunked-prefill",
+            "--long-prefill-token-threshold", str(chunk),
+            # vLLM's block-hash prefix cache stays off: BoxKVCacheManager answers prefix lookups from exllamav3's
             "--no-async-scheduling", "--enforce-eager", "--disable-prefix-caching",
             "--tokenizer-mode", tok_mode, "--trust-remote-code",
-            # the native servers did not inherit sampling defaults from generation_config.json (GLM pins top_p .95)
+            # sampling defaults stay the request's (generation_config.json would pin GLM's top_p to .95)
             "--generation-config", "vllm",
             "--enable-auto-tool-choice", "--tool-call-parser", tool, "--reasoning-parser", reasoning,
             "--middleware", "bigmoe.vllm.routes.keepalive_middleware",
@@ -122,6 +139,9 @@ def vllm_argv(backend: str, a, extra: list, tokenizer: str = None) -> list:
     argv += ["--chat-template-content-format", "openai", "--mm-processor-cache-gb", "0.25", "--skip-mm-profiling"]
     if os.environ.get("BIGMOE_MM", "1") in ("0", "", "false", "False"):
         argv += ["--limit-mm-per-prompt", json.dumps({"image": 0})]
+    if k:
+        argv += ["--speculative-config", json.dumps({"method": "ngram", "num_speculative_tokens": k,
+                                                     "prompt_lookup_min": 1, "prompt_lookup_max": 1})]
     if CHAT_DEFAULTS[backend]:
         argv += ["--default-chat-template-kwargs", json.dumps(CHAT_DEFAULTS[backend])]
     return argv + list(extra)
@@ -139,7 +159,12 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=30000)
     ap.add_argument("--served-name", default=None)
     # exllamav3 single-dash flags that would otherwise parse as "-m <rest>" (the engine parses them all again)
+    ap.add_argument("-chunk_size", "--chunk_size", type=int, default=2048)
+    ap.add_argument("-ambs", "--autosplit_max_batch_size", type=int, default=1)
     ap.add_argument("-mtp", "--mtp", action="store_true")
+    ap.add_argument("-dm", "--draft_model_dir", default=None)
+    ap.add_argument("-ngram", "--ngram_match_min", type=int, default=0)
+    ap.add_argument("-hdt", "--hybrid_draft_tokens", type=int, default=0)
     ap.add_argument("-ndt", "--num_draft_tokens", type=int, default=None)
     a, _rest = ap.parse_known_args(ours)
     exl = [x for x in ours]

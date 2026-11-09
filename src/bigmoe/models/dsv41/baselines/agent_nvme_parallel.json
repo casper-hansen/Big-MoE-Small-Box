@@ -1,0 +1,210 @@
+{
+ "started": "2026-11-09T12:01:32+0100",
+ "model": "deepseek-v4.1-flash",
+ "parallel": 2,
+ "thinking": false,
+ "env": {
+  "BIGMOE_ENGINE_PREFIX": "DSV41_",
+  "DSV41_NV": "2",
+  "DSV41_NV_STORE": "/home/casper/.cache/bigmoe/stores/turboderp--DeepSeek-V4.1-Flash-1017-exl3@9183eaaeb6f0/dsv41_flash_exl3_2.25bpw_experts.bin",
+  "DSV41_NV_CPU": "1",
+  "DSV41_NV_POL": "0.17,0.023,0.36,0.145,0.42,0.12,0.40,0.25,1.36,0.75",
+  "DSV41_EC_RESERVE_GB": "3.0",
+  "DSV41_EC_STAGE_SLOTS": "384",
+  "DSV41_EC_STAGE_MIN": "512",
+  "DSV41_EC_ELASTIC_GB": "11",
+  "DSV41_MAX_RQ_TOKENS": "4096",
+  "DSV41_EC_WARM": "/home/casper/big-moe-small-box/src/bigmoe/models/dsv41/data/stats_dec.json",
+  "DSV41_MAIN_CPUS": "0",
+  "DSV41_NV_CTL_CPU": "6",
+  "DSV41_NV_READER_CPUS": "7-11",
+  "DSV41_NV_CPU_CPUS": "1-5",
+  "DSV41_EC_WARM_PREFILL": "1",
+  "BIGMOE_EC_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_ec-84ade52388a34ad3",
+  "BIGMOE_NV2_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_nv2-d269a250bb0b9dad",
+  "BIGMOE_X16_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_x16-0c83594d32f7dd3a",
+  "DSV41_NV_RAM_GB": "46.0",
+  "BIGMOE_MM": "1",
+  "BIGMOE_MM_DISK_DIR": "/home/casper/.cache/bigmoe/mm-cache/dsv41",
+  "BIGMOE_MM_DISK_MB": "2048",
+  "EXL3_DSPARK_CONF": "0.5",
+  "BIGMOE_BACKEND": "dsv41",
+  "BIGMOE_EXL_ARGV": "[\"-m\", \"/home/casper/.cache/bigmoe/models/turboderp--DeepSeek-V4.1-Flash-1017-exl3@9183eaaeb6f0\", \"-cs\", \"131072\", \"--max-batch-size\", \"4\", \"-chunk_size\", \"8192\", \"-ccs\", \"0\", \"-rcs\", \"0.5\", \"-mtp\", \"--host\", \"127.0.0.1\", \"--port\", \"30000\", \"--served-name\", \"deepseek-v4.1-flash\"]",
+  "BIGMOE_SERVED_NAME": "deepseek-v4.1-flash",
+  "BIGMOE_CTX_RESERVE": "10"
+ },
+ "tasks": {
+  "refactor_config": {
+   "status": "done",
+   "passed": true,
+   "check_output": "----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK\n",
+   "turns": 5,
+   "tool_calls": 6,
+   "invalid_tool_calls": 0,
+   "wall_s": 76.0,
+   "prompt_tokens": 5342,
+   "cached_tokens": 4352,
+   "completion_tokens": 513,
+   "cache_hit": 0.802,
+   "mean_new_tokens": 237.2,
+   "mean_ttft_s": 12.97,
+   "per_turn": [
+    {
+     "ttft_s": 2.66,
+     "turn_s": 5.09,
+     "decode_tok_s": 19.76,
+     "prompt_tokens": 553,
+     "cached_tokens": 512,
+     "completion_tokens": 49,
+     "finish": "tool_calls",
+     "arg_deltas": 3,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 5.05,
+     "turn_s": 6.62,
+     "decode_tok_s": 44.29,
+     "prompt_tokens": 819,
+     "cached_tokens": 768,
+     "completion_tokens": 48,
+     "finish": "tool_calls",
+     "arg_deltas": 3,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 12.85,
+     "turn_s": 22.42,
+     "decode_tok_s": 28.79,
+     "prompt_tokens": 1076,
+     "cached_tokens": 1024,
+     "completion_tokens": 268,
+     "finish": "tool_calls",
+     "arg_deltas": 14,
+     "tools": [
+      "write_file",
+      "write_file",
+      "write_file"
+     ]
+    },
+    {
+     "ttft_s": 20.65,
+     "turn_s": 22.62,
+     "decode_tok_s": 25.45,
+     "prompt_tokens": 1400,
+     "cached_tokens": 1024,
+     "completion_tokens": 51,
+     "finish": "tool_calls",
+     "arg_deltas": 3,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 13.34,
+     "turn_s": 19.2,
+     "decode_tok_s": 16.37,
+     "prompt_tokens": 1494,
+     "cached_tokens": 1024,
+     "completion_tokens": 97,
+     "finish": "stop",
+     "arg_deltas": 0,
+     "tools": []
+    }
+   ]
+  },
+  "fix_stats_bug": {
+   "status": "done",
+   "passed": true,
+   "check_output": "----------------------------------------------------------------------\nRan 4 tests in 0.000s\n\nOK\n",
+   "turns": 5,
+   "tool_calls": 4,
+   "invalid_tool_calls": 0,
+   "wall_s": 86.7,
+   "prompt_tokens": 5508,
+   "cached_tokens": 3328,
+   "completion_tokens": 388,
+   "cache_hit": 0.564,
+   "mean_new_tokens": 543.5,
+   "mean_ttft_s": 16.26,
+   "per_turn": [
+    {
+     "ttft_s": 5.77,
+     "turn_s": 7.01,
+     "decode_tok_s": 40.27,
+     "prompt_tokens": 518,
+     "cached_tokens": 512,
+     "completion_tokens": 51,
+     "finish": "tool_calls",
+     "arg_deltas": 3,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 12.97,
+     "turn_s": 14.29,
+     "decode_tok_s": 40.38,
+     "prompt_tokens": 796,
+     "cached_tokens": 512,
+     "completion_tokens": 46,
+     "finish": "tool_calls",
+     "arg_deltas": 2,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 19.51,
+     "turn_s": 27.15,
+     "decode_tok_s": 24.5,
+     "prompt_tokens": 1245,
+     "cached_tokens": 768,
+     "completion_tokens": 173,
+     "finish": "tool_calls",
+     "arg_deltas": 5,
+     "tools": [
+      "write_file"
+     ]
+    },
+    {
+     "ttft_s": 14.63,
+     "turn_s": 15.67,
+     "decode_tok_s": 38.65,
+     "prompt_tokens": 1438,
+     "cached_tokens": 768,
+     "completion_tokens": 41,
+     "finish": "tool_calls",
+     "arg_deltas": 3,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 17.91,
+     "turn_s": 22.57,
+     "decode_tok_s": 16.31,
+     "prompt_tokens": 1511,
+     "cached_tokens": 768,
+     "completion_tokens": 77,
+     "finish": "stop",
+     "arg_deltas": 0,
+     "tools": []
+    }
+   ]
+  }
+ },
+ "summary": {
+  "passed": 2,
+  "tasks": 2,
+  "wall_s": 86.8,
+  "turns": 10,
+  "tool_calls": 10,
+  "invalid_tool_calls": 0,
+  "cache_hit": 0.681
+ },
+ "finished": "2026-11-09T12:02:59+0100"
+}

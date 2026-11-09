@@ -175,6 +175,12 @@ def cmd_bench(a):
     box.bench(a.tokens, prefill_tokens=a.prefill_tokens, out=a.out, log=lambda m: print(m, flush=True))
 
 
+def cmd_bench_agent(a):
+    res = _box(a).bench_agent(a.tasks or None, parallel=a.parallel, thinking=a.thinking, out=a.out,
+                              log=lambda m: print(m, flush=True))
+    sys.exit(0 if res["summary"]["passed"] == res["summary"]["tasks"] else 1)
+
+
 def cmd_verify(a):
     from .bench.verification import verify
     box_kw = {k: v for k, v in dict(revision=a.revision, backend=a.backend, context=a.context, memory_gb=a.memory_gb,
@@ -183,7 +189,8 @@ def cmd_verify(a):
         k, _, v = item.partition("=")
         if k.strip() != "mode":
             box_kw[k.strip()] = _value(v)
-    verify(a.model, out_dir=a.out, baseline_dir=a.baseline, log=lambda m: print(m, flush=True), **box_kw)
+    verify(a.model, out_dir=a.out, baseline_dir=a.baseline, agent=not a.no_agent, log=lambda m: print(m, flush=True),
+           **box_kw)
 
 
 def cmd_verify_store(a):
@@ -247,8 +254,16 @@ def main(argv=None):
                    help="new tokens on a cached 8192-token prefix (default: 8 .. 10000; none: skip)")
     p.add_argument("--out", help="result JSON (default: <home>/results/...)")
     p.set_defaults(fn=cmd_bench)
-    p = sub.add_parser("verify", help="speed + outputs against the reference results (~15 min per model)")
+    p = sub.add_parser("bench-agent", help="agentic benchmark: coding tasks over OpenAI tool calling (starts the server)")
     _add_box_args(p)
+    p.add_argument("--tasks", nargs="*", help="task names (default: all, see bigmoe/bench/agent.py)")
+    p.add_argument("--parallel", type=int, default=1, help="agents running at once (vLLM schedules them together)")
+    p.add_argument("--thinking", action="store_true", help="let the model think on every turn")
+    p.add_argument("--out", help="result JSON (default: <home>/results/...)")
+    p.set_defaults(fn=cmd_bench_agent)
+    p = sub.add_parser("verify", help="speed, outputs and the agentic benchmark against the reference results")
+    _add_box_args(p)
+    p.add_argument("--no-agent", action="store_true", help="skip the agentic benchmark")
     p.add_argument("--out", help="result directory")
     p.add_argument("--baseline", help="reference directory (default: the backend's)")
     p.set_defaults(fn=cmd_verify)

@@ -1,24 +1,31 @@
-"""vLLM's scheduler with the engine as the source of truth for progress.
+"""vLLM's scheduler over the exllamav3 executor (engine.py).
 
-vLLM's Scheduler admits requests (max_num_seqs = the engine's batch size), schedules every running request every step,
-checks stop conditions (EOS, stop strings via the detokenizer, max_tokens), builds the outputs and keeps the metrics.
-The worker runs one exllamav3 Generator.iterate() per step, which decides on its own how much of each prompt it
-prefills (its chunk size, cached prefix pages, recurrent checkpoints, last-page splits) and how many tokens a decode
-step yields (speculative decoding: up to 1 + draft). So after each step, before vLLM's own bookkeeping:
+vLLM's own Scheduler makes every scheduling decision: which waiting requests are admitted and in what order (FCFS or
+priority, max_num_seqs), how the step's token budget is split between decodes and prefill chunks (chunked prefill,
+max_num_batched_tokens, long_prefill_token_threshold), which draft tokens are verified, when a request is preempted,
+when it stops. Three adapters connect it to the engine:
 
-- num_computed_tokens is set to what the engine reports (Progress.computed): the prefill position, or all but the last
-  sampled token once decoding. A request therefore always has tokens left to schedule (a prefill remainder or the
-  last sampled token) and is in every step's batch; vLLM's token budget is set so that it never binds.
-- the prefill stats get the prefix the engine reused (Progress.cached), which vLLM reports as
-  usage.prompt_tokens_details.cached_tokens.
-- a request the engine ended on its own (the cache is full, a failed job) is finished here with finish_reason
-  "length" / "error" after its last tokens went out.
+- BoxKVCacheManager replaces vLLM's KV block manager (the stub models are attention-free, vLLM holds no K/V). The
+  K/V lives in exllamav3's page table, so that is what vLLM's capacity and prefix-cache questions are asked of:
+  get_computed_blocks reserves the request's pages in the engine and answers with the prompt tokens the prefix cache
+  (GPU pages, pinned-RAM and disk tiers, recurrent checkpoints) saves; allocate_slots fails when the engine has no
+  free pages (the request keeps waiting, or vLLM preempts the lowest-priority running request); free returns the
+  pages. vLLM's prefill stats and prefix-cache metrics (usage.prompt_tokens_details.cached_tokens) are its own.
+- _reserve_prefill_lookahead (the last word on a step's chunk size in both of vLLM's scheduling loops) shortens a
+  prefill chunk to where exllamav3 can end a forward (engine.plan_chunk): page boundaries, the max chunk, the
+  recurrent last-page split. The engine then computes exactly what was scheduled.
+- update_from_output lets vLLM do its own bookkeeping (stop checks, draft acceptance: num_computed_tokens -=
+  rejected), then checks each request's computed-token count against the engine's and corrects the rare difference
+  (counted by cause in /stats: scheduler.corrections). A request the engine ended on its own (the cache is full, a
+  failed job) is finished here with finish_reason "length" / "error".
 
-vLLM keeps no K/V cache (attention-free stubs): no blocks, no preemption, no vLLM prefix caching.
+schedule() records each scheduled request's range (computed before the step, scheduled, sequence length) for the
+worker, which hands it to the engine.
 """
+from vllm.outputs import RequestError
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
-from vllm.outputs import RequestError
 from vllm.v1.request import RequestStatus
 
 from . import state
@@ -28,11 +35,96 @@ _FINISH = {"length": (RequestStatus.FINISHED_LENGTH_CAPPED, FinishReason.LENGTH)
            "error": (RequestStatus.FINISHED_ERROR, FinishReason.ERROR)}
 
 
+class BoxKVCacheManager(KVCacheManager):
+    """vLLM's KV cache manager interface over exllamav3's page table (installed on the scheduler's manager by
+    BoxScheduler; vLLM's own block pool has no KV cache groups for the attention-free stubs and stays empty)."""
+
+    @property
+    def engine(self):
+        e = state.engine()
+        assert e is not None, "bigmoe: the engine is not loaded"
+        return e
+
+    @property
+    def usage(self) -> float:
+        return float(self.engine.page_usage())
+
+    def prefix_cache_lookup_enabled(self, request) -> bool:
+        return True                  # exllamav3's prefix cache, always on
+
+    def get_computed_blocks(self, request, max_cache_hit_length=None):
+        hit = self.engine.reserve(request)
+        if hit is None:              # no free pages: allocate_slots refuses it too
+            return self.empty_kv_cache_blocks, 0, 0
+        limit = request.num_tokens - 1 if max_cache_hit_length is None else max_cache_hit_length
+        return self.empty_kv_cache_blocks, max(0, min(int(hit), limit)), 0
+
+    def get_computed_blocks_for_connector(self, request, max_cache_hit_length=None):
+        return *self.get_computed_blocks(request, max_cache_hit_length), False
+
+    def allocate_slots(self, request, num_new_tokens, *args, **kwargs):
+        if not self.engine.ensure(request):
+            return None
+        return self.empty_kv_cache_blocks
+
+    def free(self, request) -> None:
+        self.engine.release(request.request_id)
+
+    def pop_blocks_for_free(self, request):
+        self.engine.release(request.request_id)
+        return []
+
+    def cache_blocks(self, request, num_computed_tokens: int) -> None:
+        return None                  # exllamav3 hashes its own pages
+
+    def estimate_cached_tokens(self, request) -> int:
+        return min(self.engine.cached_of(request.request_id), request.num_prompt_tokens)
+
+    def get_blocks(self, request_id: str):
+        return self.empty_kv_cache_blocks
+
+    def reset_prefix_cache(self) -> bool:
+        return False                 # exllamav3's tiers are not dropped from the API
+
+
 class BoxScheduler(Scheduler):
+
+    def __init__(self, *args, vllm_config, **kwargs):
+        # EngineCore turns chunked prefill off for a model without KV cache groups (it expects an encoder-only model);
+        # these models' K/V is exllamav3's, and their prompts are prefilled in vLLM-sized chunks
+        vllm_config.scheduler_config.enable_chunked_prefill = True
+        super().__init__(*args, vllm_config=vllm_config, **kwargs)
+        self.kv_cache_manager.__class__ = BoxKVCacheManager
+        self.kv_cache_manager.enable_caching = True
 
     def has_requests(self) -> bool:
         # an idle engine with disk-tier pages to flush keeps stepping (the worker does one flush slice per empty step)
         return super().has_requests() or state.idle_work_pending()
+
+    def _reserve_prefill_lookahead(self, request, num_computed_tokens: int, num_new_tokens: int) -> int:
+        n = super()._reserve_prefill_lookahead(request, num_computed_tokens, num_new_tokens)
+        e = state.engine()
+        if e is None or n <= 0:
+            return n
+        return e.plan(request.request_id, num_computed_tokens, n, request.num_tokens)
+
+    def update_draft_token_ids(self, draft_token_ids):
+        # A request whose prefill stopped one token short (engine.plan_chunk, hold_last) takes its first drafts: its
+        # next step is the last prompt token plus them, a decode step. vLLM would drop drafts for a prefill chunk.
+        for rid in draft_token_ids.req_ids:
+            r = self.requests.get(rid)
+            if r is not None and r.is_prefill_chunk and r.num_computed_tokens >= r.num_tokens - 1:
+                r.is_prefill_chunk = False
+        super().update_draft_token_ids(draft_token_ids)
+
+    def schedule(self, *args, **kwargs):
+        out = super().schedule(*args, **kwargs)
+        plan = {}
+        for rid, n in out.num_scheduled_tokens.items():
+            req = self.requests[rid]
+            plan[rid] = (req.num_computed_tokens - n, n, req.num_tokens)   # computed already advanced by n
+        state.put_plan(plan)
+        return out
 
     def update_from_output(self, scheduler_output, model_runner_output):
         progress = state.take_progress()
@@ -42,15 +134,23 @@ class BoxScheduler(Scheduler):
             p = progress.get(req_id)
             if request is None or p is None or request.is_finished():
                 continue
-            # Set cached-prefix stats even when the engine ended this request on this very token: super() can hit
-            # max_tokens on that token and consume the stats before _end() runs.
+            # The engine knows the prefix it reused once the request is reserved; set it before super() can consume
+            # the stats on this step's first token
             if p.cached is not None and request.prefill_stats is not None:
                 request.prefill_stats.set(request.num_prompt_tokens, min(p.cached, request.num_prompt_tokens), 0)
             if p.finished:
                 ended.append((req_id, p))
-                continue
-            request.num_computed_tokens = p.computed
         outputs = super().update_from_output(scheduler_output, model_runner_output)
+        for req_id, p in progress.items():
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished() or p.finished:
+                continue
+            if request.num_computed_tokens != p.computed:
+                kind = "prefill" if p.computed < request.num_prompt_tokens else "decode"
+                kind += "_behind" if p.computed < request.num_computed_tokens else "_ahead"
+                state.CORRECTIONS[kind] += 1
+                request.num_computed_tokens = p.computed
+                request.is_prefill_chunk = p.computed < request.num_tokens - 1
         for req_id, p in ended:
             self._end(req_id, p, outputs)
         return outputs

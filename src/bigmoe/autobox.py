@@ -177,6 +177,15 @@ class AutoBox:
     def generate(self, prompt: str, **kwargs):
         return self.client.complete(prompt, **kwargs)
 
+    def bench_agent(self, tasks=None, *, parallel=1, thinking=False, out=None, log=print) -> dict:
+        """The agentic benchmark (bench/agent.py): coding tasks through the OpenAI API with tool calling, checked."""
+        from .bench import agent
+        if not (self.running and self.server.healthy()):
+            self.start()
+        if out is None:
+            out = self.home.results / f"agent-{self.backend.name}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        return agent.run(self.client, tasks, parallel=parallel, thinking=thinking, out=str(out), log=log)
+
     def bench(self, tokens=(1024, 8192, 32768), *, prefill_tokens=None, out=None, log=print) -> dict:
         """Long-context runs (prompts of `tokens` tokens, bench/longctx.py), then prefill on a cached prefix
         (`prefill_tokens` new tokens, bench/prefill.py; None = its default sizes, () = skip). One result JSON."""

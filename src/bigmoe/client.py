@@ -94,7 +94,7 @@ class Client:
         return self.request("/stats", timeout=30)
 
     def tokenize(self, text: str) -> list:
-        # the text carries its own special tokens (vLLM's /tokenize would add a BOS; the native servers ignore the flag)
+        # the text carries its own special tokens (vLLM's /tokenize would otherwise add a BOS)
         return self.request("/tokenize", {"prompt": text, "add_special_tokens": False})["tokens"]
 
     def _chat_body(self, messages, *, thinking, max_tokens, temperature, extra):
@@ -143,7 +143,7 @@ class Client:
                 for ch in ev.get("choices") or [] if ch.get("text"))
 
     def generate(self, *, input_ids=None, text=None, sampling_params=None, stream=False, **extra):
-        """Native endpoint. Streamed events carry the whole text so far, not a delta."""
+        """SGLang-shaped /generate on token ids (bench, verify). Streamed events carry the whole text so far."""
         body = {"sampling_params": sampling_params or {}, **extra}
         if input_ids is not None:
             body["input_ids"] = list(input_ids)
