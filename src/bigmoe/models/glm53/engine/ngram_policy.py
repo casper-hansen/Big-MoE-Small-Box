@@ -1,32 +1,27 @@
-"""Cost-aware n-gram drafting for the offload engine (GLM53_NG_POLICY=1, default on with -ngram).
+"""Cost-aware n-gram drafting for GLM-5.3-Flash (speculation="ngram").
 
-On this box a draft token is not cheap: every token of a verify window brings its own routed experts, and the cold ones
-come from RAM or NVMe. Stock prompt lookup drafts whenever the last ngram_match_min tokens occur earlier in the context,
-which on prose and loosely structured output (JSON with varying values) mostly proposes tokens that get rejected:
-measured 9.6 -> 6.3 tok/s on prose and 9.2 -> 4.2 tok/s on CSV->JSON. This policy drafts only when the evidence says the
-model is copying:
-  - the suffix match must be at least GLM53_NG_MIN tokens long (default 4), and
-  - the job's recent per-token draft acceptance (EWMA over drafted tokens, GLM53_NG_ALPHA, starts at 0.5) must be
-    >= GLM53_NG_ACC (default 0.7): the draft is the stock num_draft_tokens cut to the length whose last token is still
-    accepted with probability >= GLM53_NG_KEEP (default 0.5); or
-  - the match is at least GLM53_NG_LONG tokens (default 12) and the acceptance is >= GLM53_NG_ACC_LONG (0.35): a probe of
-    GLM53_NG_PROBE tokens (default 2), which is how a job (re-)enters drafting;
-  - matched steps that do not draft let a low acceptance recover slowly toward 0.5 (GLM53_NG_RECOVER per step).
-Exact: drafts only decide what gets verified, the target model's tokens are unchanged (verification shapes can still
-flip an fp16 near-tie, as with stock speculation). Measured (README): copy +27 %, file edit +13 %, others -6..-1 %.
+A draft token is not free here: every token of a verify window brings its own routed experts, and the cold ones come
+from RAM or NVMe. exllamav3's prompt lookup drafts whenever the last ngram_match_min tokens occur earlier in the
+context, which on prose mostly proposes tokens that are rejected. This policy drafts only when the model is copying:
+  - the suffix match is at least MIN tokens long, and
+  - the job's recent per-token draft acceptance (an EWMA with weight ALPHA, starting at 0.5) is at least ACC: the draft
+    is exllamav3's, cut to the length whose last token is still accepted with probability >= KEEP; or
+  - the match is at least LONG tokens and the acceptance at least ACC_LONG: a probe of PROBE tokens, which is how a job
+    enters drafting again;
+  - a matched step that does not draft lets a low acceptance recover toward 0.5 by RECOVER.
+Drafts only decide what is verified; the tokens are the target model's.
 """
-import os
 import torch
 
-MIN = int(os.environ.get("GLM53_NG_MIN", "4"))
-ACC = float(os.environ.get("GLM53_NG_ACC", "0.7"))
-LONG = int(os.environ.get("GLM53_NG_LONG", "12"))
-ALPHA = float(os.environ.get("GLM53_NG_ALPHA", "0.3"))
-KEEP = float(os.environ.get("GLM53_NG_KEEP", "0.5"))
-ACC_LONG = float(os.environ.get("GLM53_NG_ACC_LONG", "0.35"))   # a long match probes only above this acceptance
+MIN = 4
+ACC = 0.7
+LONG = 12
+ALPHA = 0.3
+KEEP = 0.5
+ACC_LONG = 0.35
+PROBE = 2
+RECOVER = 0.01
 MM_FIRST = 1_000_000_000   # exllamav3 FIRST_MM_EMBEDDING_INDEX: image placeholder ids
-PROBE = int(os.environ.get("GLM53_NG_PROBE", "2"))               # draft length of a probe
-RECOVER = float(os.environ.get("GLM53_NG_RECOVER", "0.01"))      # acceptance recovery per matched step without a draft
 STATS = {"calls": 0, "matched": 0, "drafted": 0, "draft_tokens": 0, "steps": 0, "accepted": 0, "rejected": 0,
          "skip_short": 0, "skip_acc": 0}
 

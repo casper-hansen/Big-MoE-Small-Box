@@ -52,6 +52,12 @@ from .env import env, build_dir
 from . import tiers as NT
 
 GiB = 1024 ** 3
+TIMEOUT_NS = 5_000_000_000   # device-side waits for the host (reply, copy, CPU job)
+COPY_GRID = 48               # blocks of the admission copy kernel
+LAND_SLOTS = 64              # RAM landing slots kept ready for VRAM victims
+FREE_LOW = 96                # free RAM slots below which the host evicts
+STAGE_QD = 24                # NVMe queue depth of the prefill ring's read-ahead
+MAX_CPU_PICKS = 32           # CPU-lane picks per layer call, at most
 _EXT = None
 NV = None
 VERIFY = [False]   # BCP: set by the server around generator verify forwards (lossy-policy eligible)
@@ -155,13 +161,8 @@ class Nv2:
         g = env
         self.cpu_on = g("NV_CPU", "0") == "1"
         self.x16, self.x16_hi, self.stepped = None, 0, False   # X16 lane (x16_setup)
-        self.b70 = g("B70", "0") == "1"
-        assert not self.b70 or self.cpu_on, "B70=1 needs the CPU tier (NV_CPU=1): the CPU worker runs the B70 lane"
-        self.b70_ring = g("B70_RING", "/run/local-ai/shared/b70.ring")
-        self.b70_timeout = float(g("B70_TIMEOUT_S", "2"))
-        self.b70_keys = []
-        self.timeout_ns = int(float(g("NV_TIMEOUT_S", "5")) * 1e9)
-        self.grid = int(g("NV_COPY_GRID", "48"))
+        self.timeout_ns = TIMEOUT_NS
+        self.grid = COPY_GRID
         self.wb_on = g("NV_EXCL", "1") == "1"
         self.prefetch = g("NV_PREFETCH", "0") == "1"
         # N136: the layer-ahead routing guess runs on a side stream concurrently with this layer's router (both read the
@@ -275,16 +276,16 @@ class Nv2:
                self.a["adml"], self.a["land"], self.a["home"], self.a["res"], self.a["hx"], self.a["hout"],
                torch.tensor(self.ram.addr.tolist(), dtype=torch.int64), torch.tensor(self.pf.addr.tolist(), dtype=torch.int64),
                torch.from_numpy(sc), int(g("NV_THREADS", "16")), rcpus, int(g("NV_CTL_CPU", "25")),
-               int(self.wb_on), int(g("NV_LAND", "64")), int(g("NV_FREE_LO", "96")),
+               int(self.wb_on), LAND_SLOTS, FREE_LOW,
                torch.tensor(self.vring_addr, dtype=torch.int64), self.slot_cls, int(self.small_bytes))
-        e.set_stage_qd(int(g("NV_PF_QD", "24")))
+        e.set_stage_qd(STAGE_QD)
         if self.ring_borrow:
             e.set_ring_borrow(ring_pf)
         if self.stg_addr:
             e.stg_init(torch.tensor(self.stg_addr, dtype=torch.int64), int(g("NV_STG_MAX", "3")))
         pol = [float(x) for x in g("NV_POL", "0.17,0.023,0.38,0.145,0.165,0.040,0.40,0.12,0.395,0.75").split(",")]
-        self.pol = pol + [1.0 if self.cpu_on else 0.0, 1.0 if g("NV_NVCPU", "1" if self.cpu_on else "0") == "1" else 0.0,
-                          float(g("NV_MAXCPU", "32")), 1.0 if g("NV_NOADMIT", "1" if self.cpu_on else "0") == "1" else 0.0]
+        cpu = 1.0 if self.cpu_on else 0.0
+        self.pol = pol + [cpu, cpu, float(MAX_CPU_PICKS), cpu]   # CPU lane on, NVMe picks to it, its pick cap, no-admit
         e.set_pol(self.pol)
         # ---- the pool reads homes from the mapped table from now on (ec_step / ec_copy / ec_evict take its address)
         pool.home = self.home.view(self.L, self.E, 3)
@@ -326,7 +327,7 @@ class Nv2:
                  "lane_nvg", "lane_nvc", "reads", "read_bytes", "wb_landed", "wb_dup", "adm_freed", "adm_pinned",
                  "evictions", "cpu_jobs", "cpu_experts", "cpu_tokens", "stage_ram", "stage_nv", "stage_reads", "read_err",
                  "alloc_fail", "land_pushed", "prefetch", "plan_ns", "ctl_busy_ns", "cpu_busy_ns", "cpu_wait_land_ns",
-                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "lane_b70", "b70_jobs", "b70_rows", "b70_wait_ns", "b70_rtt_ns", "b70_err", "b70_rtt_max_ns", "pf_keys", "pf_skip", "pf_used", "pf_wasted", "lane_skip", "lossy_calls", "lossy_tok", "lossy_tok_skip", "lossy_cold_x1e6", "lossy_skip_x1e6", "lossy_coldu", "lossy_want", "lossy_bg_reads", "promoted", "stg_issued", "stg_ready", "stg_hit", "stg_late",
+                 "read_ms_x1000", "stage_wait_ns", "stage_job_ns", "wb_bulk", "dec_tok", "notice_ns", "notice_max_ns", "serve_max_ns", "reply_ns", "wb_issued", "wb_drop", "vring_hits", "pf_keys", "pf_skip", "pf_used", "pf_wasted", "lane_skip", "lossy_calls", "lossy_tok", "lossy_tok_skip", "lossy_cold_x1e6", "lossy_skip_x1e6", "lossy_coldu", "lossy_want", "lossy_bg_reads", "promoted", "stg_issued", "stg_ready", "stg_hit", "stg_late",
                  "stg_nofree", "stg_dup", "stg_waste", "wb_early", "partial_lands", "partial_binds", "wb_lat_us",
                  "wb_lat_max_us", "ring_low", "ring_low_vfree", "ring_borrowed",
                  "x16_jobs", "x16_experts", "x16_gu_ns", "x16_wait_ns", "x16_down_ns",
@@ -365,13 +366,10 @@ class Nv2:
         torch.cuda.synchronize(self.dev)
         so = p.slotof.flatten().cpu().numpy()
         vk = np.nonzero(so >= 0)[0]
-        self.b70_keys = self._b70_pick(so) if self.b70 else []
-        b70set = set(self.b70_keys)
         nd = 0
         if self.wb_on:
-            drop = np.concatenate([vk.astype(np.int64), np.asarray(self.b70_keys, np.int64)])
-            nd = ext().drop_keys(torch.from_numpy(drop))
-            rest = [k for k in self._rank if so[k] < 0 and k not in b70set]
+            nd = ext().drop_keys(torch.from_numpy(vk.astype(np.int64)))
+            rest = [k for k in self._rank if so[k] < 0]
             st = ext().state()
             ks = st[1].numpy()
             rest = [k for k in rest if ks[k] == 0][: nd]
@@ -379,34 +377,11 @@ class Nv2:
                 ext().warm_read(torch.tensor(rest, dtype=torch.int64))
         ext().nv_rows_all(self.L, self.E, p.slotof, self.a["home"], p.tabs)
         torch.cuda.synchronize(self.dev)
-        if self.b70:
-            ms = ext().b70_attach(self.b70_ring, torch.tensor(self.b70_keys, dtype=torch.int64), 900.0)
-            ext().b70_set(1, self.b70_timeout)
-            NT._log(f"nv2 B70 tier: {len(self.b70_keys)} experts loaded on the B70 server in {ms / 1e3:.1f} s ({self.b70_ring})")
         ext().reset_counters()
         self.dstats.zero_()
         c = self.counters()
         NT._log(f"nv2 post-warm: {len(vk)} VRAM-resident, {nd} RAM copies of them dropped (exclusive), RAM resident "
                 f"{c['resident']}, free {c['free']}")
-
-    def _b70_pick(self, so):
-        """B70 key set: the next experts after the 3090's VRAM warm set, by warm score (or the RAM tier's rank order)."""
-        n = int(env("B70_N", "3000"))
-        if env("B70_ORDER", "score") == "rr":
-            order = self._rank
-        else:
-            sc = np.full(self.K, -1.0)
-            for li, m in enumerate(self.pool.mods):
-                s = self.scores.get(m.key)
-                if s is not None:
-                    sc[li * self.E:(li + 1) * self.E] = np.asarray(s[:self.E], np.float64)
-            order = [int(k) for k in np.argsort(-sc, kind="stable") if sc[k] >= 0]
-        return [k for k in order if so[k] < 0][:n]
-
-    def set_b70(self, on):
-        """Runtime switch (decode-KL harness): on=False -> B70-resident picks take the normal RAM/NVMe lanes (exact)."""
-        if self.b70:
-            ext().b70_set(int(bool(on)), self.b70_timeout)
 
     # ---- per MoE layer call (decode / small forwards) -----------------------------------------------------------
     def layer(self, li, sel, w, z, bsz):
@@ -536,9 +511,9 @@ class Nv2:
             return
         e = ext()
         cpus = _cpus(env("NV_CPU_CPUS", "2-23"))
-        threads = int(env("NV_CPU_THREADS", "0")) or len(cpus)
-        mode = int(env("NV_CPU_MODE", "-1"))
-        lim = self.act_limit if env("NV_CLAMP", "1") == "1" else 0.0
+        threads = len(cpus)
+        mode = -1                 # the kernel picks its arithmetic per job
+        lim = self.act_limit      # the model's activation clamp, as on the GPU
         e.cpu_init(threads, cpus, mode, lim)
         for li, s in enumerate(self.scales):
             m = self.pool.mods[li]
@@ -957,11 +932,7 @@ class Nv2:
                                    "zc_admits": r(c["lane_zc"] / steps), "nvme_gpu": r(c["lane_nvg"] / steps),
                                    "nvme_cpu": r(c["lane_nvc"] / steps),
                                    "reply_wait_ms": r(d[9] / 1e6 / steps), "nvme_wait_ms": r(d[11] / 1e6 / steps),
-                                   "cpu_busy_ms": r(c["cpu_busy_ns"] / 1e6 / steps),
-                                   "b70_experts": r(c["lane_b70"] / steps), "b70_wait_ms": r(c["b70_wait_ns"] / 1e6 / steps)},
-               "b70": {"on": self.b70, "keys": len(self.b70_keys), "jobs": c["b70_jobs"], "rows": c["b70_rows"],
-                       "rtt_us_mean": r(c["b70_rtt_ns"] / 1e3 / max(1, c["b70_jobs"])), "rtt_us_max": r(c["b70_rtt_max_ns"] / 1e3),
-                       "wait_us_mean": r(c["b70_wait_ns"] / 1e3 / max(1, c["b70_jobs"])), "err": c["b70_err"]},
+                                   "cpu_busy_ms": r(c["cpu_busy_ns"] / 1e6 / steps)},
                "memcg": NT.cgroup_mem()}
         ps = out["decode_per_step"]
         out["decode_per_token"] = {k: (r(v * steps / toks) if isinstance(v, float) else v) for k, v in ps.items()
@@ -995,8 +966,7 @@ def finish(model):
     nd = NT._drop_checkpoint_cache()
     NT._log(f"nv2 ready: {NT._LOAD['marked_linears']} expert linears on the bounce slot, "
             f"{NT._LOAD['skipped_bytes'] / 1e9:.1f} GB of checkpoint expert bytes never read, DONTNEED on {nd} files")
-    if env("NV_VERIFY_START", "1") == "1":
-        print(f" -- nv2 startup verify: {nv.verify(32)}", flush=True)
+    print(f" -- nv2 startup verify: {nv.verify(32)}", flush=True)
 
 
 def summary():

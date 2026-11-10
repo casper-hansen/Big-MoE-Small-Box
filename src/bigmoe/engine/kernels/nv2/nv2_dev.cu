@@ -255,7 +255,7 @@ __global__ void nv_step_k(const int64_t* __restrict__ sel, const __half* __restr
         const long long e = sel[s] - first;
         int ln = LN_VRAM;
         if (e >= 0 && e < E) { const int u = uidx[e]; if (u >= 0) ln = ulane[u]; }
-        const bool c = ln == LN_CPU || ln == LN_NVC || ln == LN_B70 || ln == LN_SKIP;
+        const bool c = ln == LN_CPU || ln == LN_NVC || ln == LN_SKIP;
         sel_out[s] = c ? -1 : sel[s];
         float rsc = 1.0f;
         if (s_ok && rp->rn_on) { const int tk = s / max(1, (int) rp->rn_topk); if (tk < MAXB) rsc = rp->rn_sc[tk]; }
@@ -388,7 +388,7 @@ __global__ void nv_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
         for (int u = t; u < nu; u += blockDim.x)
         {
             const int ln = ulane[u];
-            if (ln == LN_CPU || ln == LN_NVC || ln == LN_B70 || ln == LN_SKIP) continue;
+            if (ln == LN_CPU || ln == LN_NVC || ln == LN_SKIP) continue;
             const int e = uexp[u];
             const long long key = (long long) li * E + e;
             const int s = slotof_all[key];

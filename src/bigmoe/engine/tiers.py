@@ -33,6 +33,10 @@ from .ec import ext as _ext
 from .env import env
 
 GiB = 1024 ** 3
+TURN_CKPTS = 4            # turn checkpoints kept (turn_resume.py), ~36 MB each for DeepSeek-V4.1
+ADMIT_MAX = 64            # layer calls of at most this many picks may admit experts to VRAM (decode)
+CHUNK_SLOTS = 32          # VRAM slots per allocation; the prefill and the vision tower borrow whole chunks
+ACT_BYTES_PER_TOKEN = 0.6e6   # activation memory a prefill forward needs per token
 _BC_ARGS = {}             # id(multi_gate.ptrs_trellis) -> (gate ptrs, up ptrs, gu_trellis_ptr) from BC_BlockSparseMLP(...)
 _BOUNCE = {}              # device index -> (tensor, base address)
 _LOAD = {"active": None, "marked_linears": 0, "skipped_bytes": 0, "files": set()}
@@ -261,8 +265,8 @@ def _drop_checkpoint_cache():
 # VRAM pool
 # --------------------------------------------------------------------------------------------------------------------
 class Pool:
-    def __init__(self, device, mods, reserve, max_slots, admit_max, stage_n=0, stage_min=8192, elastic=0.0):
-        self.device, self.mods, self.admit_max = device, mods, admit_max
+    def __init__(self, device, mods, reserve, stage_n=0, stage_min=8192, elastic=0.0):
+        self.device, self.mods, self.admit_max = device, mods, ADMIT_MAX
         self.nv2 = None
         self.stage_min = stage_min
         m0 = mods[0]
@@ -290,10 +294,8 @@ class Pool:
             self.stage = [torch.empty((self.stage_n, self.rec), dtype=torch.uint8, device=device) for _ in range(2)]
             free -= 2 * self.stage_n * self.rec
         S = max(0, int((free - reserve) // self.rec))
-        if max_slots is not None:
-            S = min(S, max_slots)
         # arena in chunks of spc slots: flex chunks (the last ones) are handed back to torch during prefill (elastic)
-        self.spc = int(env("EC_CHUNK_SLOTS", "32"))
+        self.spc = CHUNK_SLOTS
         self.chunks = []
         for _ in range((S + self.spc - 1) // self.spc):
             try:
@@ -338,7 +340,7 @@ class Pool:
             self.keep.append((pg, pu, pd, gu))
         self.home = torch.stack(home).contiguous()                    # [L, E, 3] current homes
         self.tabs = torch.tensor(tabs, dtype=torch.int64, device=device)
-        self.grid = int(env("EC_COPY_GRID", "0")) or torch.cuda.get_device_properties(device).multi_processor_count * 8
+        self.grid = torch.cuda.get_device_properties(device).multi_processor_count * 8
         self.size_hist = {}
         if self.stage_n:
             self.cstream = torch.cuda.Stream(device)
@@ -467,8 +469,8 @@ class Pool:
         chunks), allocate the staging buffers from it. Short forwards take only what they need (EC_ELASTIC_DYN)."""
         e = _ext()
         self.flex = list(self.flex_all)
-        if ntok is not None and self.nv2 is not None and env("EC_ELASTIC_DYN", "1") == "1":
-            need = 2 * self.stage_n * self.rec + ntok * float(env("EC_ACT_MB_PER_TOK", "0.6")) * 1e6 + 0.3e9
+        if ntok is not None and self.nv2 is not None:
+            need = 2 * self.stage_n * self.rec + ntok * ACT_BYTES_PER_TOKEN + 0.3e9
             nf = min(len(self.flex_all), int(-(-need // (self.spc * self.rec))))
             self.flex = self.flex_all[len(self.flex_all) - nf:]
         if self.nv2 is not None:
@@ -670,15 +672,13 @@ def attach(model):
     mods.sort(key=lambda m: by_key[m.key]["li"])
     dev = torch.device(str(mods[0].device))
     reserve = float(env("EC_RESERVE_GB", "2.5")) * GiB
-    mx = env("EC_MAX_SLOTS")
-    admit_max = int(env("EC_ADMIT_MAX", "64"))
     stage_min = int(env("EC_STAGE_MIN", "8192"))
     elastic = float(env("EC_ELASTIC_GB", "0")) * GiB
     slots = env("EC_STAGE_SLOTS")
     stage_gb = float(env("EC_STAGE_GB", "0"))
     slot = max(al(L["trellis_bytes"]) for L in by_key.values())
     stage_n = int(slots) if slots else (int(stage_gb * GiB // slot) if stage_gb > 0 else 0)
-    p = Pool(dev, mods, reserve, int(mx) if mx else None, admit_max, stage_n, stage_min, elastic)
+    p = Pool(dev, mods, reserve, stage_n, stage_min, elastic)
     for li, m in enumerate(mods):
         Ly = by_key[m.key]
         sg, su, sd, ou, od = p.geom(li)
@@ -747,10 +747,10 @@ def attach(model):
         log(last_page.apply(p.stage_min, p.topk, rewinds))
         if rewinds:      # the next request of a conversation resumes where the last one stopped
             from . import turn_resume
-            log(turn_resume.install(int(env("TURN_CKPTS", "4"))))
+            log(turn_resume.install(TURN_CKPTS))
     log(f"pool: {len(mods)} MoE layers (experts {p.first}..{p.first + p.E - 1}), {p.S} slots x {p.rec / 1e6:.2f} MB = "
         f"{p.S * p.rec / GiB:.2f} GiB ({p.S / len(mods):.1f}/layer), {'uniform' if p.uniform else 'per-layer'} geometry, "
-        f"admit <= {admit_max} picks, stage 2 x {p.stage_n} experts (>= {stage_min} picks), elastic "
+        f"admit <= {ADMIT_MAX} picks, stage 2 x {p.stage_n} experts (>= {stage_min} picks), elastic "
         f"{len(p.flex_all)} chunks{', warm ' + warm if warm else ''}")
     N2.finish(model)
     return POOLS
