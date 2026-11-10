@@ -1,5 +1,5 @@
 {
- "started": "2026-11-09T18:38:02+0100",
+ "started": "2026-11-10T17:03:28+0100",
  "model": "deepseek-v4.1-flash",
  "parallel": 2,
  "thinking": false,
@@ -20,103 +20,23 @@
   "DSV41_NV_READER_CPUS": "7-11",
   "DSV41_NV_CPU_CPUS": "1-5",
   "DSV41_EC_WARM_PREFILL": "1",
-  "DSV41_EC_WARM_FETCH": "64",
-  "DSV41_EC_WARM_AHEAD": "1",
+  "DSV41_NV_SLRU": "80",
   "BIGMOE_EC_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_ec-84ade52388a34ad3",
-  "BIGMOE_NV2_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_nv2-d269a250bb0b9dad",
+  "BIGMOE_NV2_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_nv2-2797d2288873a837",
   "BIGMOE_X16_BUILD": "/home/casper/.cache/bigmoe/kernels/bigmoe_x16-0c83594d32f7dd3a",
   "DSV41_NV_RAM_GB": "46.0",
   "BIGMOE_MM": "1",
   "BIGMOE_MM_DISK_DIR": "/home/casper/.cache/bigmoe/mm-cache/dsv41",
   "BIGMOE_MM_DISK_MB": "2048",
   "DSV41_RC_INTERVAL": "256",
+  "DSV41_TURN_CKPTS": "4",
   "EXL3_DSPARK_CONF": "0.5",
   "BIGMOE_BACKEND": "dsv41",
-  "BIGMOE_EXL_ARGV": "[\"-m\", \"/home/casper/.cache/bigmoe/models/turboderp--DeepSeek-V4.1-Flash-1017-exl3@9183eaaeb6f0\", \"-cs\", \"131072\", \"--max-batch-size\", \"4\", \"-chunk_size\", \"8192\", \"-ccs\", \"0\", \"-rcs\", \"0.5\", \"-mtp\", \"--host\", \"127.0.0.1\", \"--port\", \"30000\", \"--served-name\", \"deepseek-v4.1-flash\"]",
+  "BIGMOE_EXL_ARGV": "[\"-m\", \"/home/casper/.cache/bigmoe/models/turboderp--DeepSeek-V4.1-Flash-1017-exl3@9183eaaeb6f0\", \"-cs\", \"131072\", \"--max-batch-size\", \"4\", \"-chunk_size\", \"8192\", \"-ccs\", \"0\", \"-rcs\", \"0.5\", \"-mtp\", \"--host\", \"127.0.0.1\", \"--port\", \"30010\", \"--served-name\", \"deepseek-v4.1-flash\"]",
   "BIGMOE_SERVED_NAME": "deepseek-v4.1-flash",
   "BIGMOE_CTX_RESERVE": "10"
  },
  "tasks": {
-  "fix_stats_bug": {
-   "status": "done",
-   "passed": true,
-   "check_output": "----------------------------------------------------------------------\nRan 4 tests in 0.000s\n\nOK\n",
-   "turns": 5,
-   "tool_calls": 4,
-   "invalid_tool_calls": 0,
-   "wall_s": 73.4,
-   "prompt_tokens": 5508,
-   "cached_tokens": 4352,
-   "completion_tokens": 392,
-   "cache_hit": 0.77,
-   "mean_new_tokens": 287.5,
-   "mean_ttft_s": 13.46,
-   "per_turn": [
-    {
-     "ttft_s": 1.13,
-     "turn_s": 3.17,
-     "decode_tok_s": 26.79,
-     "prompt_tokens": 518,
-     "cached_tokens": 512,
-     "completion_tokens": 51,
-     "finish": "tool_calls",
-     "arg_deltas": 3,
-     "tools": [
-      "bash"
-     ]
-    },
-    {
-     "ttft_s": 12.9,
-     "turn_s": 14.31,
-     "decode_tok_s": 41.23,
-     "prompt_tokens": 796,
-     "cached_tokens": 512,
-     "completion_tokens": 46,
-     "finish": "tool_calls",
-     "arg_deltas": 2,
-     "tools": [
-      "bash"
-     ]
-    },
-    {
-     "ttft_s": 10.76,
-     "turn_s": 18.56,
-     "decode_tok_s": 23.86,
-     "prompt_tokens": 1245,
-     "cached_tokens": 768,
-     "completion_tokens": 173,
-     "finish": "tool_calls",
-     "arg_deltas": 5,
-     "tools": [
-      "write_file"
-     ]
-    },
-    {
-     "ttft_s": 19.32,
-     "turn_s": 20.67,
-     "decode_tok_s": 29.6,
-     "prompt_tokens": 1438,
-     "cached_tokens": 1280,
-     "completion_tokens": 41,
-     "finish": "tool_calls",
-     "arg_deltas": 3,
-     "tools": [
-      "bash"
-     ]
-    },
-    {
-     "ttft_s": 10.86,
-     "turn_s": 16.63,
-     "decode_tok_s": 13.87,
-     "prompt_tokens": 1511,
-     "cached_tokens": 1280,
-     "completion_tokens": 81,
-     "finish": "stop",
-     "arg_deltas": 0,
-     "tools": []
-    }
-   ]
-  },
   "refactor_config": {
    "status": "done",
    "passed": true,
@@ -124,21 +44,21 @@
    "turns": 5,
    "tool_calls": 6,
    "invalid_tool_calls": 0,
-   "wall_s": 83.7,
-   "prompt_tokens": 5343,
-   "cached_tokens": 4864,
-   "completion_tokens": 517,
-   "cache_hit": 0.909,
-   "mean_new_tokens": 109.5,
-   "mean_ttft_s": 14.68,
+   "wall_s": 72.5,
+   "prompt_tokens": 5395,
+   "cached_tokens": 4827,
+   "completion_tokens": 522,
+   "cache_hit": 0.891,
+   "mean_new_tokens": 131.8,
+   "mean_ttft_s": 12.08,
    "per_turn": [
     {
-     "ttft_s": 5.64,
-     "turn_s": 7.54,
-     "decode_tok_s": 25.23,
+     "ttft_s": 2.5,
+     "turn_s": 4.75,
+     "decode_tok_s": 26.28,
      "prompt_tokens": 553,
      "cached_tokens": 512,
-     "completion_tokens": 49,
+     "completion_tokens": 60,
      "finish": "tool_calls",
      "arg_deltas": 3,
      "tools": [
@@ -146,24 +66,24 @@
      ]
     },
     {
-     "ttft_s": 12.8,
-     "turn_s": 14.16,
-     "decode_tok_s": 44.52,
-     "prompt_tokens": 819,
-     "cached_tokens": 768,
+     "ttft_s": 10.84,
+     "turn_s": 12.31,
+     "decode_tok_s": 38.95,
+     "prompt_tokens": 832,
+     "cached_tokens": 613,
      "completion_tokens": 48,
      "finish": "tool_calls",
-     "arg_deltas": 2,
+     "arg_deltas": 3,
      "tools": [
       "bash"
      ]
     },
     {
-     "ttft_s": 18.1,
-     "turn_s": 27.9,
-     "decode_tok_s": 28.48,
-     "prompt_tokens": 1076,
-     "cached_tokens": 1024,
+     "ttft_s": 14.75,
+     "turn_s": 24.67,
+     "decode_tok_s": 27.6,
+     "prompt_tokens": 1089,
+     "cached_tokens": 880,
      "completion_tokens": 268,
      "finish": "tool_calls",
      "arg_deltas": 14,
@@ -174,11 +94,11 @@
      ]
     },
     {
-     "ttft_s": 10.95,
-     "turn_s": 12.5,
-     "decode_tok_s": 32.95,
-     "prompt_tokens": 1400,
-     "cached_tokens": 1280,
+     "ttft_s": 18.01,
+     "turn_s": 20.02,
+     "decode_tok_s": 31.19,
+     "prompt_tokens": 1413,
+     "cached_tokens": 1357,
      "completion_tokens": 52,
      "finish": "tool_calls",
      "arg_deltas": 3,
@@ -187,15 +107,301 @@
      ]
     },
     {
-     "ttft_s": 16.87,
-     "turn_s": 21.52,
-     "decode_tok_s": 21.31,
-     "prompt_tokens": 1495,
-     "cached_tokens": 1280,
-     "completion_tokens": 100,
+     "ttft_s": 4.72,
+     "turn_s": 10.68,
+     "decode_tok_s": 15.61,
+     "prompt_tokens": 1508,
+     "cached_tokens": 1465,
+     "completion_tokens": 94,
      "finish": "stop",
      "arg_deltas": 0,
      "tools": []
+    }
+   ],
+   "transcript": [
+    {
+     "role": "system",
+     "content": "You are a coding agent working in a git repository, which is the current directory. Use the tools to inspect files, edit them and run commands (python is available). Work step by step and verify your change by running the tests or the program. When the task is complete, reply with a one-paragraph summary and no tool call."
+    },
+    {
+     "role": "user",
+     "content": "app/server.py and app/worker.py both contain an identical load_settings function. Refactor: move it into a new module app/config.py and make both modules import it from there (no copy may remain in server.py or worker.py). The tests must still pass with `python -m unittest -q`. Do not modify the tests."
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-838aca5a61f1f025",
+       "type": "function",
+       "function": {
+        "name": "bash",
+        "arguments": "{\"command\": \"ls -R . | head -50; echo ---; cat app/server.py; echo ---; cat app/worker.py\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-838aca5a61f1f025",
+     "content": "exit code 0\n.:\napp\ntests\n\n./app:\n__init__.py\nserver.py\nworker.py\n\n./tests:\n__init__.py\ntest_app.py\n---\nimport json\n\n\ndef load_settings(path):\n    with open(path) as f:\n        data = json.load(f)\n    host = data.get(\"host\", \"127.0.0.1\")\n    port = int(data.get(\"port\", 8080))\n    return host, port\n\n\ndef address(path):\n    host, port = load_settings(path)\n    return f\"{host}:{port}\"\n---\nimport json\n\n\ndef load_settings(path):\n    with open(path) as f:\n        data = json.load(f)\n    host = data.get(\"host\", \"127.0.0.1\")\n    port = int(data.get(\"port\", 8080))\n    return host, port\n\n\ndef worker_url(path):\n    host, port = load_settings(path)\n    return f\"http://{host}:{port}/work\"\n"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-bc49e34668da268f",
+       "type": "function",
+       "function": {
+        "name": "bash",
+        "arguments": "{\"command\": \"cat tests/test_app.py; cat app/__init__.py\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-bc49e34668da268f",
+     "content": "exit code 0\nimport json\nimport os\nimport tempfile\nimport unittest\n\nfrom app.server import address\nfrom app.worker import worker_url\n\n\ndef write(data):\n    fd, p = tempfile.mkstemp(suffix=\".json\")\n    with os.fdopen(fd, \"w\") as f:\n        json.dump(data, f)\n    return p\n\n\nclass AppTest(unittest.TestCase):\n    def test_defaults(self):\n        p = write({})\n        self.assertEqual(address(p), \"127.0.0.1:8080\")\n        self.assertEqual(worker_url(p), \"http://127.0.0.1:8080/work\")\n\n    def test_values(self):\n        p = write({\"host\": \"example.org\", \"port\": \"9000\"})\n        self.assertEqual(address(p), \"example.org:9000\")\n        self.assertEqual(worker_url(p), \"http://example.org:9000/work\")\n"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-91867e6282c9c8fe",
+       "type": "function",
+       "function": {
+        "name": "write_file",
+        "arguments": "{\"path\": \"app/config.py\", \"content\": \"import json\\n\\n\\ndef load_settings(path):\\n    with open(path) as f:\\n        data = json.load(f)\\n    host = data.get(\\\"host\\\", \\\"127.0.0.1\\\")\\n    port = int(data.get(\\\"port\\\", 8080))\\n    return host, port\\n\"}"
+       }
+      },
+      {
+       "id": "chatcmpl-tool-a61554ca75158435",
+       "type": "function",
+       "function": {
+        "name": "write_file",
+        "arguments": "{\"path\": \"app/server.py\", \"content\": \"from app.config import load_settings\\n\\n\\ndef address(path):\\n    host, port = load_settings(path)\\n    return f\\\"{host}:{port}\\\"\\n\"}"
+       }
+      },
+      {
+       "id": "chatcmpl-tool-9f14ec2ac3656ea3",
+       "type": "function",
+       "function": {
+        "name": "write_file",
+        "arguments": "{\"path\": \"app/worker.py\", \"content\": \"from app.config import load_settings\\n\\n\\ndef worker_url(path):\\n    host, port = load_settings(path)\\n    return f\\\"http://{host}:{port}/work\\\"\\n\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-91867e6282c9c8fe",
+     "content": "wrote 195 characters to app/config.py"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-a61554ca75158435",
+     "content": "wrote 123 characters to app/server.py"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-9f14ec2ac3656ea3",
+     "content": "wrote 138 characters to app/worker.py"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-8871d49a1ca64e12",
+       "type": "function",
+       "function": {
+        "name": "bash",
+        "arguments": "{\"command\": \"python -m unittest -q; grep -rn \\\"def load_settings\\\" app/\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-8871d49a1ca64e12",
+     "content": "exit code 0\napp/config.py:4:def load_settings(path):\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK\n"
+    },
+    {
+     "role": "assistant",
+     "content": "I created `app/config.py` containing the single `load_settings` implementation, and replaced the duplicated definitions in `app/server.py` and `app/worker.py` with `from app.config import load_settings` imports, leaving their `address` and `worker_url` functions unchanged. A grep confirms only one `def load_settings` remains (in `app/config.py`), and `python -m unittest -q` passes both tests without any test modifications."
+    }
+   ]
+  },
+  "fix_stats_bug": {
+   "status": "done",
+   "passed": true,
+   "check_output": "----------------------------------------------------------------------\nRan 4 tests in 0.000s\n\nOK\n",
+   "turns": 5,
+   "tool_calls": 4,
+   "invalid_tool_calls": 0,
+   "wall_s": 79.3,
+   "prompt_tokens": 5588,
+   "cached_tokens": 4862,
+   "completion_tokens": 408,
+   "cache_hit": 0.864,
+   "mean_new_tokens": 172.8,
+   "mean_ttft_s": 13.66,
+   "per_turn": [
+    {
+     "ttft_s": 7.15,
+     "turn_s": 9.51,
+     "decode_tok_s": 31.16,
+     "prompt_tokens": 518,
+     "cached_tokens": 483,
+     "completion_tokens": 63,
+     "finish": "tool_calls",
+     "arg_deltas": 4,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 14.35,
+     "turn_s": 15.89,
+     "decode_tok_s": 29.12,
+     "prompt_tokens": 813,
+     "cached_tokens": 581,
+     "completion_tokens": 46,
+     "finish": "tool_calls",
+     "arg_deltas": 3,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 24.45,
+     "turn_s": 31.77,
+     "decode_tok_s": 24.46,
+     "prompt_tokens": 1266,
+     "cached_tokens": 859,
+     "completion_tokens": 173,
+     "finish": "tool_calls",
+     "arg_deltas": 5,
+     "tools": [
+      "write_file"
+     ]
+    },
+    {
+     "ttft_s": 6.01,
+     "turn_s": 6.97,
+     "decode_tok_s": 41.67,
+     "prompt_tokens": 1459,
+     "cached_tokens": 1439,
+     "completion_tokens": 41,
+     "finish": "tool_calls",
+     "arg_deltas": 3,
+     "tools": [
+      "bash"
+     ]
+    },
+    {
+     "ttft_s": 9.83,
+     "turn_s": 15.07,
+     "decode_tok_s": 16.05,
+     "prompt_tokens": 1532,
+     "cached_tokens": 1500,
+     "completion_tokens": 85,
+     "finish": "stop",
+     "arg_deltas": 0,
+     "tools": []
+    }
+   ],
+   "transcript": [
+    {
+     "role": "system",
+     "content": "You are a coding agent working in a git repository, which is the current directory. Use the tools to inspect files, edit them and run commands (python is available). Work step by step and verify your change by running the tests or the program. When the task is complete, reply with a one-paragraph summary and no tool call."
+    },
+    {
+     "role": "user",
+     "content": "The test suite in this repository fails (`python -m unittest -q`). Fix the bugs in stats.py so that it passes. Do not modify the tests."
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-a30a22938c0f615f",
+       "type": "function",
+       "function": {
+        "name": "bash",
+        "arguments": "{\"command\": \"ls -la && cat stats.py && ls tests* 2>/dev/null; find . -name \\\"*test*\\\" -type f\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-a30a22938c0f615f",
+     "content": "exit code 0\ntotal 8\ndrwxrwxr-x 3 casper casper 100 Nov 10 17:03 .\ndrwx------ 5 casper casper 100 Nov 10 17:03 ..\ndrwxrwxr-x 7 casper casper 240 Nov 10 17:03 .git\n-rw-rw-r-- 1 casper casper 280 Nov 10 17:03 stats.py\n-rw-rw-r-- 1 casper casper 480 Nov 10 17:03 test_stats.py\ndef mean(xs):\n    return sum(xs) / len(xs)\n\n\ndef median(xs):\n    \"\"\"Median of a non-empty list of numbers.\"\"\"\n    s = sorted(xs)\n    return s[len(s) // 2]\n\n\ndef variance(xs):\n    \"\"\"Population variance.\"\"\"\n    m = mean(xs)\n    return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)\n./test_stats.py\n"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-91a533bde7172ceb",
+       "type": "function",
+       "function": {
+        "name": "bash",
+        "arguments": "{\"command\": \"cat test_stats.py; python -m unittest -q\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-91a533bde7172ceb",
+     "content": "exit code 1\nimport unittest\n\nfrom stats import mean, median, variance\n\n\nclass StatsTest(unittest.TestCase):\n    def test_mean(self):\n        self.assertEqual(mean([1, 2, 3, 4]), 2.5)\n\n    def test_median_odd(self):\n        self.assertEqual(median([3, 1, 2]), 2)\n\n    def test_median_even(self):\n        self.assertEqual(median([4, 1, 3, 2]), 2.5)\n\n    def test_variance(self):\n        self.assertEqual(variance([2, 4, 4, 4, 5, 5, 7, 9]), 4.0)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n======================================================================\nFAIL: test_median_even (test_stats.StatsTest.test_median_even)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/tmp/bigmoe-agent-layc6b6l/fix_stats_bug/test_stats.py\", line 14, in test_median_even\n    self.assertEqual(median([4, 1, 3, 2]), 2.5)\nAssertionError: 3 != 2.5\n\n======================================================================\nFAIL: test_variance (test_stats.StatsTest.test_variance)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/tmp/bigmoe-agent-layc6b6l/fix_stats_bug/test_stats.py\", line 17, in test_variance\n    self.assertEqual(variance([2, 4, 4, 4, 5, 5, 7, 9]), 4.0)\nAssertionError: 4.571428571428571 != 4.0\n\n----------------------------------------------------------------------\nRan 4 tests in 0.000s\n\nFAILED (failures=2)\n"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-969b7eae4685e767",
+       "type": "function",
+       "function": {
+        "name": "write_file",
+        "arguments": "{\"path\": \"stats.py\", \"content\": \"def mean(xs):\\n    return sum(xs) / len(xs)\\n\\n\\ndef median(xs):\\n    \\\"\\\"\\\"Median of a non-empty list of numbers.\\\"\\\"\\\"\\n    s = sorted(xs)\\n    n = len(s)\\n    mid = n // 2\\n    if n % 2:\\n        return s[mid]\\n    return (s[mid - 1] + s[mid]) / 2\\n\\n\\ndef variance(xs):\\n    \\\"\\\"\\\"Population variance.\\\"\\\"\\\"\\n    m = mean(xs)\\n    return sum((x - m) ** 2 for x in xs) / len(xs)\\n\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-969b7eae4685e767",
+     "content": "wrote 353 characters to stats.py"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-a39a3ccc8cf20fc5",
+       "type": "function",
+       "function": {
+        "name": "bash",
+        "arguments": "{\"command\": \"python -m unittest -q\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "chatcmpl-tool-a39a3ccc8cf20fc5",
+     "content": "exit code 0\n----------------------------------------------------------------------\nRan 4 tests in 0.000s\n\nOK\n"
+    },
+    {
+     "role": "assistant",
+     "content": "Fixed two bugs in `stats.py`: `median` returned the upper middle element for even-length inputs instead of averaging the two middle values, and `variance` divided by `len(xs) - 1` (sample variance) instead of `len(xs)` as its docstring specifies for population variance. The test suite now passes (`Ran 4 tests ... OK`), and the tests were left untouched."
     }
    ]
   }
@@ -203,11 +409,533 @@
  "summary": {
   "passed": 2,
   "tasks": 2,
-  "wall_s": 83.7,
+  "wall_s": 79.3,
   "turns": 10,
   "tool_calls": 10,
   "invalid_tool_calls": 0,
-  "cache_hit": 0.838
+  "cache_hit": 0.877
  },
- "finished": "2026-11-09T18:39:26+0100"
+ "stats_end": {
+  "requests": 28,
+  "completion_tokens": 3200,
+  "scheduler": {
+   "steps": 765,
+   "reserved": 28,
+   "no_pages": 0,
+   "requeue_waits": 0,
+   "prefill_tokens": 46836,
+   "verify_steps": 719,
+   "drafts_dropped": 0,
+   "execute_s": 342.99461200262886,
+   "between_s": 0.8705682633444667,
+   "between_n": 764,
+   "corrections": {}
+  },
+  "draft": {
+   "accepted": 2493,
+   "rejected": 546,
+   "rounds": 719,
+   "windows": {
+    "4": 47,
+    "3": 62,
+    "2": 59,
+    "5": 499,
+    "1": 52
+   },
+   "accepted_hist": {
+    "3": 67,
+    "2": 69,
+    "0": 76,
+    "5": 372,
+    "1": 82,
+    "4": 53
+   }
+  },
+  "recurrent_cache": {
+   "checkpoints": 10,
+   "bytes": 359281120,
+   "max_bytes": 393158464,
+   "bytes_per_checkpoint": 35928112,
+   "stash_evictions": 18,
+   "stash_evictions_stranded": 0,
+   "stash_evictions_live_kv": 18,
+   "stash_pruned": 0
+  },
+  "prefix_cache": {
+   "page_size": 256,
+   "max_tokens": 131072,
+   "used_tokens": 0,
+   "cached_tokens": 48640,
+   "free_tokens": 82432,
+   "tier_cached_tokens": 0,
+   "tier_max_tokens": 0,
+   "disk_cached_tokens": 0,
+   "disk_pages": 0,
+   "disk_states": 0,
+   "disk_used_bytes": 0,
+   "disk_max_bytes": 0,
+   "alloc_pages": 755,
+   "alloc_prompt_pages": 251,
+   "alloc_cached_pages": 72,
+   "alloc_tier_pages": 0,
+   "alloc_disk_pages": 0,
+   "hit_rate": 0.2868525896414343,
+   "tier_hit_rate": 0.0,
+   "disk_hit_rate": 0.0,
+   "active_jobs": 0,
+   "pending_jobs": 0
+  },
+  "gpu": {
+   "allocated_mib": 21324,
+   "reserved_mib": 21386,
+   "peak_allocated_mib": 22716,
+   "free_mib": 2291,
+   "total_mib": 24177
+  },
+  "vision": {
+   "requests": 0,
+   "images": 0,
+   "encoded": 0,
+   "tower_loads": 0,
+   "load_s": 0.0,
+   "encode_s": 0.0,
+   "lent_mib": 0,
+   "oom_retries": 0,
+   "image_tokens": 0,
+   "max_image_tokens": 1024,
+   "resident": false,
+   "weight_mib": 275,
+   "cache": {
+    "ram_hits": 0,
+    "disk_hits": 0,
+    "misses": 0,
+    "disk_writes": 0,
+    "disk_errors": 0,
+    "ram_entries": 0,
+    "ram_mib": 0.0,
+    "ram_budget_mib": 256,
+    "keys": 0,
+    "disk_dir": "/home/casper/.cache/bigmoe/mm-cache/dsv41"
+   }
+  },
+  "tiers": [
+   {
+    "vram": {
+     "device": "cuda:0",
+     "layers": 40,
+     "slots": 864,
+     "slot_bytes": 11059200,
+     "arena_gb": 9.56,
+     "uniform_geometry": false,
+     "elastic": {
+      "enter": 16,
+      "exit": 16,
+      "realloc_fail": 0,
+      "wb": 12879,
+      "flex_chunks": 26,
+      "in_prefill": false
+     },
+     "lent": {
+      "lends": 0,
+      "chunks": 0,
+      "wb": 0,
+      "realloc_fail": 0,
+      "lost_chunks": 0
+     },
+     "hits": 340,
+     "misses": 174571,
+     "admitted": 0,
+     "no_victim": 0,
+     "evictions": 0,
+     "hit_rate": 0.0019,
+     "stage": {
+      "forwards": 19,
+      "layers": 741,
+      "experts": 96629,
+      "per_buffer": 384
+     },
+     "warm_prefill": {
+      "forwards": 19,
+      "exact_calls": 546,
+      "fetched": 69747,
+      "fetched_bytes": 662185082880,
+      "read_ms": 87366,
+      "ahead_guessed": 12480,
+      "ahead_read": 12160,
+      "ahead_hit": 9451,
+      "ahead_wasted": 2709,
+      "ahead_missed": 2709,
+      "ahead_wait_ms": 4318,
+      "ahead_ms": 20153,
+      "fetched_gb": 662.19,
+      "ahead_hit_frac": 0.777,
+      "ahead_cover_frac": 0.777,
+      "dropped_pick_frac": 0.0703,
+      "dropped_weight_frac": 0.0565
+     },
+     "last_page": {
+      "tail_ckpt": 12,
+      "tail_ckpt_skipped": 5,
+      "tail_ckpt_page": 0,
+      "skipped_why": {
+       "window": 5
+      }
+     },
+     "turn_resume": {
+      "stashed": 56,
+      "stash_skipped": 0,
+      "kept": 0,
+      "covered": 5,
+      "evicted": 47,
+      "resumed": 20,
+      "resumed_tokens": 2868,
+      "resumed_exact": 19,
+      "resumed_moved": 1,
+      "not_better": 0,
+      "missed": 0,
+      "errors": 0,
+      "stash_ms": 507.5,
+      "resume_ms": 74.4,
+      "budget_bytes": 143712448,
+      "stashed_prompt": 28,
+      "stashed_turn": 28,
+      "resumed_turn": 20,
+      "limit": 4,
+      "entries": [
+       {
+        "kind": "turn",
+        "pos": 1602,
+        "floor": 1348
+       },
+       {
+        "kind": "turn",
+        "pos": 1500,
+        "floor": 1244
+       },
+       {
+        "kind": "prompt",
+        "pos": 1531,
+        "floor": 1275
+       },
+       {
+        "kind": "turn",
+        "pos": 1617,
+        "floor": 1364
+       }
+      ]
+     },
+     "picks_hist": {
+      "32": 40
+     }
+    },
+    "nv2": {
+     "ram_slots": 5223,
+     "ram_gib": 53.795,
+     "pf_ring": 1,
+     "exclusive": true,
+     "slru_kept_pct": 80,
+     "cpu_tier": true,
+     "pol": [
+      0.17,
+      0.023,
+      0.36,
+      0.145,
+      0.42,
+      0.12,
+      0.4,
+      0.25,
+      1.36,
+      0.75,
+      1.0,
+      1.0,
+      32.0,
+      1.0
+     ],
+     "host": {
+      "reqs": 29828,
+      "dec_reqs": 29360,
+      "small_reqs": 468,
+      "picks": 597124,
+      "vram": 219799,
+      "ram": 313092,
+      "nvme": 64233,
+      "inflight_hit": 0,
+      "lane_zc": 185057,
+      "lane_cpu": 145424,
+      "lane_nvg": 20496,
+      "lane_nvc": 50613,
+      "reads": 71109,
+      "read_bytes": 691631308800,
+      "wb_landed": 31187,
+      "wb_dup": 0,
+      "adm_freed": 44088,
+      "adm_pinned": 15,
+      "evictions": 71180,
+      "cpu_jobs": 29310,
+      "cpu_experts": 229244,
+      "cpu_tokens": 150826,
+      "stage_ram": 99237,
+      "stage_nv": 0,
+      "stage_reads": 0,
+      "read_err": 0,
+      "alloc_fail": 0,
+      "land_pushed": 31187,
+      "prefetch": 0,
+      "plan_ns": 637797041,
+      "ctl_busy_ns": 701024629,
+      "cpu_busy_ns": 130222123509,
+      "cpu_wait_land_ns": 0,
+      "read_ms_x1000": 407076294,
+      "stage_wait_ns": 0,
+      "stage_job_ns": 182063192,
+      "wb_bulk": 12879,
+      "dec_tok": 150920,
+      "notice_ns": 0,
+      "notice_max_ns": 0,
+      "serve_max_ns": 98055,
+      "reply_ns": 684882720,
+      "wb_issued": 31187,
+      "wb_drop": 0,
+      "vring_hits": 5,
+      "lane_b70": 0,
+      "b70_jobs": 0,
+      "b70_rows": 0,
+      "b70_wait_ns": 0,
+      "b70_rtt_ns": 0,
+      "b70_err": 0,
+      "b70_rtt_max_ns": 0,
+      "pf_keys": 0,
+      "pf_skip": 0,
+      "pf_used": 0,
+      "pf_wasted": 0,
+      "lane_skip": 0,
+      "lossy_calls": 0,
+      "lossy_tok": 0,
+      "lossy_tok_skip": 0,
+      "lossy_cold_x1e6": 0,
+      "lossy_skip_x1e6": 0,
+      "lossy_coldu": 0,
+      "lossy_want": 0,
+      "lossy_bg_reads": 0,
+      "promoted": 0,
+      "stg_issued": 0,
+      "stg_ready": 0,
+      "stg_hit": 0,
+      "stg_late": 0,
+      "stg_nofree": 0,
+      "stg_dup": 0,
+      "stg_waste": 0,
+      "wb_early": 31183,
+      "partial_lands": 71109,
+      "partial_binds": 36984,
+      "wb_lat_us": 29713294,
+      "wb_lat_max_us": 22704,
+      "ring_low": 6,
+      "ring_low_vfree": 0,
+      "ring_borrowed": 0,
+      "x16_jobs": 0,
+      "x16_experts": 0,
+      "x16_gu_ns": 0,
+      "x16_wait_ns": 0,
+      "x16_down_ns": 0,
+      "resident": 5130,
+      "inflight": 0,
+      "free": 93,
+      "landing": 32
+     },
+     "dev": {
+      "hit": 226269,
+      "miss": 68371,
+      "admit": 44105,
+      "novict": 0,
+      "evict": 31187,
+      "wb": 31187,
+      "wb_noslot": 1,
+      "fix": 161448,
+      "bad_rows": 0,
+      "reply_wait_ns": 616188928,
+      "reply_waits": 29828,
+      "nv_wait_ns": 19042489344,
+      "nv_waits": 6383,
+      "timeouts": 0,
+      "noslot_ring_x1e6": 1000000,
+      "noslot_jobs": 2
+     },
+     "py": {
+      "elastic_wb": 12879,
+      "elastic_wb_ms": 4660.14045861084,
+      "stage_wait_ms": 7.662708288989961,
+      "staged_calls": 741,
+      "dec_calls": 29360,
+      "small_calls": 468
+     },
+     "decode_per_step": {
+      "steps_est": 734,
+      "tokens_est": 3773,
+      "picks": null,
+      "vram_hits": 299.454,
+      "ram_hits": 426.556,
+      "nvme": 87.511,
+      "cpu_experts": 312.322,
+      "zc_admits": 252.121,
+      "nvme_gpu": 27.924,
+      "nvme_cpu": 68.955,
+      "reply_wait_ms": 0.839,
+      "nvme_wait_ms": 25.943,
+      "cpu_busy_ms": 177.414,
+      "b70_experts": 0.0,
+      "b70_wait_ms": 0.0
+     },
+     "b70": {
+      "on": false,
+      "keys": 0,
+      "jobs": 0,
+      "rows": 0,
+      "rtt_us_mean": 0.0,
+      "rtt_us_max": 0.0,
+      "wait_us_mean": 0.0,
+      "err": 0
+     },
+     "memcg": {
+      "current": 54.65,
+      "peak": 54.946,
+      "max": 60.5,
+      "anon": 51.926,
+      "file": 2.589,
+      "host_avail": 4.147
+     },
+     "decode_per_token": {
+      "vram_hits": 58.256,
+      "ram_hits": 82.982,
+      "nvme": 17.024,
+      "cpu_experts": 60.759,
+      "zc_admits": 49.048,
+      "nvme_gpu": 5.432,
+      "nvme_cpu": 13.415,
+      "reply_wait_ms": 0.163,
+      "nvme_wait_ms": 5.047,
+      "cpu_busy_ms": 34.514,
+      "b70_experts": 0.0,
+      "b70_wait_ms": 0.0
+     },
+     "cpu_selftest": {
+      "EXACT": 0.001069,
+      "AFFINE": 0.001069,
+      "I16": 0.001069
+     },
+     "latency": {
+      "n": 4096,
+      "us_pub_to_notice_rel": {
+       "p50": 159.0,
+       "p90": 248.2,
+       "p99": 266.1,
+       "mean": 142.8
+      },
+      "us_host_serve": {
+       "p50": 24.8,
+       "p90": 35.7,
+       "p99": 48.0,
+       "mean": 24.2
+      },
+      "us_step_wait": {
+       "p50": 22.5,
+       "p90": 32.8,
+       "p99": 46.1,
+       "mean": 21.7
+      },
+      "us_pub_to_seen": {
+       "p50": 30.7,
+       "p90": 41.0,
+       "p99": 53.2,
+       "mean": 29.6
+      },
+      "us_step_after_reply": {
+       "p50": 14.3,
+       "p90": 26.6,
+       "p99": 38.9,
+       "mean": 16.2
+      },
+      "us_copy": {
+       "p50": 887.3,
+       "p90": 4950.0,
+       "p99": 28452.1,
+       "mean": 2495.0
+      },
+      "copy_gbps_p50": 22.71,
+      "jobs_per_call": 1.42,
+      "us_gap_copy_to_next_pub": {
+       "p50": 3307.5,
+       "p90": 8219.0,
+       "p99": 25654.6,
+       "mean": 4505.1
+      },
+      "us_layer_total": {
+       "p50": 4922.4,
+       "p90": 11597.4,
+       "p99": 54227.5,
+       "mean": 7086.5
+      }
+     },
+     "timeline": {
+      "n": 3935,
+      "us_layer_mean": 5682.5,
+      "parts_us_mean": {
+       "A_pub_to_reply": 29.4,
+       "B_step": 62.4,
+       "C_copy": 1712.2,
+       "D_moe": 2099.6,
+       "E_cpu_wait": 1225.8,
+       "F_rest": 553.1
+      },
+      "C_fix_us_mean": 718.9,
+      "jobs_per_call": 1.41,
+      "cpu_job_us_mean": 4520.6,
+      "cpu_end_minus_combine_start_us_mean": 780.9,
+      "cpu_start_minus_pub_us_mean": 168.4,
+      "frac_layers_demand_read": 0.83,
+      "frac_layers_inflight_hit": 0.0,
+      "demand_land_minus_copy_start_us_mean": 4666.2,
+      "layer_us_mean_with_demand": 6286.4,
+      "layer_us_mean_without": 2734.6,
+      "parts_with_demand": {
+       "A_pub_to_reply": 33.4,
+       "B_step": 64.7,
+       "C_copy": 1980.2,
+       "D_moe": 2182.1,
+       "E_cpu_wait": 1445.6,
+       "F_rest": 580.4
+      },
+      "parts_without": {
+       "A_pub_to_reply": 9.7,
+       "B_step": 51.4,
+       "C_copy": 404.1,
+       "D_moe": 1697.3,
+       "E_cpu_wait": 152.5,
+       "F_rest": 419.7
+      },
+      "frac_layers_any_nvme": 0.83,
+      "tail_cpu_end_minus_last_land_us_mean": 401.2,
+      "combine_go_minus_last_land_us_mean": 941.5,
+      "last_land_minus_copy_start_us_mean": 4666.3,
+      "layer_us_mean_any_nvme": 6286.4,
+      "cpu_ram_per_call": 5.07,
+      "cpu_nvc_per_call": 1.77,
+      "frac_layers_ram_only": 0.169,
+      "cpu_experts_ram_only_mean": 4.64,
+      "cpu_us_per_expert_ram_only": 483.1,
+      "layer_us_mean_ram_only": 2750.2,
+      "parts_ram_only": {
+       "A_pub_to_reply": 9.7,
+       "B_step": 51.6,
+       "C_copy": 406.5,
+       "D_moe": 1708.1,
+       "E_cpu_wait": 153.6,
+       "F_rest": 420.7
+      }
+     }
+    }
+   }
+  ]
+ },
+ "finished": "2026-11-10T17:04:47+0100"
 }

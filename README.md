@@ -1,96 +1,120 @@
 # Big MoE, Small Box
 
-Big MoE, Small Box serves Mixture-of-Experts models that are far larger than the GPU from one 24 GB card, 64 GB of RAM and an NVMe drive: [GLM-5.3-Flash](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3) (321B parameters, EXL3 3.05 bpw, 125 GB) and [DeepSeek-V4.1-Flash](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3) (EXL3 2.25 bpw, 361 GB including 203 GB of Engram tables). Both are served by vLLM 0.33.0 (its OpenAI/Anthropic server, tool and reasoning parsers, and its scheduler), with [exllamav3](https://github.com/turboderp-org/exllamav3) 1.6.6 as the model executor it drives (one release for both, `models/runtime.py`). A token only uses a few routed experts per MoE layer (8 of 288 for GLM, 6 of 384 for DeepSeek), so the routed experts, which are most of the weights, live in three tiers and every layer is served from wherever its experts are:
+Serve Mixture-of-Experts models that are far larger than the GPU from one 24 GB card, 64 GB of RAM and an NVMe drive:
 
-- **Expert store.** The routed experts are packed into one file of fixed-size records per layer and read with `O_DIRECT`; the checkpoint keeps everything else and its expert bytes are punched out after the store is verified. The loader never reads the experts from the checkpoint: every expert tensor starts as a view of one VRAM bounce slot.
-- **Three tiers, exllamav3's own math.** A CLOCK cache of uniform slots fills all free VRAM (layers with different expert sizes share it, each in its own compact layout); a pinned, GPU-mapped RAM tier holds the experts that are not in VRAM; the rest stays on NVMe. exllamav3's kernels read every expert through its live pointer tables, which the engine points at the expert's current home, so the bytes and the arithmetic are exllamav3's own.
-- **A scheduler per layer.** The GPU publishes each layer's picks to mapped memory without a host sync; a host planner sends every pick to the cheapest lane: a VRAM hit, a copy in from RAM, a zero-copy read, an NVMe read (demand reads ahead of prefetches, prefetches guessed one layer ahead from the next router), or the CPU lane. Admitted experts evict VRAM victims back into RAM. DeepSeek's RAM tier (mode `nvme`) evicts with a segmented LRU: an expert that was read from NVMe and not used again goes before the ones decode keeps using, which reads 7 % less from NVMe and decodes 4 % faster on a replayed agent session ([docs/vllm.md](docs/vllm.md#ram-tier-eviction-segmented-lru-deepseek-mode-nvme-2026-11-10)).
-- **CPU lane.** RAM-resident and freshly landed experts can be computed on the CPU (trellis decoding with AVX-512 VBMI, or AVX2 for GLM's 3-bit experts; int16 dot products; results combined on the GPU), which takes PCIe and NVMe pressure off the GPU. This is mode `nvme`, the default, and it is near-exact: on the same forced tokens it picks the same top-1 token as exact decode 99.3 % of the time for DeepSeek (mean KL 0.0013, without speculation) and 97.3 % for GLM (mean KL 0.0096). Mode `nvme-exact` keeps every expert on the GPU path, so decode is exllamav3's own computation on the same bytes.
-- **Bit-exact CPU lane (`x16_layers`, off by default).** The CPU lane's experts differ from the GPU kernel's in the last bits (the GPU accumulates in fp16 with its own rounding); for GLM that alone costs its top-1 agreement. `x16_layers=N` computes the CPU's experts in the first `N` MoE layers bit-identically to the GPU (its tensor-core rounding emulated on the CPU), self-tested at every start: GLM with 21 layers agrees with exact decode on 99.2 % of top-1 tokens (mean KL 0.0011; default 97.3 %) at 13 % lower decode speed, DeepSeek with all 40 layers decodes exactly (with DSpark, whose verify forwards stay on the GPU: 99.7 %, at 40 % lower decode speed). Details: [docs/x16.md](docs/x16.md).
-- **Prefill** stages each layer's experts into VRAM buffers one layer ahead of the compute, in memory borrowed from the VRAM cache while the prefill runs (8192-token chunks). Staging every expert reads every NVMe-only one, ~15 s per chunk for DeepSeek whatever its length, which is what each agent step would pay for its tool result. DeepSeek (mode `nvme`, `engine/warm_prefill.py`) reads only what a chunk routes to: it runs on the experts already in VRAM or RAM, plus, per layer once its routing is known, its NVMe-only experts, read in parallel. A chunk of up to 1,024 rows (an agent step) reads every one its routing touches (75-165 of ~250 per layer) and drops none, so it computes what staging every expert does. A longer chunk reads the 64 with the most routing weight, guessing the next layer's with that layer's router while the current one computes, and drops the picks of the rest, rescaling each token's weights. DeepSeek also runs no separate forward for a prompt's last partial page: its recurrent state rewinds by cursor, so the checkpoint at the last page boundary, where a follow-up resumes, is stashed from the end of the prompt's last forward (`engine/last_page.py`). GLM keeps exllamav3's split there for tails of up to 63 tokens; a longer split would cost a whole extra staged forward. On a cached 8k prefix, 100-1,000 new tokens take 5.0-11.9 s instead of 15.1-20.3 s (71.5 s for one step of each size instead of 145.8 s), at top-1 99.76 % and mean KL 0.0005 against exact prefill over 3,344 forced positions. The only differences come from the tail sharing its forward with the tokens before it: exact staging with the same chunking gives bit-identical logits ([docs/vllm.md](docs/vllm.md#tail-checkpoints-deepseek-mode-nvme-2026-11-10)). Measured while every chunk was capped at 64 (short ones were not exact yet), teacher-forced against exact prefill (prompt and answer through it, 128 answer positions each): top-1 99.2 %, mean KL 0.023; on a DeepSeek Harness agent turn (decode exact after the prefill, 330 forced answer positions): top-1 99.7 %, mean KL 0.0021. GLM prefills exactly: its answers react more to approximate prefill (teacher-forced top-1 94.5 %, mean KL 0.042). Below ~86 new tokens prefill is exact anyway. Mode `nvme-exact` keeps exllamav3's prefill.
-- **Serving agents.** The servers take `tools` and return OpenAI `tool_calls`, streamed as argument deltas (vLLM's parsers: DeepSeek's DSML calls, GLM's `<tool_call>` blocks), refuse a prompt that does not fit the cache with an immediate 400 `context_length_exceeded` (agent clients compact and retry; `bigmoe/serving.py`), report errors as JSON or in-band SSE events instead of dropping the stream, send an SSE comment on a stream that is silent for 15 s, free what a request that ran out of GPU memory held (and run it again with half-size prefill chunks if no token was streamed yet), and report `usage.prompt_tokens_details.cached_tokens` (prefix reuse, counted by vLLM's scheduler from what exllamav3 reused), with one log line per request. Requests may carry an OpenAI-style `priority` (lower first; vLLM's priority scheduling orders the queue). vLLM's grammars are enforced in exllamav3's sampler, so `response_format` (JSON schemas) works and tool calls follow vLLM's strict tool-call grammar. `bigmoe bench-agent` (and `bigmoe verify`) runs coding tasks through the OpenAI API with tool calling and checks the results (`bench/agent.py`). An agent's next request is its last one plus the answer plus a tool result, and DeepSeek (mode `nvme`) resumes it where the last one stopped: the recurrent state is stashed at the end of every request and of its prompt (`engine/turn_resume.py`, `-o turn_ckpts`, 4 states of 36 MB in host RAM), so a turn prefills only what is new instead of everything after the last 256-token page boundary, and the chat template renders a tool-call turn token for token as the model wrote it. A recorded 51-turn agent session replayed with the same tokens takes 598 s instead of 680 s: 22 % less time to the first token, 4 % faster decode, the same agreement with exact prefill and decode (top-1 99.1 % and 99.0 %; [docs/vllm.md](docs/vllm.md#turn-checkpoints-deepseek-mode-nvme-2026-11-10)). Prompt prefixes are reused from the GPU cache; with `-o disk_cache=<dir>` the pages it evicts (one long conversation evicts the others) go through exllamav3's pinned-RAM tier to disk, written only on eviction or when the server is idle, so a prefix also survives other conversations and restarts. A prefix comes back from disk through that RAM tier, all of it at once, so `cpu_cache_gb` defaults to the whole context (`models/prefix_cache.py`): 0.25 GiB for DeepSeek's 64k at 3.2 KB per token, 2.5 GiB for GLM's 128k at 17.6 KB; a 0.25 GiB tier gave GLM back nothing of a 17k-token prompt. Measured: a 17k-token prompt prefilled in 27.0 s (DeepSeek) / 27.9 s (GLM) took 5.7 s / 5.5 s after a restart.
-- **Image input, on by default, free while unused.** Both checkpoints ship a vision tower (DeepSeek-V4.1: ~0.4 GiB of 6-bit weights, GLM-5.3: ~0.5 GiB) and both servers take OpenAI / Anthropic image blocks (`bigmoe/multimodal.py`, [docs/multimodal.md](docs/multimodal.md)). Nothing of the tower is resident: a request with a new image loads it from the checkpoint on NVMe (0.05-0.26 s), encodes its images (a new image costs 0.26-0.34 s in all) and unloads it before the job is queued, in VRAM that torch has free between forwards or that the expert cache lends for the encode (written back to the RAM tier, reallocated right after). Text-only serving keeps the same VRAM expert cache and RAM tier: measured against `multimodal=False` on the same box, prefill and decode are unchanged and `nvme-exact` answers are byte-identical to the baselines. Images are keyed by content: a resent image skips the tower (RAM, then an SSD cache that survives restarts) and keeps its token ids, so follow-up turns reuse the prefix through the image (DeepSeek, 11.5k-token conversation with a screenshot: 3-4 s per turn instead of 24 s). For DeepSeek-V4.1 the server turns off exllamav3's exact image chunking, which is meant for V4-Flash-Vision-Exp and cost V4.1 two extra prefill forwards per image and every checkpoint after it.
-- **Speculative decoding.** DeepSeek-V4.1-Flash uses its own DSpark block drafter (up to 5 tokens per step, cut by its confidence head at 0.5) by default; GLM-5.3-Flash can draft from the context (`speculation="ngram"`).
-- **One command.** `AutoBox` pins and builds the Python runtime (the same exllamav3 release for both models) and the CUDA extensions, downloads and verifies the weights, packs and verifies the store, and starts the server in a memory-capped systemd scope with its threads pinned (main, scheduler, CPU lane and NVMe readers on separate cores).
+| model | checkpoint | size |
+|---|---|---|
+| GLM-5.3-Flash | [turboderp/GLM-5.3-Flash-exl3](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3), EXL3 3.05 bpw | 125 GB |
+| DeepSeek-V4.1-Flash | [turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3), EXL3 2.25 bpw | 361 GB, 203 GB of it Engram tables |
+
+A token uses only a few routed experts per MoE layer (8 of 288 for GLM, 6 of 384 for DeepSeek), so the routed experts,
+most of the weights, live in three tiers: a cache in all free VRAM, a pinned RAM tier, and a packed store on NVMe read
+with `O_DIRECT`. A per-layer planner serves each picked expert from wherever it is, and can compute RAM-resident
+experts on the CPU instead of moving them over PCIe. [vLLM](https://github.com/vllm-project/vllm) 0.33.0 is the
+server and scheduler (OpenAI and Anthropic APIs, tool calling, reasoning, structured outputs, images);
+[exllamav3](https://github.com/turboderp-org/exllamav3) 1.6.6 runs the forwards. How it works:
+[docs/architecture.md](docs/architecture.md).
+
+## Quick start
+
+```sh
+pip install -e .
+bigmoe doctor                          # what this box has
+bigmoe start deepseek-v4.1-flash       # or glm-5.3-flash; OpenAI-compatible server on http://127.0.0.1:30000/v1
+bigmoe chat "Why do MoE models fit on small boxes?"
+bigmoe stop
+```
+
+The first start builds a pinned Python runtime and the CUDA extensions, downloads and verifies the checkpoint, packs
+and verifies the expert store, and punches the expert bytes out of the checkpoint (the store has them). Later starts
+take about a minute. The server runs in a memory-capped systemd user scope with its threads pinned.
+
+From Python:
 
 ```python
 from bigmoe import AutoBox
 
-box = AutoBox.from_pretrained("deepseek-v4.1-flash")   # or "glm-5.3-flash"; first run downloads, packs and builds
-box.start()                                            # OpenAI-compatible server on http://127.0.0.1:30000/v1
-print(box.chat("Why do MoE models fit on small boxes?"))
+box = AutoBox.from_pretrained("deepseek-v4.1-flash")
+box.start()
 print(box.chat("What does this chart show?", images=["chart.png"]))   # paths, bytes, PIL images or URLs
 box.stop()
 ```
 
-The offloading and scheduling engine started as 0xSero's [glm-flash-lite](https://github.com/sybil-solutions/glm-flash-lite) (MIT, `LICENSE.glm-flash-lite`); this package is Apache-2.0 (`LICENSE`).
+Other commands: `bigmoe prepare` (build and download only), `serve` (foreground), `status`, `logs`, `bench`,
+`bench-agent`, `verify` (speed, exact answers and the agentic benchmark against the stored baselines), `models` (every
+backend option and its default).
 
-## Serving engine
+## Options
 
-vLLM 0.33.0 is the serving engine: the OpenAI/Anthropic API server, chat renderer, tool and reasoning parsers, detokenizer, stop handling and multimodal input pipeline, and its scheduler, which decides admission, preemption, chunked-prefill sizes under its token budget, and which speculative tokens are verified (and accounts the accepted ones). An out-of-tree plugin (`bigmoe.vllm`) gives that scheduler a KV-cache manager over exllamav3's page table (capacity and prefix-cache hits from the GPU, RAM and disk tiers) and a worker that executes each scheduled step on exllamav3: the prefill chunks, one batched sample / verify forward, and the drafter's next drafts. The EXL3 kernels, nv2 expert tiers, prefix caches, DSpark / n-gram drafters and lazy vision towers are the measured ones; exllamav3's own scheduling loop is not used. vLLM 0.33 cannot execute either model's attention on sm86 and has no EXL3 quantization, so the forwards stay exllamav3's. Architecture, compatibility notes and verification results: [docs/vllm.md](docs/vllm.md).
+Pass them as keyword arguments to `AutoBox` or as `-o key=value` on the command line.
 
-## Build
+| option | default | |
+|---|---|---|
+| `mode` | `nvme` | `nvme`: the CPU lane computes some experts, near-exact. `nvme-exact`: every expert on the GPU, exllamav3's own arithmetic |
+| `context` | 131072 | context length in tokens (an `AutoBox` argument, `--context`) |
+| `memory_gb` | 56 on a 64 GB box | memory cap of the server; the RAM tier is sized from it (`--memory-gb`) |
+| `speculation` | DeepSeek `dspark`, GLM `none` | DeepSeek's own block drafter, or `ngram` drafts from the context for GLM |
+| `x16_layers` | 0 | bit-exact CPU lane in the first N MoE layers ([docs/x16.md](docs/x16.md)) |
+| `disk_cache` | off | directory for a prefix cache that survives restarts |
+| `cpu_cache_gb` | 0, or the whole context with `disk_cache` | pinned-RAM prefix-cache tier |
+| `multimodal`, `image_tokens` | on, model's budget | image input |
+| `cache_quant`, `chunk_size` | FP16, 8192 | K/V cache bits, prefill chunk |
 
-- RTX 3090 (used)
-- 64GB DDR5-5600 (used)
-- WD SN850X (used)
-- Ryzen 5 7600X
-- ASRock B650 Pro RS
-- Peerless Assassin 120 SE
-- Lian Li V100
-- ASUS TUF GAMING 850G EVO 2026
+## Results
 
-## GLM-5.3-Flash
+RTX 3090, Ryzen 5 7600X, 64 GB DDR5-5600, WD SN850X. `bigmoe verify`: greedy, 128k context, FP16 K/V cache; the
+numbers are the stored baselines in `src/bigmoe/models/*/baselines`.
 
-`bigmoe bench` prompts (Python source files and a question about them), greedy, 128k context, FP16 KV cache, exllamav3 1.6.6 (`bigmoe verify`, 2026-11-06). KL and top-1: mean per-token KL divergence from exact decode (`nvme-exact`) and the share of positions with the same most likely token, on the same forced tokens, six chat prompts, 1,152 positions.
+**GLM-5.3-Flash** (2026-11-06)
 
-| mode | prompt tokens | prefill | decode | KL | top-1 |
-|---|---|---|---|---|---|
-| `nvme` | 1,024 | 114 tok/s | 11.1 tok/s | 0.0096 | 97.3 % |
-| `nvme` | 8,192 | 789 tok/s | 11.3 tok/s | 0.0096 | 97.3 % |
-| `nvme` | 32,768 | 846 tok/s | 11.5 tok/s | 0.0096 | 97.3 % |
-| `nvme` | 120,000 | 817 tok/s | 11.3 tok/s | 0.0096 | 97.3 % |
-| `nvme-exact` | 1,024 | 59 tok/s | 7.9 tok/s | 0 (reference) | 100 % (reference) |
-| `nvme-exact` | 8,192 | 418 tok/s | 8.0 tok/s | 0 (reference) | 100 % (reference) |
+| mode | prompt tokens | prefill | decode |
+|---|---|---|---|
+| `nvme` | 1,024 | 114 tok/s | 11.1 tok/s |
+| `nvme` | 8,192 | 789 tok/s | 11.3 tok/s |
+| `nvme` | 32,768 | 846 tok/s | 11.5 tok/s |
+| `nvme` | 120,000 | 817 tok/s | 11.3 tok/s |
+| `nvme-exact` | 1,024 | 59 tok/s | 7.9 tok/s |
+| `nvme-exact` | 8,192 | 418 tok/s | 8.0 tok/s |
 
-exllamav3's fused hyper-connection sites (`EXL3_HC_FOLD=1`) replace the custom decode kernels the 1.5.1 runtime needed. GLM prefills exactly. Warm prefill was measured for it (an option until 2026-11-10): after 4k / 8k / 16k-token prompts, forced decode agreed with exact decode on 96.2 % of 288 positions (mean KL 0.018) with it, 99.7 % (0.002) without. `bigmoe bench`, prefill on a cached 8,192-token prefix, time to first token by new tokens, mode `nvme` (800 new tokens leave a 31-token tail, which keeps its own forward):
+**DeepSeek-V4.1-Flash**, DSpark speculative decoding (2026-11-10)
 
-| new tokens | 8 | 80 | 120 | 400 | 800 | 2,000 | 5,000 | 10,000 |
-|---|---|---|---|---|---|---|---|---|
-| default | 1.4 s | 8.8 s | 8.7 s | 8.9 s | 12.9 s | 9.2 s | 9.7 s | 22.0 s |
-| with warm prefill (removed for GLM) | 1.2 s | 3.7 s | 5.1 s | 5.6 s | 10.0 s | 6.9 s | 9.3 s | 20.8 s |
+| mode | prompt tokens | prefill | decode |
+|---|---|---|---|
+| `nvme` | 1,024 | 79 tok/s | 16.4 tok/s |
+| `nvme` | 8,192 | 767 tok/s | 21.3 tok/s |
+| `nvme` | 32,768 | 820 tok/s | 20.3 tok/s |
+| `nvme-exact` | 1,024 | 33 tok/s | 10.6 tok/s |
+| `nvme-exact` | 8,192 | 250 tok/s | 12.1 tok/s |
 
-## DeepSeek-V4.1-Flash
+Short prompts prefill slowly: a prefill forward reads its NVMe-only experts at the SSD's speed however few tokens it
+has. What an agent waits for is the time to the first token after a cached prefix, here
+8,192 tokens (`bigmoe bench`):
 
-`bigmoe bench` prompts, greedy, 128k context, FP16 KV cache, DSpark speculative decoding (`bigmoe verify`, 2026-11-06). KL and top-1: mean per-token KL divergence from exact single-token decode (`nvme-exact`, no speculation) and the share of positions with the same most likely token, on the same forced tokens, six chat prompts, 1,110 positions; with DSpark even `nvme-exact` differs slightly, because the verify forwards round in other GEMM shapes. This is the decode path on short prompts; an agent turn that also prefills new tokens through warm prefill agrees less (98.3-98.8 % top-1 on the same test for the old engine and vLLM, 99.4 % with exact prefill at 76 % more time per turn, measured before short chunks were exact; [docs/vllm.md](docs/vllm.md#agent-turn-quality-deepseek-mode-nvme-2026-11-09)).
+| new tokens | 8 | 80 | 400 | 800 | 2,000 | 10,000 |
+|---|---|---|---|---|---|---|
+| GLM-5.3-Flash | 1.4 s | 8.8 s | 8.9 s | 12.9 s | 9.2 s | 22.0 s |
+| DeepSeek-V4.1-Flash | 1.2 s | 3.4 s | 8.0 s | 9.7 s | 6.5 s | 16.7 s |
 
-| mode | prompt tokens | prefill | decode | KL | top-1 |
-|---|---|---|---|---|---|
-| `nvme` | 1,024 | 174 tok/s | 17.5 tok/s | 0.0011 | 99.6 % |
-| `nvme` | 8,192 | 680 tok/s | 20.2 tok/s | 0.0011 | 99.6 % |
-| `nvme` | 32,768 | 725 tok/s | 19.0 tok/s | 0.0011 | 99.6 % |
-| `nvme-exact` | 1,024 | 33 tok/s | 10.6 tok/s | 0.0007 | 99.7 % |
-| `nvme-exact` | 8,192 | 248 tok/s | 11.8 tok/s | 0.0007 | 99.7 % |
+**Agreement with exact decode.** On the same forced tokens (six chat prompts), mode `nvme` picks the same most likely
+token as `nvme-exact` 97.3 % of the time for GLM (mean KL 0.0096) and 99.6 % for DeepSeek (mean KL 0.0011). With
+`x16_layers=21` GLM reaches 99.2 % at 13 % lower decode speed. `nvme-exact` answers are byte-identical to the baselines.
 
-A 120,000-token prompt prefills at 657 tok/s (183 s) and decodes at 18.5 tok/s. Larger chunks prefill long prompts faster (`-o chunk_size=10240`: 815 tok/s) but leave too little VRAM at 128k: a ~125k-token re-prefill peaks 300 MiB below the card's limit (8192: 900 MiB), and a long agent session ran out of GPU memory with them; `/stats` reports GPU memory (`gpu`). Mode `nvme` prefills with warm prefill (teacher-forced against exact prefill: top-1 99.2 %, mean KL 0.023); `nvme-exact` answers are identical to the runs before it. `bigmoe bench`, prefill on a cached 8,192-token prefix, time to first token by new tokens, mode `nvme` with exact prefill (before warm prefill and the last-page split: 400, 2,000 and 5,000 new tokens took two forwards) and now:
+**Agentic benchmark** (`bigmoe bench-agent`, mode `nvme`): three coding tasks in fresh git repositories, solved over
+the OpenAI API with `bash`, `read_file` and `write_file` tools, each checked by a command independent of what the
+model says; then two of them with two agents at once.
 
-| new tokens | 8 | 80 | 120 | 400 | 800 | 2,000 | 5,000 | 10,000 |
-|---|---|---|---|---|---|---|---|---|
-| exact prefill | 0.7 s | 3.3 s | 14.8 s | 29.0 s | 17.2 s | 29.6 s | 29.8 s | 33.1 s |
-| warm prefill | 1.2 s | 3.3 s | 3.3 s | 5.4 s | 8.2 s | 6.9 s | 8.9 s | 18.6 s |
-| + next-layer read-ahead | 0.6 s | 4.1 s | 3.4 s | 5.5 s | 8.3 s | 6.3 s | 7.4 s | 16.5 s |
-
-For chunks of at least 1,024 rows, warm prefill now guesses the next layer's cold experts with that layer's own router and reads them while the current layer computes, then reads only what the real routing still needs. The fetched experts and outputs are unchanged (1,200/1,200 teacher-forced positions bit-identical, KL 0); long cached-prefix steps are 10-20 % faster on this box. Measurements and the matched-prompt A/B are in [docs/vllm.md](docs/vllm.md#warm-prefill-read-ahead-2026-11-09).
-
-## Agentic benchmark
-
-`bigmoe verify` also runs `bench/agent.py` (or `bigmoe bench-agent` alone): three coding tasks in fresh git repositories, solved over the OpenAI chat API with `bash` / `read_file` / `write_file` function tools, every turn streamed, each result checked by a command independent of what the model says; then two of them with two agents at once. Mode `nvme`, 2026-11-09 (GLM) and 2026-11-10 (DeepSeek, with turn checkpoints; before them: 165 s, 80 %, 5.7 s and 84 s, 84 %, 14.1 s):
-
-| model | tasks solved | turns | tool calls (malformed) | wall | prefix reuse after turn 1 | mean time to first token |
+| | tasks solved | turns | tool calls (malformed) | wall | prefix reuse after turn 1 | mean time to first token |
 |---|---|---|---|---|---|---|
 | DeepSeek-V4.1-Flash | 3 / 3 | 14 | 13 (0) | 153 s | 89 % | 4.3 s |
 | DeepSeek-V4.1-Flash, two agents | 2 / 2 | 10 | 10 (0) | 79 s | 88 % | 12.9 s |
 | GLM-5.3-Flash | 3 / 3 | 21 | 28 (0) | 376 s | 21 % | 9.3 s |
 | GLM-5.3-Flash, two agents | 2 / 2 | 13 | 17 (0) | 217 s | 44 % | 11.4 s |
 
-Both models have recurrent state, so a conversation resumes only from a recurrent checkpoint. DeepSeek checkpoints every 256 tokens while decoding (`rc_interval`, mode `nvme`), so the next turn resumes inside the previous answer: 80 % reuse instead of 59 %, and its resumed turns are closer to exact than a re-prefill through warm prefill (KL 0.0044 instead of 0.0142). Its turn checkpoints then resume at the answer's end: 89 %, and the short tool results that are left take 1.5-2.5 s to the first token. GLM's recurrent state does not rewind, so it has no turn checkpoints, and decode-time checkpoints measured as a wash for it, so these short GLM conversations (under 3k tokens) still reuse only what their earlier prompt lengths happened to checkpoint, which is why GLM's reuse varies so much. Details, including concurrency: [docs/vllm.md](docs/vllm.md#agentic-benchmark-benchagentpy-mode-nvme).
+DeepSeek resumes each agent request where the previous one stopped; GLM's recurrent state cannot be moved back, so it
+resumes only at a stored checkpoint, and short conversations reuse little.
+
+## Credits
+
+The offloading and scheduling engine started as 0xSero's
+[glm-flash-lite](https://github.com/sybil-solutions/glm-flash-lite) (MIT, `LICENSE.glm-flash-lite`). This package is
+Apache-2.0 (`LICENSE`).
