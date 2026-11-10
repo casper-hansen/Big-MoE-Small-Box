@@ -1,4 +1,4 @@
-"""The first run downloads the 125 GB checkpoint and builds the runtime; later runs start in about a minute."""
+"""The first run downloads the 125 GB checkpoint and builds the runtime; later runs only start the server."""
 from bigmoe import AutoBox
 
 box = AutoBox.from_pretrained("glm-5.3-flash", context=131072)

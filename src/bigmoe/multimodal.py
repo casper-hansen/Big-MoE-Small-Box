@@ -1,29 +1,22 @@
-"""Image input for both servers (glm53, dsv41; bigmoe/vllm): OpenAI / Anthropic image blocks -> exllamav3 MMEmbeddings.
+"""Image input for both backends (glm53, dsv41): exllamav3 MMEmbeddings for a request's images.
 
-The text-only path has to stay exactly as fast as before, so the vision tower costs nothing while no image comes in:
+- Nothing of the vision tower is resident. A request with an image that is not cached loads the tower from the
+  checkpoint, encodes all of its new images and unloads it, synchronously on the engine's thread between two forward
+  passes (vllm/engine.py calls embed_prepped when vLLM's scheduler admits the request), so no forward runs while the
+  tower is loaded or the expert cache is lent.
+- VRAM for the encode is what torch has free between forwards; when that is short the expert pools lend chunks of
+  their VRAM cache (tiers.Pool.lend / give_back).
+- Embeddings are cached by image content (a hash of the image plus the model and the token budget) in a RAM LRU over
+  a size-capped directory on disk, which survives restarts. An image keeps its placeholder token ids for the process
+  lifetime, so a conversation that sends it again produces the same prompt ids and the prefix cache matches through
+  the image.
+- Vision.prepare takes chat messages and loads the images itself: download, decode and preprocessing run in a thread
+  pool, only the encode on the calling thread.
 
-- Not resident. The tower (DeepSeek-V4.1: ~0.4 GiB of 6-bit weights; GLM-5.3: ~0.5 GiB) stays in the checkpoint on
-  NVMe. A request with images that are not cached loads it (0.05 s from the page cache, 0.26 s cold from NVMe),
-  encodes all of that request's images (~0.2 s for 1280x960), and unloads it before the request is queued. The VRAM expert cache, the RAM
-  tier and the decode path are the ones measured without images.
-- VRAM for the encode comes from what torch has free between forward passes (the EC_RESERVE_GB headroom the prefill
-  activations use); when that is short (GLM's 1.5 GB headroom, large images) the expert pool lends chunks of its cache
-  (tiers.Pool.lend: written back to the RAM tier, freed, reallocated and re-enabled right after the encode). The
-  executor encodes when vLLM's scheduler admits the request (vllm/engine.py: reserve), on the EngineCore thread between
-  two steps, so no forward ever sees the cache shrink.
-- CPU work (download, base64 decode, PIL decode, resize / normalize) runs in a thread pool: the decode of other
-  requests is not held up by it, only by the GPU encode itself (~0.2 s per 1280x960 image).
-- Content-addressed embeddings. Each image is keyed by a hash of its bytes (plus the model and the token budget); its
-  placeholder token ids are fixed for the process lifetime, so an agent conversation that sends the same screenshot
-  again every turn produces the same token ids and its prefix (image included) is reused from exllamav3's prefix cache
-  instead of prefilled again. Embeddings are kept in a RAM LRU (BIGMOE_MM_CACHE_MB, 256) and written to a size-capped
-  directory on the SSD (BIGMOE_MM_DISK_DIR / BIGMOE_MM_DISK_MB, 2048), which also survives restarts: a hit there is a
-  few ms of NVMe read instead of a tower load + encode.
-
-Environment (set by the backends' launch_spec): BIGMOE_MM (1 = on), BIGMOE_MM_MAX_TOKENS (per-image token budget,
-default the model's own), BIGMOE_MM_CACHE_MB, BIGMOE_MM_DISK_DIR, BIGMOE_MM_DISK_MB, BIGMOE_MM_MAX_IMAGES (16 per
-request), BIGMOE_MM_MAX_BYTES (20 MB per image), BIGMOE_MM_FETCH (1: http(s) image URLs are fetched), BIGMOE_MM_FILES
-(0: file:// URLs are refused).
+Environment: BIGMOE_MM (0 = off), BIGMOE_MM_MAX_TOKENS (per-image token budget; default the model's own),
+BIGMOE_MM_CACHE_MB (RAM cache, 256), BIGMOE_MM_DISK_DIR and BIGMOE_MM_DISK_MB (disk cache, 2048), BIGMOE_MM_THREADS
+(worker threads, 2). For Vision.prepare: BIGMOE_MM_MAX_IMAGES (16 per request), BIGMOE_MM_MAX_BYTES (20 MB per image),
+BIGMOE_MM_FETCH (0: http(s) image URLs are refused), BIGMOE_MM_FILES (1: file:// URLs are allowed).
 
 Stdlib only at import time (torch, PIL and exllamav3 are imported where they are used), so the parsing and caching
 logic is testable without the GPU stack.
@@ -120,7 +113,7 @@ def image_sources(messages) -> list:
 
 
 def has_images(messages) -> bool:
-    """Cheap pre-check that runs on every chat request: a text-only request never gets further than this."""
+    """True if any message holds an image block: one scan of the content lists, all a text-only request costs."""
     for m in messages or ():
         c = m.get("content") if isinstance(m, dict) else None
         if isinstance(c, list):
@@ -133,8 +126,8 @@ def has_images(messages) -> bool:
 
 def with_aliases(messages, aliases) -> list:
     """The messages with the i-th image block replaced by a text block holding aliases[i]. Both chat templates render
-    text blocks where they rendered image blocks (DeepSeek: parts joined by blank lines, the image placeholder token
-    becoming the alias; GLM: concatenated), so the alias lands exactly where the template puts the image."""
+    a text block where they render an image block (DeepSeek joins the parts with blank lines, GLM concatenates them),
+    so the alias lands where the template puts the image."""
     it = iter(aliases)
     out = []
     for m in messages:
@@ -227,7 +220,7 @@ def open_image(data: bytes):
 # --------------------------------------------------------------------------------------------------------------------
 def rebase(mme, first_index: int):
     """Move an MMEmbedding's placeholder ids to start at first_index (the ids an earlier embedding of the same image
-    had), so the prompt's token ids, and with them the prefix cache's page hashes, are the same as before."""
+    had), so the prompt's token ids, and with them the prefix cache's page hashes, stay the same."""
     old = mme.first_index
     if old == first_index:
         return mme
@@ -274,7 +267,7 @@ def _from_record(rec, first_index=None):
 
 
 class EmbeddingCache:
-    """RAM LRU (bytes budget) over a size-capped directory of records on the SSD, keyed by content key. ids[key] (the
+    """RAM LRU (bytes budget) over a size-capped directory of records on disk, keyed by content key. ids[key] (the
     first placeholder id of the key's embedding) lives as long as the process, a few bytes per image ever seen."""
 
     def __init__(self, ram_bytes: int, disk_dir: str = None, disk_bytes: int = 0):
@@ -466,16 +459,16 @@ class Vision:
         if not force and (key in self.cache.lru or (self.cache.disk_dir and os.path.exists(self.cache._path(key)))):
             return key, None, None
         im = open_image(data)
-        # the class's method: _encode_now shadows the instance attribute while it encodes (on the event loop, while
-        # this runs in a worker thread for another request)
+        # the class's method: _encode_now shadows the instance attribute while it encodes, which can be while this
+        # runs in a worker thread for another request
         return key, im, type(self.tower).preprocess(self.tower, im)
 
-    # ---- GPU side (event loop, between generator steps) ----
+    # ---- GPU side (the calling thread, between forward passes) ----
     def _load_tower(self):
         """Model.load without its garbage pass: with the text model resident exllamav3 runs free_mem() (a full
-        gc.collect() + empty_cache) first, to return VRAM held by an earlier model's garbage. There is none here, and in
-        the server's heap that collection alone took ~0.4 s, longer than reading the tower from NVMe. The heap is frozen
-        for the load, as exllamav3 itself does on a first load."""
+        gc.collect() + empty_cache) first, to return VRAM held by an earlier model's garbage. There is none here, and
+        collecting the server's heap takes longer than reading the tower. The heap is frozen for the load, as
+        exllamav3 does when nothing else has frozen it."""
         import gc
         import exllamav3.model.model as xm
         orig, xm.free_mem = xm.free_mem, (lambda: None)
@@ -494,8 +487,8 @@ class Vision:
         return int(x.shape[0]) if hasattr(x, "shape") else 0
 
     def _encode_now(self, todo, measure=False):
-        """Load the tower, encode every (key, image, prepped) of a request, unload it. Lends VRAM from the expert pool
-        when torch's free memory is short. Runs synchronously: no generator step can interleave. measure (the startup
+        """Load the tower, encode every (key, image, prepped) of a request, unload it. Lends VRAM from the expert pools
+        when torch's free memory is short. Runs synchronously: no forward pass can interleave. measure (the startup
         self-test only: it resets torch's peak counter, which /stats reports) sizes the activation estimate."""
         torch = self.torch
         tiers = None
@@ -528,7 +521,7 @@ class Vision:
                     wbytes = torch.cuda.memory_allocated(self.device) - base
                     out = []
                     for key, im, prepped in todo:
-                        self.tower.preprocess = lambda *_a, _p=prepped, **_k: _p   # done in the worker pool
+                        self.tower.preprocess = lambda *_a, _p=prepped, **_k: _p   # preprocessed by the caller
                         try:
                             mme = self.tower.get_image_embeddings(self.tok, im)
                         finally:
@@ -605,10 +598,10 @@ class Vision:
         return with_aliases(messages, [e.text_alias for e in order]), uniq, info
 
     def embed_prepped(self, items):
-        """[MMEmbedding] for [(content key, (width, height) of the original image, preprocessed tensors)] that the
-        caller decoded and preprocessed already (the vLLM processor, bigmoe/vllm/mm.py, runs preprocess() in the API
-        server). Cached embeddings (RAM, then disk) skip the tower; the rest are encoded in one tower load. Each key keeps
-        its placeholder ids for the process lifetime, as in prepare()."""
+        """[MMEmbedding] for [(content key, (width, height) of the original image, preprocessed tensors)]: images the
+        caller decoded and preprocessed (the vLLM processor, vllm/mm.py, runs preprocess() in the API server). Cached
+        embeddings (RAM, then disk) skip the tower; the rest are encoded in one tower load. Each key keeps its
+        placeholder ids for the process lifetime, as in prepare()."""
         t0 = time.perf_counter()
         embs, todo = {}, []
         for key, size, prepped in items:
@@ -692,11 +685,11 @@ def not_supported() -> RequestError:
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# what the servers call
+# request helpers
 # --------------------------------------------------------------------------------------------------------------------
 async def prepare_chat(vision, messages):
-    """(messages for the chat template, [MMEmbedding]). Text-only requests come back unchanged after one scan of the
-    content lists; images need the server's Vision (else a 400)."""
+    """(messages for the chat template, [MMEmbedding]). Text-only messages come back unchanged; images need a Vision
+    (else a 400)."""
     if not has_images(messages):
         return messages, []
     if vision is None:
@@ -714,7 +707,7 @@ def encode_prompt(tok, prompt: str, embeddings):
 
 
 def text_of(content) -> str:
-    """Plain text of a message content (string or block list) for the servers' built-in fallback templates."""
+    """Plain text of a message content (string or block list): its text blocks concatenated."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -724,6 +717,6 @@ def text_of(content) -> str:
 
 
 def model_card_fields(vision) -> dict:
-    """/v1/models extras: the input modalities this server takes (OpenRouter-style), so clients can tell."""
+    """/v1/models extras: the input modalities this server takes (OpenRouter-style)."""
     mods = ["text", "image"] if vision is not None else ["text"]
     return {"input_modalities": mods, "capabilities": {"vision": vision is not None}}

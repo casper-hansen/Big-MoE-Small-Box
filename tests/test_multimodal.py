@@ -1,5 +1,5 @@
 """Image input (bigmoe/multimodal.py): message parsing, alias substitution, the content-keyed embedding cache and the
-backends' launch environment. No GPU: the vision tower itself is exercised by the servers' startup self-test."""
+backends' launch environment. No GPU: the vision tower itself is exercised by the server's startup self-test."""
 import asyncio
 import base64
 import io

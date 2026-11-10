@@ -40,8 +40,7 @@ class RuntimeSpec:
     smoke_test: str = "import torch"
     # installed with --no-deps after `requirements` (vLLM: its wheel pins a torch the runtime does not use)
     nodeps_requirements: Path = None
-    # a runtime with the same torch whose source-build wheels this one reuses (the vLLM runtimes reuse the native
-    # runtimes' exllamav3 build instead of compiling it again)
+    # the package set the source builds are compiled against: its key(), not this spec's, names the wheel cache
     wheels_like: "RuntimeSpec" = None
 
     def key(self) -> str:
@@ -82,8 +81,8 @@ def find_uv() -> str:
 
 def patch_cuda_glibc_rsqrt(include_dir: Path) -> bool:
     """CUDA 13.0's crt/math_functions.h declares rsqrt/rsqrtf without the noexcept(true) that glibc >= 2.41 uses in
-    C++, so nvcc fails with "exception specification is incompatible" (e.g. Ubuntu 26.04's glibc 2.43). This matches
-    glibc's declaration; on older glibc the macro expands to nothing."""
+    C++, so nvcc fails with "exception specification is incompatible". This matches glibc's declaration; on older
+    glibc the macro expands to nothing."""
     p = Path(include_dir) / "crt" / "math_functions.h"
     if not p.is_file():
         return False
@@ -133,10 +132,10 @@ PLUGIN_ENTRY_POINTS = ("[vllm.general_plugins]\nbigmoe = bigmoe.vllm:register\n\
 
 
 def link_vllm_plugin(env: Path):
-    """The symlinked package has no dist-info, so vLLM (which finds plugins by entry point) would not see it: a minimal
-    dist-info declares bigmoe.vllm:register as a vllm.general_plugins entry point (vLLM calls it in every process it
-    starts) and the extra HTTP routes as a vllm.endpoint_plugins one (loaded once VLLM_PLUGINS allowlists it, which
-    bigmoe.vllm.serve does). Harmless in an environment without vLLM."""
+    """vLLM finds plugins by entry point and the symlinked package has no dist-info, so a minimal one declares
+    bigmoe.vllm:register under vllm.general_plugins (called in every process vLLM starts) and the HTTP routes under
+    vllm.endpoint_plugins (loaded only when VLLM_PLUGINS allowlists them, which bigmoe.vllm.serve does). Harmless in
+    an environment without vLLM."""
     d = _site_packages(env) / PLUGIN_DIST
     want = {"METADATA": "Metadata-Version: 2.1\nName: bigmoe-vllm-plugin\nVersion: 0.1.0\n",
             "entry_points.txt": PLUGIN_ENTRY_POINTS, "RECORD": ""}
@@ -237,7 +236,7 @@ class Runtime:
         if wheels:
             self._uv("pip", "install", "--python", self.python, "--no-deps", *wheels)
             sp = _site_packages(self.path)
-            for w in wheels:  # source builds carry debug info (exllamav3_ext: 380 MB -> 261 MB)
+            for w in wheels:  # source builds carry debug info
                 for name in _wheel_libraries(w):
                     if (sp / name).is_file():
                         strip_debug(sp / name)

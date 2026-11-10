@@ -1,4 +1,4 @@
-"""Box-only check (needs the checkpoint + a GPU): the n135 VBMI decode tables for trellis formats K 2 / 2.5 / 3
+"""Box-only check (needs the checkpoint + a GPU): the VBMI decode tables for trellis formats K 2 / 2.5 / 3
 (ft_n135.h init_vbmi, re-implemented here line by line) extract the same 16-bit states from real tiles as exllamav3's
 own unpack (unpack_trellis_frac for K 2.5; the ring definition for integer K). Simulates vpermt2b + vpmultishiftqb.
 

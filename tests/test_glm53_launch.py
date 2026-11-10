@@ -9,7 +9,7 @@ from bigmoe.models import glm53
 
 BASE = Path(glm53.__file__).parent / "baselines"
 PATHS = ("GLM53_EC_WARM", "GLM53_NV_STORE")
-# set by the reference runs and read by nothing (NV_CPU_KERN and EC_WARM_PREFILL: at the engine's defaults)
+# the baselines' environment also holds variables nothing reads, and two the launch leaves at the engine's defaults
 UNREAD = ("GLM53_NV", "GLM53_EC", "GLM53_K_FTSPLIT", "GLM53_K_OVL", "GLM53_CPU_TIER", "GLM53_ZC_STATS")
 DEFAULTS = {"GLM53_NV_CPU_KERN": "1", "GLM53_EC_WARM_PREFILL": "0"}
 
@@ -33,7 +33,7 @@ def spec_for(tmp_path, monkeypatch, mode, flags=frozenset({"avx2", "fma", "f16c"
 
 @pytest.mark.parametrize("mode,fname", [("nvme", "longctx_nvme.json"), ("nvme-exact", "longctx_exact.json")])
 def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
-    # the reference runs (bigmoe verify, 2026-11-06) were measured with the defaults on an AVX-512 VBMI CPU
+    # the baselines hold the environment of a default launch on an AVX-512 VBMI CPU
     box, spec = spec_for(tmp_path, monkeypatch, mode, flags=glm53.VBMI_FLAGS | {"avx2", "fma", "f16c"})
     glm = lambda env: {k: v for k, v in env.items() if k.startswith("GLM53_") and not k.endswith("_BUILD")}
     ref, ours = glm(json.loads((BASE / fname).read_text())["env"]), glm(spec.env)
@@ -93,7 +93,7 @@ def test_speculation_option(tmp_path, monkeypatch):
     assert "-ngram" not in spec.argv and "-ndt" not in spec.argv   # off by default
     _, spec = spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram")
     assert spec.argv[spec.argv.index("-ngram") + 1] == "2" and spec.argv[spec.argv.index("-ndt") + 1] == "5"
-    # one recurrent slot with drafts (the rewind history would take 2.7 GB of expert cache at -ambs 4): the last -ambs wins
+    # drafts run with one recurrent slot (the rewind history is kept per slot): the last -ambs wins
     i = len(spec.argv) - 1 - spec.argv[::-1].index("-ambs")
     assert spec.argv[i + 1] == "1" and i > spec.argv.index("-ambs")
     with pytest.raises(ValueError):

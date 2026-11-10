@@ -90,7 +90,7 @@ def test_dspark_default_and_off(tmp_path, monkeypatch):
 def test_launch_cpu_lane(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch)   # default mode nvme
     assert spec.env["DSV41_NV_CPU"] == "1" and spec.env["DSV41_NV_CPU_CPUS"] == "1-5"
-    assert spec.env["DSV41_NV_SLRU"] == "80"    # the RAM tier's segmented LRU: mode nvme, where it was measured
+    assert spec.env["DSV41_NV_SLRU"] == "80"    # the RAM tier's segmented LRU, mode nvme only
     box, _ = spec_for(tmp_path, monkeypatch, flags={"avx2", "fma", "f16c"}, mode="nvme")
     monkeypatch.setattr(system, "gpu_compute_apps", lambda: [])
     monkeypatch.setattr(system, "check_odirect", lambda p: None)
@@ -150,8 +150,7 @@ def test_store_v2_mixed_sizes(odirect_dir, tmp_path):
 def test_warm_prefill_in_mode_nvme(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch)
     assert spec.env["DSV41_EC_WARM_PREFILL"] == "1"
-    # no knobs: the fetch policy, read-ahead and tail checkpoints are the implementation (engine/warm_prefill.py,
-    # engine/last_page.py)
+    # the fetch policy, read-ahead and tail checkpoints have no knobs (engine/warm_prefill.py, engine/last_page.py)
     assert not [k for k in spec.env if k.startswith(("DSV41_EC_WARM_", "DSV41_EC_TAIL")) and k != "DSV41_EC_WARM_PREFILL"]
     names = {f.name for f in dataclasses.fields(dsv41.DSV41Options)}
     assert not names & {"warm_prefill", "warm_fetch", "warm_exact_rows", "warm_drop", "warm_ahead", "warm_ahead_n",

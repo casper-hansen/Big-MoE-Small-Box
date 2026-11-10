@@ -60,8 +60,8 @@ def _lfs_sha256(sibling):
 
 class Checkpoint:
     """A checkpoint (repo @ commit) in a local directory. Verification results are kept in .bigmoe/checkpoint.json
-    with each file's size and mtime: re-checks are free, and a file whose expert bytes were punched out (it can no
-    longer be hashed) still counts as verified, unless a full copy is asked for (need_full=True)."""
+    with each file's size and mtime: re-checks are free, and a file whose expert bytes were punched out (it cannot be
+    hashed) still counts as verified, unless a full copy is asked for (need_full=True)."""
     STATE = ".bigmoe/checkpoint.json"
 
     def __init__(self, repo_id: str, commit: str, directory, *, ignore=(), token=None):

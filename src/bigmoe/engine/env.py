@@ -1,4 +1,4 @@
-"""Engine knobs: <BIGMOE_ENGINE_PREFIX>NAME (the backend's own prefix, e.g. GLM53_NV_CPU / DSV41_NV_CPU)."""
+"""Engine variables: <BIGMOE_ENGINE_PREFIX>NAME (the backend's own prefix, e.g. GLM53_NV_CPU / DSV41_NV_CPU)."""
 import os
 
 PREFIX = os.environ.get("BIGMOE_ENGINE_PREFIX") or "BIGMOE_"

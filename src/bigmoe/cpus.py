@@ -51,7 +51,7 @@ def plan_layout(cores, cpu_lane: bool = True) -> CpuLayout:
     """The main (GPU-feeding) thread and the planner's controller are latency-critical; the CPU lane's AVX2 GEMVs are
     FPU-bound, so SMT siblings do not help them, while the NVMe readers mostly sit in pread. With SMT: main and
     controller share the first core, the lane takes one thread of every other core, the readers their siblings
-    (on a 7600X: 0 / 6 / 1-5 / 7-11, the measured layout). Without SMT the readers share the last lane CPUs."""
+    (on a 7600X: 0 / 6 / 1-5 / 7-11). Without SMT the readers share the last lane CPUs."""
     if not cores:
         raise ValueError("no CPUs")
     if len(cores) >= 2 and all(len(c.threads) >= 2 for c in cores):

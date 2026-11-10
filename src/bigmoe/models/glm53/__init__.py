@@ -105,7 +105,7 @@ class GLM53(ModelBackend):
 
     @property
     def default_memory_gb(self) -> float:
-        """56 GiB on a 60 GiB+ box (measured best: 4.8 GiB host headroom at peak); smaller hosts MemTotal - 8 GiB."""
+        """56 GiB on a host with 60 GiB or more, otherwise MemTotal - 8 GiB."""
         total = system.meminfo().get("MemTotal", 64)
         return 56.0 if total >= 60 else float(max(15, int(total - 8)))
 
@@ -273,7 +273,7 @@ class GLM53(ModelBackend):
                        GLM53_NV_PREFETCH="1", GLM53_NV_PFSIDE="1", GLM53_NV_PUBFAST="1", GLM53_MAX_RQ_TOKENS="4096")
             env.update(engine.x16_env("GLM53_", o.x16_layers))
         rcs = float(o.prefix_cache_gb)
-        if box.memory_gb < 24:   # small hosts: a smaller prefill ring, more reader threads, smaller read pieces
+        if box.memory_gb < 24:   # small hosts: a larger memory margin, more reader threads, smaller read pieces
             env.update(GLM53_NV_MARGIN_GB="1.5", GLM53_NV_PF_RING="128", GLM53_NV_THREADS="48", GLM53_NV_PIECE_KB="1024")
             rcs = min(1.0, rcs)
         for spec in self.kernel_specs(box):

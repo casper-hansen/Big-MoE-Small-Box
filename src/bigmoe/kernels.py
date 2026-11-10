@@ -91,8 +91,7 @@ def main(argv=None):
     if len(argv) != 2 or argv[0] != "build":
         sys.exit("usage: build '<json list of {name, env_var, module, function, dir}>'")
     build(json.loads(argv[1]))
-    # done: skip interpreter teardown, where unloading the freshly imported extensions next to torch / CUDA can
-    # segfault (seen with glm53_nv2 on torch 2.13)
+    # skip interpreter teardown: unloading the freshly imported extensions next to torch / CUDA can segfault
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)

@@ -1,5 +1,5 @@
-// Per-model environment prefix of the shared offload engine: knob NAME is read from <BIGMOE_ENGINE_PREFIX>NAME
-// (GLM-5.3: GLM53_, DeepSeek-V4.1: DSV41_), so every backend keeps its own variable names.
+// penv("NAME") reads the environment variable <prefix>NAME. Each backend sets its prefix in BIGMOE_ENGINE_PREFIX
+// (GLM-5.3: GLM53_, DeepSeek-V4.1: DSV41_; unset: BIGMOE_), so every backend has its own variable names.
 #pragma once
 #include <cstdlib>
 #include <string>
