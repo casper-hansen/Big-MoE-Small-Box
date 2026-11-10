@@ -150,6 +150,12 @@ def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch)
     assert spec.env["DSV41_EC_WARM_PREFILL"] == "1" and spec.env["DSV41_EC_WARM_FETCH"] == "64"
     assert spec.env["DSV41_EC_WARM_AHEAD"] == "1" and "DSV41_EC_WARM_AHEAD_N" not in spec.env
+    assert spec.env["DSV41_EC_WARM_EXACT_ROWS"] == "1024" and spec.env["DSV41_EC_WARM_DROP"] == "0"
+    _, spec = spec_for(tmp_path, monkeypatch, warm_exact_rows=0, warm_drop=0.005)
+    assert spec.env["DSV41_EC_WARM_EXACT_ROWS"] == "0" and spec.env["DSV41_EC_WARM_DROP"] == "0.005"
+    for bad in ({"warm_exact_rows": -1}, {"warm_drop": 1.0}):
+        with pytest.raises(ValueError):
+            spec_for(tmp_path, monkeypatch, **bad)
     _, spec = spec_for(tmp_path, monkeypatch, warm_fetch=192, warm_ahead_n=128)
     assert spec.env["DSV41_EC_WARM_FETCH"] == "192" and spec.env["DSV41_EC_WARM_AHEAD_N"] == "128"
     _, spec = spec_for(tmp_path, monkeypatch, warm_prefill=False)

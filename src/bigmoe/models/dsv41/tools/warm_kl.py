@@ -89,6 +89,8 @@ def run(a, mode):
     print("prefix warm-up: cached", touch(url, prefix), flush=True)
     res = {"prefix": prefix, "sizes": list(sizes), "reps": reps, "samples": {}}
     for name, n, ids in todo:
+        if n < getattr(a, "min_n", 0):
+            continue
         if mode == "force":
             switch(0)                                           # the prefix (if it has to be recomputed): exact
         cached_touch = touch(url, prefix)
@@ -171,6 +173,7 @@ def main():
             p.add_argument("--sizes", type=lambda s: [int(x) for x in s.split(",")], default=list(SIZES))
         else:
             p.add_argument("--ref", required=True)
+            p.add_argument("--min-n", type=int, default=0, help="skip smaller samples (the per-pick sizes are controls)")
     c = sub.add_parser("compare")
     c.add_argument("ref")
     c.add_argument("new")

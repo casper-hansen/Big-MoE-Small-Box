@@ -897,6 +897,19 @@ class ExlEngine:
         from ..engine import warm_prefill
         return warm_prefill.set_ahead(bool(on), int(n))
 
+    def warm_fetch(self, n: int = None, drop: float = None, exact_rows: int = None) -> dict:
+        """Runtime warm_fetch / warm_drop / warm_exact_rows (A/B runs on one server); None keeps a value."""
+        from ..engine import warm_prefill
+        return warm_prefill.set_fetch(n, drop, exact_rows)
+
+    def warm_trace(self, on: int = 1, path: str = "") -> dict:
+        """Debug: record warm prefill's per-layer routing (on=1 starts a record; on=0 ends it and saves it to path)."""
+        from ..engine import warm_prefill
+        prev = warm_prefill.set_trace(bool(on))
+        if prev is not None and path:
+            self.torch.save(prev, path)
+        return {"calls": len(prev) if prev is not None else None, "path": path}
+
     def cpu_switch(self, on: int = 1) -> dict:
         """Runtime CPU-lane switch (mode nvme): on=0 puts every pick on the GPU path (bit-exact), for A/B runs."""
         from ..engine import nv2

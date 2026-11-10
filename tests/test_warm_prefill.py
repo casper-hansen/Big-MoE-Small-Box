@@ -25,6 +25,42 @@ def test_rank_cold_by_summed_weight():
     assert warm.rank_cold(sel + 10, w, cold, 10, 1).tolist() == [3]   # routing_first offset
 
 
+def test_rank_cold_drop_stops_once_the_weight_left_out_is_small():
+    cold = torch.tensor([True, True, False, True, True])
+    sel = torch.tensor([[0, 2], [1, 3], [3, 2]])
+    w = torch.tensor([[0.5, 0.5], [0.2, 0.8], [0.3, 0.7]])
+    # routing weight 3.0; cold 3 -> 1.1, 0 -> 0.5, 1 -> 0.2 (1.8 cold in all)
+    assert warm.rank_cold(sel, w, cold, 0, 8, drop=0.3).tolist() == [3]          # 0.7 left out <= 0.9
+    assert warm.rank_cold(sel, w, cold, 0, 8, drop=0.1).tolist() == [3, 0]       # 0.2 left out <= 0.3
+    assert warm.rank_cold(sel, w, cold, 0, 8, drop=0.05).tolist() == [3, 0, 1]   # nothing left out
+    assert warm.rank_cold(sel, w, cold, 0, 2, drop=0.05).tolist() == [3, 0]      # the limit still caps it
+    assert warm.rank_cold(sel, w, cold, 0, 8, drop=0.9).tolist() == [3]          # the heaviest is always read
+    assert warm.rank_cold(sel, w, torch.zeros(5, dtype=torch.bool), 0, 8, drop=0.1).tolist() == []
+
+
+def test_set_fetch_runtime_switch():
+    old = warm.set_fetch()
+    try:
+        assert warm.set_fetch(384, 0.002, 0) == {"fetch": 384, "drop": 0.002, "exact_rows": 0}
+        assert warm.set_fetch(64) == {"fetch": 64, "drop": 0.002, "exact_rows": 0}   # the others are kept
+    finally:
+        warm.set_fetch(old["fetch"], old["drop"], old["exact_rows"])
+
+
+def test_fetch_policy_exact_short_forwards():
+    old = warm.set_fetch()
+    try:
+        warm.set_fetch(64, 0.005, 1024)
+        assert warm.fetch_policy(99, 300) == (300, 0.0)      # short: every routed cold expert, nothing dropped
+        assert warm.fetch_policy(1024, 250) == (250, 0.0)
+        assert warm.fetch_policy(1025, 250) == (64, 0.005)   # longer: the warm_fetch cap and warm_drop
+        assert warm.fetch_policy(8192, 40) == (40, 0.005)    # never past the free staging slots
+        warm.set_fetch(exact_rows=0)
+        assert warm.fetch_policy(99, 300) == (64, 0.005)     # off
+    finally:
+        warm.set_fetch(old["fetch"], old["drop"], old["exact_rows"])
+
+
 def test_drop_cold_sentinel_and_renormalization():
     cold = torch.tensor([False, True, False, False])
     sel = torch.tensor([[0, 1], [2, 3], [1, 1]])

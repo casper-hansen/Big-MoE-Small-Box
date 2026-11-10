@@ -391,3 +391,67 @@ lines.
 - A request whose prompt was cached up to its last token (a resent prompt ending one token past a checkpoint) failed
   with a 500: exllamav3 restores it complete at allocation, so `Job.prefill`, which stamps the prefill start time, never
   ran. The executor stamps it now (`tests/test_vllm.py`).
+
+## Exact short prefills (DeepSeek, mode `nvme`, 2026-11-09)
+
+Exact staging reads every NVMe-only expert of every layer, about 250 of 384 per layer (~95 GB), however few tokens the
+chunk has. A short chunk routes far fewer of them. Recorded on the samples above (`warm_trace` RPC): 75 per layer at
+100 new tokens and 153 at 1,000. Warm prefill reads the 64 heaviest and drops the rest, and that drop is where the
+3 % top-1 loss came from. It does not have to read the other ~100-175: no token routes to them.
+
+Now a staged forward of at most `warm_exact_rows` rows (default 1,024) reads **every** routed NVMe-only expert and drops
+nothing. The MoE then runs the same experts on the same bytes as exact staging, so the logits are bit-identical. Longer
+chunks are unchanged (the 64-expert cap, read-ahead). Same test, same reference (`warm_kl.py`, `ref.json` from the
+`warm_prefill=False` server), 3 samples per size, prefill times from the engine's request log:
+
+| new tokens | exact prefill | warm prefill (fetch 64) | **exact short prefill** (new default) | top-1 / mean KL |
+|---|---|---|---|---|
+| 100 | 15.1 s | 4.5 s | **5.0 s** | 100 % / 0, 3/3 bit-identical |
+| 120 | 15.2 s | 4.8 s | **5.2 s** | 100 % / 0, 3/3 |
+| 160 | 15.2 s | 4.9 s | **6.0 s** | 100 % / 0, 3/3 |
+| 200 | 15.2 s | 5.0 s | **6.6 s** | 100 % / 0, 3/3 |
+| 300 | 20.3 s | 9.7 s | **11.9 s** | 100 % / 0, 3/3 |
+| 400 | 15.2 s | 5.2 s | **8.4 s** | 100 % / 0, 3/3 |
+| 600 | 15.2 s | 5.4 s | **10.0 s** | 100 % / 0, 3/3 |
+| 800 | 19.1 s | 9.1 s | **14.0 s** | 100 % / 0, 3/3 |
+| 1,000 | 15.3 s | 5.7 s | **11.9 s** | 100 % / 0, 3/3 |
+| all 3,344 positions | | 97.4 % / 0.0065 | **100 % / 0** | |
+
+Sum over one step of each size: exact 145.8 s, warm prefill 54.2 s, exact short prefill 79.0 s. That is exact prefill's
+answers in 54 % of its time; against warm prefill it costs +0.4-1.6 s per step up to 200 new tokens and +3.2-6.2 s at
+400-1,000. The forward is NVMe-bound: 1,078 GB in 27 forwards in 182 s of reads (5.9 GB/s; raw O_DIRECT reads of
+expert-sized records on this SSD reach 5.9-6.2 GB/s). The 300 and 800 rows still pay a second forward for their short
+tail (`engine/last_page.py`). A 4,000-token prompt (one 4k-row forward) and a 4,600-token one take no exact layer calls,
+so long prefills are unaffected. The run went through `bigmoe start deepseek-v4.1-flash` with no options set.
+`-o warm_exact_rows=0` restores warm prefill's speed for short steps, and `-o warm_exact_rows=256` keeps exact
+prefill only for steps up to 256 rows (the +0.4-1.6 s ones).
+
+GLM: the engine default is off (`EC_WARM_EXACT_ROWS=0`); GLM's warm prefill is off by default and this was not measured
+there.
+
+Measured, not kept (same samples, sizes 100-1,000, sum of prefill times / top-1 / mean KL):
+
+| variant | prefill | top-1 | mean KL |
+|---|---|---|---|
+| warm prefill, fetch 64 (before) | 54.2 s | 97.40 % | 0.0065 |
+| fetch 64; each dropped pick goes to the token's next-best warm expert, weights recomputed as the router does | 54.5 s | 97.07 % | 0.0058 |
+| `warm_fetch=384 warm_drop=0.005`: read until <= 0.5 % of the call's routing weight is left out | 69.9 s | 98.09 % | 0.0034 |
+| `warm_fetch=384 warm_drop=0.002` | 74.5 s | 98.06 % | 0.0027 |
+| every routed expert (= the new default) | 79.0 s | 100 % | 0 |
+| every routed expert + read-ahead (64 / 384 guesses, `EC_WARM_AHEAD_MIN=0`) | 78.5 / 78.7 s | 100 % | 0 |
+
+- Leaving out even 0.2 % of the routing weight keeps KL at 0.0027, and it is only 6 % faster than reading every routed
+  expert. Approximation does not pay at these sizes. `warm_drop` is kept as an option for longer chunks (with `warm_fetch=384`), not measured there yet.
+- Substituting dropped picks with warm experts moves KL little and top-1 the wrong way.
+- Read-ahead guesses are right (93-95 % of them are used), but it covers only 19-20 % of the reads. A layer's compute is
+  much shorter than its reads, so there is little time to run ahead of the real routing, and the reads already saturate
+  the SSD.
+- Offline (recorded routings): fetching to minimise each token's squared dropped weight, instead of the summed weight,
+  cuts the worst token's dropped weight by a third at the same budget. That comes at a slightly higher mean, so it was
+  not tried on the server. Keeping the experts a step read in the RAM tier would cut the next step's cold reads (on
+  these samples the cold routing weight would fall from ~0.5 to 0.06-0.15 with an unbounded tier). But a bounded LRU
+  evicts decode-hot experts, and it changes decode, so it was not tried either.
+
+Tools: `warm_kl.py force --min-n 100` skips the per-pick control sizes. The debug RPCs `warm_fetch` (`n`, `drop`,
+`exact_rows`, at runtime) and `warm_trace` (records each staged layer call's routing and cold set to a file) need
+`BIGMOE_DEBUG_RPC=1`.
