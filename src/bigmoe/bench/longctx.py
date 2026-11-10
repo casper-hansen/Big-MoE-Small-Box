@@ -19,7 +19,7 @@ CORPUS_PACKAGES = ("exllamav3", "transformers")
 
 
 def glm_frame(n_tokens: int):
-    """GLM-5.x chat framing, thinking off. The reference results were measured with exactly this text."""
+    """GLM-5.x chat framing, thinking off. The baselines depend on exactly this text."""
     return f"[gMASK]<sop><|user|>[document set {n_tokens}]\n", QUESTION + "<|assistant|><think></think>"
 
 

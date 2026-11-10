@@ -1,33 +1,24 @@
-"""Turn checkpoints (models whose recurrent state rewinds by cursor: DeepSeek-V4, last_page.rewindable()).
+"""Turn checkpoints (models whose recurrent state can be moved back by its cursor: DeepSeek-V4,
+last_page.rewindable()).
 
-exllamav3 resumes a cached prompt from a recurrent checkpoint, and a checkpoint sits on a 256-token page boundary
-(the K/V pages are shared by hash, a page is hashed when it is full). An agent's next request extends the last one
-(prompt + answer + tool result), so every step prefilled again the end of the last prompt and most of the answer the
-model had just decoded: 100-500 tokens, a staged forward of 4-8 s, where the tokens that are really new are often a
-few dozen (a short tool result), which the per-pick path takes in 1-2 s.
+exllamav3 resumes a cached prompt from a recurrent checkpoint on a 256-token page boundary. An agent's next request
+extends its last one (prompt + answer + tool result), so without more checkpoints every request would prefill again the
+end of the last prompt and most of the answer. Here the state is also stashed where a request stops:
 
-Here the state is also stashed where a request stops:
+  turn end     when a job gives its pages back (Job.deallocate_pages), at its K/V position: the prompt and every answer
+               token but the last sampled one
+  prompt end   after the prompt's last forward, at its last token, for a follow-up that keeps the prompt but not the
+               answer as it was generated
 
-  turn end     when a job gives its pages back (Job.deallocate_pages: finished, stopped by vLLM, requeued), at its K/V
-               position: the prompt and every answer token but the last sampled one
-  prompt end   after the prompt's last forward, at its last token (for a follow-up that keeps the prompt but not the
-               answer as it was generated: a client that drops the reasoning, a retried request, a template that
-               renders the answer differently)
+A starting job (Job.allocate_pages) whose prompt begins with such a sequence resumes there: at the stashed position,
+or below it where the two diverge, as far as the state can be moved back exactly (up to a page, and not below the rows
+the SWA ring still holds for a whole window). The K/V rows of the resume point's page are copied from a page that holds
+them; the full pages below are the prefix cache's. Anything that cannot be verified (an evicted entry, a missing page,
+a state that cannot move that far) falls back to exllamav3's page-aligned resume.
 
-and a starting job (Job.allocate_pages) whose prompt begins with such a sequence resumes there: at the stashed
-position, or below it where the two diverge when the state can be moved back exactly (the cursor rewind exllamav3
-uses for rejected drafts: up to a page, and not below the rows the SWA ring still holds for a whole window). The
-K/V rows of the page the resume point lies in are copied from the page that holds them (exllamav3's partial-page
-reuse, which it skips for recurrent models because their checkpoints are page-aligned); the full pages below are the
-prefix cache's. Whatever cannot be verified (the entry was evicted, a page of the prefix is gone, the state cannot be
-moved that far) falls back to exllamav3's page-aligned resume.
-
-The store is a small LRU beside exllamav3's RecurrentCache (whose keys are page hashes), of `entries` checkpoints
-(DSV41_TURN_CKPTS, default 4, ~36 MB each for DeepSeek-V4.1), taken out of the recurrent cache's budget. An entry
-that a newer one covers (same sequence, and the newer one reaches back at least as far) is dropped.
-
-Installed by tiers.attach in mode nvme (mode nvme-exact keeps exllamav3's schedule, so its answers stay those of
-exllamav3). Job.prefill must accept a start inside a page: last_page.apply relaxes its assert (_BIGMOE_MID_PAGE).
+The store is a small LRU of install(entries) checkpoints beside exllamav3's RecurrentCache, whose budget it takes from.
+An entry that a newer one covers (same sequence, reaching back at least as far) is dropped. Installed by tiers.attach in
+mode nvme; Job.prefill must accept a start inside a page, which last_page.apply allows (_BIGMOE_MID_PAGE).
 """
 import sys
 import time

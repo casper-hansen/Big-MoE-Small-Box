@@ -1,9 +1,8 @@
 """Launch-time sizing of exllamav3's prefix-cache tiers (the backends' cpu_cache_gb / disk_cache options).
 
 exllamav3 restores a prefix from its disk tier by promoting every page of it into the pinned-RAM tier before copying
-it to the GPU, and promotions never evict each other: the RAM tier caps the longest prefix the disk can give back.
-Measured on the box: a 16.9k-token GLM prompt (66 pages of 4.5 MB) came back from disk with a 1 GiB tier and not at
-all with 0.25 GiB (room for ~55 pages).
+it to the GPU, and promotions never evict each other: the RAM tier caps the longest prefix the disk can give back,
+and a prefix longer than that comes back not at all.
 """
 import math
 

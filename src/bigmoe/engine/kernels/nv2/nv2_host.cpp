@@ -1,12 +1,12 @@
-// N119 nv2 host engine (one per GPU process). Owns every residency decision ("only the host marks an expert
+// nv2 host engine (one per GPU process). Owns every residency decision ("only the host marks an expert
 // resident, and only after its bytes have landed"):
 //   controller thread  polls the device's per-layer requests (mapped ring), drains the device's write-back /
-//                      admission logs (exclusive RAM tier), runs plan_layer (moetier semantics: lanes gpu / zerocopy /
+//                      admission logs (exclusive RAM tier), runs plan_layer (lanes gpu / zerocopy /
 //                      cpu / nvme, greedy min-max split, NVMe stall), issues O_DIRECT NVMe reads into fresh RAM slots,
 //                      writes the reply (lanes), dispatches the CPU job, keeps the landing ring + free list stocked
 //   reader pool        pthreads doing O_DIRECT preads of record pieces (decode reads ahead of prefill read-ahead);
 //                      the thread that finishes a record's last piece marks it landed (ram_res = 1, after the bytes)
-//   CPU worker         AVX2 MUL1 kernels (ft_core.h) computing RAM-resident experts IN PLACE from their RAM slot
+//   CPU worker         the CPU-lane kernels (ft_n135.h, ft_core.h) computing RAM-resident experts in place in RAM
 //                      (native layout), slots pinned (refcount) for the job; persistent pool (no per-layer spin-up)
 //   stage engine       prefill: per forward, pins the RAM-resident experts, reads the NVMe-only ones ahead (FIFO ring,
 //                      bounded queue depth, several layers ahead) and H2Ds them into the VRAM staging buffers
@@ -24,7 +24,7 @@
 #include "ft_core.h"
 #include "ft_n135.h"
 #include "ft_x16.h"
-// N135 CPU-lane forward switch: NV_CPU_KERN=1 -> n135::moe_forward4 (ft_n135.h), default 0 -> ft_core moe_forward
+// CPU-lane kernel: NV_CPU_KERN=1 (default) is n135::moe_forward4 (ft_n135.h), 0 is ft_core's moe_forward
 static int g_cpu_kern = -1;
 static inline void cpu_kern_init()
 {
@@ -130,7 +130,7 @@ struct Reader
     void submit(int fd, int64_t off, int64_t dst, int64_t len, int64_t piece, int cls, DoneFn fn, void* ctx, int64_t tag, int key = -1,
                 PartFn part = nullptr, int64_t part_bytes = 0)
     {
-        if (!prio) cls = cls == RC_BULK ? RC_BULK : RC_DEMAND;   // legacy: demand and prefetch share one FIFO
+        if (!prio) cls = cls == RC_BULK ? RC_BULK : RC_DEMAND;   // NV_PRIO=0: demand and prefetch share one FIFO
         Track* tr = new Track; tr->fn = fn; tr->ctx = ctx; tr->tag = tag; tr->t0 = now_ms();
         if (part && part_bytes > 0 && (part_bytes + piece - 1) / piece <= 63)
         {
@@ -268,10 +268,10 @@ struct Pol
 {
     double g0 = 0.17, thit = 0.023, tzc = 0.38, ca = 0.145, cb = 0.165, ctok = 0.040, push = 0.40;
     double nvlat = 0.12, nvdeep = 0.395, nvone = 0.75;
-    double tnzc = 0.6;    // GPU cost of a zero-copy NVMe pick after landing, ms (NV_TNZC; < 0 = legacy model)
-    // streaming (NV_STREAM): CPU-lane time left for an NVMe->CPU pick after its last byte lands, ms (NV_CBT;
-    // < 0 = legacy model: the lane starts the pick at its arrival). The lane computes the bands as they land, so it is
-    // done at max(lane free + cb, arrival + cbt) instead of max(lane free, arrival) + cb
+    double tnzc = 0.6;    // GPU cost of a zero-copy NVMe pick after landing, ms (NV_TNZC; < 0: push + thit instead)
+    // streaming (NV_STREAM): CPU-lane time left for an NVMe->CPU pick after its last byte lands, ms (NV_CBT). The lane
+    // computes the bands as they land, so it is done at max(lane free + cb, arrival + cbt); < 0: the lane starts the
+    // pick at its arrival, max(lane free, arrival) + cb
     double cbt = -1;
     int cpu_on = 0, nvcpu_on = 0, maxcpu = 32, nv_noadmit = 0;
     // X16 lane (x16_init): MoE layers [0, x16_hi) put their CPU-lane picks on the bit-exact X16 path (RAM-resident
@@ -296,7 +296,7 @@ struct Counters
     std::atomic<long long> ring_borrowed{0};   // RAM slots lent to the prefill ring (cumulative)
     std::atomic<long long> stg_issued{0}, stg_ready{0}, stg_hit{0}, stg_late{0}, stg_nofree{0}, stg_dup{0}, stg_waste{0};
     std::atomic<long long> lane_skip{0}, lossy_calls{0}, lossy_tok{0}, lossy_tok_skip{0}, lossy_cold_x1e6{0},
-        lossy_skip_x1e6{0}, lossy_coldu{0}, lossy_want{0}, lossy_bg_reads{0};   // BCP
+        lossy_skip_x1e6{0}, lossy_coldu{0}, lossy_want{0}, lossy_bg_reads{0};   // lossy plan
 };
 
 struct Engine;
@@ -338,14 +338,14 @@ struct Engine
     std::vector<int32_t> freel_c[NSC];
     std::vector<int8_t> slot_cls, kcls;
     int64_t small_bytes = 0; int nslot_c[NSC] = { 0, 0 };
-    std::vector<int32_t> freel;   // unused (legacy diagnostics: size of class 0 + 1 lists is reported)
+    std::vector<int32_t> freel;   // unused
     std::vector<uint8_t> prot; std::vector<int32_t> protl;
-    // BCP lossy verify (NV_LOSSY=1 or ext().set_lossy; approximate, not lossless): see lossy_plan
+    // lossy verify plan (NV_LOSSY=1 or ext().set_lossy; approximate): see lossy_plan
     bool lossy_on = false; float lossy_eps = 0.0f, lossy_whi = 2.0f; int lossy_renorm = 0, lossy_pf = 0, lossy_bg = 0;
     int lossy_lo = 0, lossy_hi = 1 << 30;
-    int tail_r = 0, tail_scope = 0;   // Strata tail skip (patch_tail.py); tail_r 0 = off
+    int tail_r = 0, tail_scope = 0;   // tail skip (NV_TAIL, see lossy_tail_plan); tail_r 0 = off
     std::vector<uint8_t> lwant; std::vector<int16_t> luix;
-    std::vector<uint8_t> pfs; int pf_max = 4;   // prefetched and not yet demanded; NV_PF_MAX (4 = best measured)
+    std::vector<uint8_t> pfs; int pf_max = 4;   // pfs: prefetched and not yet demanded; pf_max: hints read per call (NV_PF_MAX)
     int pf_multi = 2;                           // NV_PF_MULTI: prefetch hints per token of a verify window
     std::vector<float> score;
     std::mutex mu; std::condition_variable land_cv;
@@ -816,7 +816,7 @@ struct Engine
         }
     }
 
-    // ---------------- plan_layer (moetier semantics) ----------------
+    // ---------------- plan_layer ----------------
     struct PK { int u, key, cnt; double arr; float sc; };
     std::vector<PK> V, Rm, N;
     bool lossy_cold(const Req& r, int u) const
@@ -824,7 +824,7 @@ struct Engine
         const int key = r.key[u];
         return r.cls[u] != LN_VRAM && kst[key] == KS_NONE;
     }
-    // BCP: per token, cold picks sorted by weight; fetch largest-first while the token's remaining cold mass > eps
+    // lossy plan: per token, cold picks sorted by weight; fetch largest-first while the token's remaining cold mass > eps
     // (fraction of its routed mass) or the pick's own fraction >= whi. The union over tokens is what gets read, so a
     // cold expert fetched for one token is exact for every token that picked it.
     void lossy_plan(const Req& r, Rep& p)
@@ -885,7 +885,7 @@ struct Engine
         for (int u = 0; u < r.nu; ++u) nw += lwant[u];
         C.lossy_coldu += ncu; C.lossy_want += nw; C.lossy_calls++;
     }
-    // Strata tail skip (set_tail / NV_TAIL): a pick is skipped only when every token of the call routes it at
+    // tail skip (set_tail / NV_TAIL): a pick is skipped only when every token of the call routes it at
     // rank >= tail_r of its top-k (rank by routing weight, 0 = best); scope 1 also covers RAM-tier picks. No renormalisation.
     void lossy_tail_plan(const Req& r, Rep& p)
     {
@@ -1036,7 +1036,7 @@ struct Engine
             // cold: zero-copy, keep VRAM. A verify window admits NVMe picks shared by several of its tokens instead (the
             // fused decode kernel reads a zero-copy expert once per token that picked it)
             const bool nzc = dec && pol.nv_noadmit && (r.ntok == 1 || k.cnt == 1);
-            // GPU cost after landing: zero-copy in the MoE kernel (tnzc, NV_TNZC; < 0: legacy push + thit model)
+            // GPU cost after landing: zero-copy in the MoE kernel (tnzc, NV_TNZC; < 0: push + thit)
             const double ge = (nzc && pol.tnzc >= 0) ? std::max(g, a) + pol.tnzc : std::max(g, a + pol.push) + pol.thit;
             if (cpu && pol.nvcpu_on && !x16l && ncpu < pol.maxcpu && std::max(ce, g) <= std::max(c, ge)) { c = ce; p.lane[k.u] = LN_NVC; ncpu++; cur_ncn++; C.lane_nvc++; }
             else if (nzc) { g = pol.tnzc >= 0 ? ge : std::max(g, a) + pol.tzc; p.lane[k.u] = LN_NZC; C.lane_nvg++; }
@@ -1340,7 +1340,7 @@ struct Engine
         bool any1 = false; for (auto& v : r1) any1 |= !v.empty();
         if (g_cpu_kern == 1 && n135::K_.merge && any2)
         {
-            // N135: ONE forward over the RAM and the NVMe->CPU picks; an NVC job is bound (waits for its landing) by the
+            // one forward over the RAM and the NVMe->CPU picks; an NVC job is bound (waits for its landing) by the
             // first worker that reaches it, after every resident job's units
             std::vector<uint8_t> late(E, 0);
             for (int k = 0; k < np; ++k) if (cj.lane[k] == LN_NVC) { late[cj.e[k]] = 1; r1[cj.t[k]].push_back({ cj.e[k], cj.w[k] }); }
@@ -1698,9 +1698,8 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
     e.exclusive = exclusive != 0; e.land_target = int(land_target); e.free_lo = int(free_lo);
     e.ctl_cpu = int(ctl_cpu);
     {
-        // the controller waits with MWAITX by default where the CPU has it (20000 timer cycles ~ 2.3 us on the 7600X): with
-        // the main thread sleeping on the token event too, core 0 idles and the lane cores clock 4.8 instead of 4.34 GHz.
-        // The CPU lane's own waits stay PAUSE spins by default (MWAITX there measured no further clock gain)
+        // the controller waits with MWAITX where the CPU has it (NV_CTL_MWX timer cycles): an idle core leaves the shared
+        // power budget to the CPU lane's cores. The CPU lane's own waits are PAUSE spins unless NV_LANE_MWX is set
         const bool mx = mwaitx_ok();
         const char* v = penv("NV_CTL_MWX");
         e.ctl_mwx = mx ? unsigned(v && *v ? std::max(0, atoi(v)) : 20000) : 0;

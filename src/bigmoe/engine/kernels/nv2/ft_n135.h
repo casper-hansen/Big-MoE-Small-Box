@@ -1,6 +1,7 @@
-// N135: GLM-5.3-Flash CPU-tier forward v4 (AVX2, EXL3 mul1 K=3 trellis, NATIVE RAM-slot layout, ft_core.h codebook).
+// CPU-lane forward (the default kernel, NV_CPU_KERN=1): EXL3 mul1 trellis experts computed in place in their RAM slot
+// (native layout, ft_core.h codebook); AVX2 decodes K 3, AVX-512 VBMI decodes K 2, 2.5 and 3.
 //
-// What changes against ft_core.h moe_forward (kept as the default; this is opt-in):
+// Differences from ft_core.h's moe_forward:
 //  1. one pool.run per layer call: a dataflow unit queue (prep -> gate/up -> act -> down -> out) with per-job
 //     completion counters instead of 4 global barriers, so one job's tail overlaps the next stage of earlier jobs;
 //  2. GEMV units are rectangles (R tile rows x C tiles) of ONE matrix: R = K gives ft_core's block unit (no partial
@@ -25,7 +26,7 @@ namespace n135 {
 // ------------------------------------------------------------------------------------------
 struct Knobs
 {
-    // defaults (batch B, 2026-10-09): p16 kernel; full-row bands only when every job of the call has 1 token (m = 1),
+    // defaults: p16 kernel; full-row bands only when every job of the call has 1 token (m = 1),
     // ft_core-shaped block units otherwise (bands keep C * 64 * m accumulators live and lose at m >= 2)
     int kern = 1;        // I16 kernel: 0 = ft_core math (int32 dup activations; rt2 when rt = 1), 1 = p16
     int rg = 32;         // gate/up unit rows (tile rows); 0 = all (ft_core's block unit)
@@ -39,8 +40,7 @@ struct Knobs
     int merge = 1;       // engine: 1 = RAM and NVMe->CPU picks of a job in ONE forward (late-bound NVC jobs)
     int bandmaxm = 1;    // use the rg/cg/rd/cd band shapes only when the call's max tokens per job <= bandmaxm
     int rt = 0;          // 1: I16 units keep a tile's accumulators in registers over each 8-row scale block (rt2; p16: m = 1 only).
-                         // p16 ignores it when the VBMI decode is on (rt = 1 used to select the AVX2 register path
-                         // there: 0.345-0.373 ms per expert in place vs 0.317 with VBMI)
+                         // p16 ignores it when the VBMI decode is on
 };
 inline Knobs K_;
 

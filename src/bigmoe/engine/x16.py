@@ -1,17 +1,15 @@
 """X16 lane: CPU-computed experts that are bit-identical to the GPU's (mode nvme, NV_X16_HI leading MoE layers).
 
-The ordinary CPU lane (int16 activations, fp32 sums) gets within ~1e-3 of the GPU's expert outputs, which is as close as
-the GPU is to fp64 but not equal. Some models amplify any change of their early MoE layers' outputs into a different
-token distribution downstream (GLM-5.3-Flash: relative noise of 1e-6 in its first 21 MoE layers already drops top-1
-agreement with exact decode from ~99.3 % to ~97 %); for those layers the X16 lane computes the CPU's experts bit-exactly:
-  CPU   gate / up GEMVs with rect_x16 (nv2/ft_x16.h: the tensor-core MMA's fp16-accumulator rounding, measured on the
-        GPU, and the kernel's fold / warp summation order) -> fp16 rows; after the GPU's activation epilogue, the down
-        GEMVs -> fp32 rows (host-mapped buffers)
+The ordinary CPU lane is close to the GPU's expert outputs but not equal, and some models (GLM-5.3-Flash) amplify
+any change in their early MoE layers. In those layers the X16 lane computes the CPU's experts bit-exactly:
+  CPU   gate / up GEMVs with rect_x16 (nv2/ft_x16.h: the tensor-core MMA's fp16-accumulator rounding and the kernel's
+        fold / warp summation order) -> fp16 rows; after the GPU's activation epilogue, the down GEMVs -> fp32 rows
+        (host-mapped buffers)
   GPU   x16_epa: exllamav3's kernel-A epilogue on those rows; x16_red: kernel B's token reduction over every slot (the
         GPU's own down outputs and the CPU's) -> the layer output the full GPU kernel would have produced
-Every start self-tests one layer (nv2.NV.x16_selftest) and leaves the lane off unless it is bit-identical. The cost: an
-X16 expert takes ~4x the CPU time of the ordinary lane, so the CPU absorbs less of those layers' PCIe traffic.
-This module builds / loads the device half (kernels/x16/x16_dev.cu) with exllamav3's nvcc flags.
+Every start self-tests each X16 layer (nv2.NV.x16_selftest) and leaves the lane off unless it is bit-identical. An X16
+expert costs several times the CPU time of an ordinary one. This module builds / loads the device half
+(kernels/x16/x16_dev.cu) with exllamav3's nvcc flags. Details: docs/x16.md.
 """
 import os
 

@@ -1,48 +1,36 @@
-"""nv2: RAM tier, NVMe reads, planner and CPU lane of the shared engine (exact mode: every pick on the GPU path with a
-device-side stall; mode nvme: + CPU lane on RAM-resident / streamed experts). Builds on tiers.py's loader (expert
-trellis -> one VRAM bounce slot, nothing read) and VRAM CLOCK pool. Knobs below are <prefix>NAME (env.py).
+"""nv2: the RAM tier, NVMe reads, the planner hand-off and the CPU lane, on top of tiers.py's loader and VRAM pool.
 
-Per MoE layer call with <= EC_STAGE_MIN picks (decode, small forwards), no host sync:
-  nv_pub   device publishes the layer's unique picks (+ the MoE input rows for a CPU job) to a mapped request ring
-  host     controller thread (nv2_host.cpp) drains the device's write-back / admission logs, runs plan_layer (moetier
-           semantics: lanes gpu | zerocopy (= GPU-admitted RAM expert) | cpu | nvme->gpu | nvme->cpu, greedy min-max,
-           NVMe misses stall = exact), starts O_DIRECT reads into fresh RAM slots, replies with the lanes, hands the
-           CPU job to the persistent CPU worker
-  nv_step  device waits for the reply (bounded), masks CPU-lane picks (id -1, weight 0), CLOCK admission of GPU-lane
-           misses; VRAM victims get a fresh RAM landing slot (exclusive RAM tier), admissions are logged
-  nv_copy  gathers admitted experts: RAM sources first, NVMe sources once their landed flag is up (per key, set by
-           the host after the read completes); victim bytes go to the landing slot in the same pass
-  MoE      exllamav3's kernels, unchanged, on the live pointer tables
-  combine  waits for the CPU job (bounded), adds its fp32 partial
-Prefill (>= stage_min picks): staging buffers filled on the copy stream from RAM slots (pinned for the forward) and,
-for NVMe-only experts, from a pinned FIFO ring that a reader fills several layers ahead (NV_PF_RING slots).
-Env: NV_RAM_GB (auto), NV_MARGIN_GB (1), NV_THREADS (16 readers), NV_PIECE_KB (2304),
-     NV_PF_RING (128), NV_PF_QD (24), NV_EXCL (1), NV_ELASTIC_WB (1), NV_LAND (64),
-     NV_FREE_LO (96), NV_CPU (0: S2; 1: S3 CPU tier), NV_NVCPU (0), NV_CPU_CPUS (2-23),
-     NV_CPU_MODE (-1 auto), NV_CLAMP (1: swiglu clamp on the CPU share, B004 fix), NV_POL (cost model
-     "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone"), NV_MAXCPU (32), NV_CTL_CPU (25),
-     NV_READER_CPUS (26-39), NV_TIMEOUT_S (20), NV_COPY_GRID (48)
-2026-10-20 (nv2_host.cpp): NV_TNZC (0.6 ms: GPU cost of a zero-copy NVMe pick after landing; < 0 legacy model),
-     NV_PARTIAL (1: an NVMe->CPU job binds at gate+up landing, down units wait), NV_PRIO (1: reader classes
-     demand > prefetch > bulk), NV_HI_MB (12) / NV_LO_MB (6) in-flight caps, NV_PF_LIFO (1),
-     NV_DPIECE_KB (512: decode read pieces), NV_WB_EARLY (1: write-backs drained at nv_copy completion),
-     NV_PF_MULTI (2 prefetch hints per verify-window token), NV_RZC1 (1: verify windows do not admit RAM picks
-     of one token), NV_STG / NV_STG_MAX (0 / 3: layer-ahead DMA staging pool, experimental, off) with
-     NV_STG_GATE (2: DMA after the copy kernel unless the MoE reads zero-copy, then after the MoE kernel),
-     NV_PF_RING_BORROW (1: the prefill ring borrows RAM-tier slots during a staged prefill).
-     NV_SLRU (0: the RAM tier evicts its least recently used expert; N: segmented, N % of the slots are for experts
-     used again after they landed, and the ones that only landed go first. DeepSeek in mode nvme sets 80).
-     Round 3: NV_STREAM (1: an NVMe->CPU pick is bound when its read starts and each gate / up / down band of the
-     CPU lane waits only for the read pieces that hold it), NV_TRACK_QD (0: pieces of one decode read in flight,
-     uncapped), NV_CBT (planner: CPU time left for a streamed NVMe->CPU pick after its last byte lands, ms; < 0
-     legacy), NV_CTL_MWX (20000) / NV_LANE_MWX (0): MWAITX timer cycles for the controller's / CPU lane's waits
-     on AMD (0 = PAUSE spins). timeline() also reports the CPU tail after the last landing of any NVMe pick and the
-     lane's time per RAM expert in layers without NVMe picks.
-     Diagnostics: timeline() (per-layer breakdown in summary()), ext().trace_set / trace_take (routing trace)
-N137 B70 expert tier (needs the CPU tier, NV_CPU=1): B70 (0), B70_RING (/run/local-ai/shared/b70.ring,
-     created by b70tier/b70srv.py on the B70), B70_N (3000 experts), B70_ORDER (score: warm-score order after the VRAM warm
-     set | rr: the RAM tier's round-robin rank), B70_TIMEOUT_S (2). Decode picks of B70-resident experts are masked
-     on the 3090 and computed on the B70; their RAM copies are dropped (exclusive) and RAM refills with colder experts.
+A MoE layer call with fewer than EC_STAGE_MIN picks (decode, small forwards) runs without a host sync:
+  nv_pub   the GPU publishes the layer's unique picks (and the input rows, for a CPU job) to a mapped request ring
+  host     the controller thread (kernels/nv2/nv2_host.cpp) plans every pick into a lane: VRAM hit, copy in from RAM,
+           zero-copy from RAM, NVMe read then GPU, NVMe read then CPU, CPU lane; it starts the reads, replies, and
+           hands the CPU job to the CPU worker
+  nv_step  the GPU waits for the reply, masks the CPU lane's picks (id -1, weight 0) and admits GPU-lane misses to the
+           CLOCK cache; a VRAM victim gets a RAM landing slot (the RAM tier is exclusive of VRAM)
+  nv_copy  copies the admitted experts in, from RAM at once and from NVMe once each read has landed
+  MoE      exllamav3's kernels on the live pointer tables
+  combine  waits for the CPU job and adds its fp32 partial sum
+A staged forward (prefill) instead fills the pool's staging buffers from RAM slots, pinned for the forward, and from a
+ring of RAM slots that a reader fills with the NVMe-only experts several layers ahead.
+
+Variables read here (<prefix>NAME, env.py), with their defaults:
+  NV_STORE            the store's .bin (required)
+  NV_CPU (0)          CPU lane; NV_CPU_CPUS (2-23) its CPUs
+  NV_RAM_GB (auto)    RAM tier size; auto: what the cgroup leaves, less NV_MARGIN_GB (1) and exllamav3's host caches
+  NV_RAMCLS (1)       a second RAM slot class for layers with smaller experts
+  NV_EXCL (1)         RAM tier exclusive of VRAM (victims written back); NV_ELASTIC_WB (1) also for lent chunks
+  NV_VRING (32)       VRAM ring that parks victims for their write-back
+  NV_PREFETCH (0)     prefetch the next layer's guessed picks; NV_PFSIDE (0) guess on a side stream
+  NV_PF_RING (128)    prefill ring slots; NV_PF_RING_BORROW (1) borrow them from the RAM tier during a prefill
+  NV_THREADS (16), NV_READER_CPUS (26-39), NV_PIECE_KB (2304)   NVMe readers, their CPUs, read piece size
+  NV_CTL_CPU (25)     the controller thread's CPU
+  NV_POL              planner cost model "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone", ms (Pol in nv2_host.cpp)
+  NV_STG (0), NV_STG_MAX (3)   layer-ahead VRAM staging pool (off)
+  NV_SLRU (0)         RAM tier: percent of slots kept for reused experts (segmented LRU); 0 is plain LRU
+  NV_X16_HI (0), NV_X16_COST (550)   X16 lane layers and planner cost (x16.py)
+  EC_WARM             per-expert scores that order the initial fill and break planner ties
+The host engine reads further tuning variables of its own (penv in kernels/nv2/nv2_host.cpp).
+Diagnostics: summary() (counters, latency(), timeline()), verify(), ext().trace_set / trace_take.
 """
 import collections, concurrent.futures as cf, ctypes, json, mmap, os, signal, threading, time
 import numpy as np
@@ -60,7 +48,7 @@ STAGE_QD = 24                # NVMe queue depth of the prefill ring's read-ahead
 MAX_CPU_PICKS = 32           # CPU-lane picks per layer call, at most
 _EXT = None
 NV = None
-VERIFY = [False]   # BCP: set by the server around generator verify forwards (lossy-policy eligible)
+VERIFY = [False]   # GLM: set by the executor around multi-token forwards, whose layer calls are verify steps
 
 
 def _cpus(spec):
@@ -165,9 +153,8 @@ class Nv2:
         self.grid = COPY_GRID
         self.wb_on = g("NV_EXCL", "1") == "1"
         self.prefetch = g("NV_PREFETCH", "0") == "1"
-        # N136: the layer-ahead routing guess runs on a side stream concurrently with this layer's router (both read the
-        # same MoE input; 36-block GEMVs on an 82-SM card), instead of after it on the compute stream (NV_PFSIDE=1;
-        # single-row decode only, see predict_early)
+        # NV_PFSIDE: the next layer's routing guess runs on a side stream beside this layer's router (both read the same
+        # MoE input) instead of after it on the compute stream; single-row decode only, see predict_early
         self.pfside = self.prefetch and g("NV_PFSIDE", "0") == "1"
         self._pfe = None
         if self.pfside:
@@ -240,8 +227,8 @@ class Nv2:
         self.nram = nram
         self.pf = NT.HostArena(ring_own, self.slot, ring_own, dev_idx, "pfring")
         NT._log(f"nv2: RAM arena + prefill ring registered")
-        # VRAM victim ring (write-back source: nv_copy parks the victim's bytes here D2D, the host drains it D2H on a
-        # copy engine; SM stores to host memory run at ~4 GB/s vs 25 GB/s for the DMA engine)
+        # VRAM victim ring: nv_copy parks a victim's bytes here (D2D) and the host drains it to RAM on a copy engine,
+        # which writes host memory much faster than SM stores do
         nvr = int(g("NV_VRING", "32")) if self.wb_on else 0
         self.vring = torch.empty((max(nvr, 1), self.slot), dtype=torch.uint8, device=self.dev) if nvr else None
         self.vring_addr = [self.vring[i].data_ptr() for i in range(nvr)] if nvr else []
@@ -461,10 +448,10 @@ class Nv2:
         return lp[li]
 
     def predict_early(self, li, z, bsz):
-        """N136: launch layer li+1's routing guess on the side stream before layer li's router runs (decode only)."""
+        """Launch layer li+1's routing guess on the side stream before layer li's router runs (decode only)."""
         # bsz 1 only: for more rows exllamav3's routing projection is routing_gemm_det, whose decode-class calls share
-        # per-device static workspaces, so a concurrent guess on the side stream would corrupt the layer's own routing
-        # (N136 AB1: C4 streams looped). The single-row GEMV path has no shared scratch.
+        # per-device static workspaces, so a concurrent guess on the side stream would corrupt the layer's own routing.
+        # The single-row GEMV path has no shared scratch.
         if not self.pfside or li + 1 >= self.L or bsz != 1:
             return
         main = torch.cuda.current_stream(self.dev)
@@ -775,8 +762,8 @@ class Nv2:
 
     # ---- checks / stats -----------------------------------------------------------------------------------------
     def verify(self, n=64, seed=0):
-        """I1: sampled VRAM slots and RAM slots byte-compared against fresh O_DIRECT store reads; pointer tables, homes,
-        landed flags consistent with the host's residency."""
+        """Sampled VRAM and RAM slots byte-compared against fresh O_DIRECT store reads; pointer tables, homes and
+        landed flags checked against the host's residency."""
         import random
         p = self.pool
         torch.cuda.synchronize(self.dev)

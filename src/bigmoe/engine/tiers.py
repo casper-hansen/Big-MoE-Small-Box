@@ -1,21 +1,19 @@
-"""Expert tiers: store manifest, loader patch, VRAM pool, attach (with nv2.py: RAM tier, NVMe, planner, CPU lane).
+"""Expert tiers: the store manifest, the loader patch, the VRAM pool and attach (nv2.py adds RAM, NVMe and the planner).
 
-  loader   install() before model load: the routed experts' trellis tensors become views of a VRAM bounce slot (the
-           checkpoint bytes are never read; the store has them) and the fused path's gu pointer table is captured
-  Pool     ONE CLOCK cache over every routed layer in the free VRAM. Slots are uniform (the largest layer's expert); an
-           expert of layer li fills its slot in li's compact layout (gate | up @ off_u | down @ off_d = the store
-           record image), so per-layer kernel calls pass geom(li). Prefill chunks stage every non-VRAM expert of the
-           next layer into two VRAM buffers on a copy stream; in elastic mode those buffers (and the activations) come
-           from the last chunks of the cache, which are handed back to torch for the prefill and reclaimed for decode.
-           In mode nvme with EC_WARM_PREFILL=1 (the DeepSeek backend) a staged forward stages the warm experts plus the
-           cold ones its routing uses (warm_prefill.py).
-  attach   pool + nv2 + routing / combine hooks + bounce proxies for exllamav3's per-expert paths
+  loader   install(), before the model loads: the routed experts' trellis tensors become views of one VRAM bounce slot
+           (the checkpoint's expert bytes are never read) and the fused path's gate | up pointer table is captured
+  Pool     one CLOCK cache over every routed layer in the free VRAM. Slots are uniform (the largest layer's expert);
+           an expert of layer li fills its slot in li's layout (gate | up @ off_u | down @ off_d, the store record's
+           image), so kernel calls pass geom(li). A staged forward copies the next layer's non-VRAM experts into one
+           of two staging buffers on a copy stream; with EC_ELASTIC_GB those buffers and the activations come from the
+           cache's last chunks, handed back to torch for the prefill and reclaimed for decode. With EC_WARM_PREFILL
+           a staged forward stages only what its routing uses (warm_prefill.py).
+  attach   the pool, nv2, the routing / combine hooks, and bounce proxies for exllamav3's per-expert paths
 
-Knobs (<prefix>NAME, see env.py): NV_STORE (store .bin), EC_RESERVE_GB (VRAM left to torch, 2.5), EC_MAX_SLOTS,
-EC_ADMIT_MAX (64), EC_CHUNK_SLOTS (32), EC_STAGE_SLOTS / EC_STAGE_GB (staging buffer size; 0 = no staged prefill),
-EC_STAGE_MIN (picks per layer call that stage, 8192), EC_ELASTIC_GB (0 = off), EC_ELASTIC_DYN (1),
-EC_ACT_MB_PER_TOK (0.6), EC_COPY_GRID, EC_WARM (JSON {layer key: [score x E]}), EC_WARM_PREFILL (0; set by the DeepSeek
-backend in mode nvme).
+Variables (<prefix>NAME, env.py): NV_STORE (the store's .bin), EC_RESERVE_GB (VRAM left to torch, 2.5),
+EC_STAGE_SLOTS or EC_STAGE_GB (staging buffer size; 0: no staged prefill), EC_STAGE_MIN (picks per layer call that
+stage, 8192), EC_ELASTIC_GB (VRAM lent to a prefill, 0), EC_WARM (JSON {layer key: [score per expert]}),
+EC_WARM_PREFILL (0).
 """
 import ctypes
 import gc

@@ -2,8 +2,8 @@
 // geometry, ksplit 1, mul1 codebook), for the X16 lane (engine/x16.py): CPU-computed experts whose gate / up / down
 // GEMV outputs are bit-identical to the GPU kernel's.
 //
-// Semantics of mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 (measured on an RTX 3090, 100 % of 2.5M outputs over
-// six input distributions): every k8 half-step turns the fp16 accumulator c into
+// Semantics of mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 on Ampere (determined on an RTX 3090; the start-up
+// self-test checks them): every k8 half-step turns the fp16 accumulator c into
 //     RN16( sum_i trunc0(t_i, 2^(emax - 24)) ),   t = { c, x_k * w_k for the 8 rows k },
 //     emax = max( e(c), e(x_k) + e(w_k) )
 // where e is the input's exponent (floor(log2 |v|), fp16 subnormals -14, zero terms excluded): each term is truncated

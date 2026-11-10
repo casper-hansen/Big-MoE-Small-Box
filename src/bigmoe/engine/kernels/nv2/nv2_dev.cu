@@ -1,4 +1,4 @@
-// N119 nv2 device side. Per MoE layer call (decode / small forwards), all on the compute stream, no host sync:
+// nv2 device side. Per MoE layer call (decode / small forwards), all on the compute stream, no host sync:
 //   nv_pub   (1 block)  dedup the picks, classify VRAM / not, publish a request (+ x rows for a CPU job) to mapped memory
 //   nv_step  (1 block)  wait for the host's reply (plan_layer lanes), mask the CPU-lane picks out of the GPU selection,
 //                       then the expert-cache CLOCK step on the GPU lane: VRAM victims get a fresh RAM landing slot
@@ -94,7 +94,7 @@ __global__ void nv_pub_k(const int64_t* __restrict__ sel, const __half* __restri
     }
 }
 
-// N136: nv_pub_k with the two serial thread-0 scans over E (unique-expert positions, prefetch-hint keys) replaced by
+// NV_PUBFAST: nv_pub_k with the two serial thread-0 scans over E (unique-expert positions, prefetch-hint keys) replaced by
 // warp-ballot compactions (same ascending order, same MAXP cap), the ack wait overlapped with the counting, and the
 // x-row copy issued before the request words. Same request contents bit for bit; 320 threads = 10 warps >= E / 32.
 constexpr int PUBF_T = 320;

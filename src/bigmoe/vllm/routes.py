@@ -21,10 +21,9 @@ SSE_KEEPALIVE = b": keepalive\n\n"
 
 
 class KeepaliveMiddleware:
-    """An SSE comment on a streaming response that has been silent for KEEPALIVE_S (queued behind other requests, a
-    long prefill): Node's fetch (undici) drops a response body that is silent for 300 s ("terminated") and agent
-    clients retried the whole request. Clients' idle watchdogs see events, not comments, so they still catch a server
-    that has really stopped. Pure ASGI: only text/event-stream responses are touched."""
+    """An SSE comment on a streaming response that has been silent for KEEPALIVE_S (queued, or in a long prefill):
+    HTTP clients drop a response body that stays silent too long. Clients' idle watchdogs see events, not comments,
+    so they still catch a server that has stopped. Pure ASGI: only text/event-stream responses are touched."""
 
     def __init__(self, app, interval: float = KEEPALIVE_S):
         self.app, self.interval = app, interval

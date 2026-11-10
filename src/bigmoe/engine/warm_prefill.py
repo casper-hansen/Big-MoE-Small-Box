@@ -1,27 +1,20 @@
 """Warm prefill (DeepSeek-V4.1, mode nvme): a staged forward reads from NVMe only the experts its routing uses.
 
-A staged forward (a prefill chunk, >= EC_STAGE_MIN picks per layer) used to stage every expert of every layer, which
-reads every NVMe-only expert once: ~15 s per forward on a 3090 box whatever the chunk's length, the floor of every
-agent step that adds a tool result. Here the forward starts from the warm set (VRAM-resident and RAM-tier experts at
-its start). Once a layer's routing is known, its cold (NVMe-only) experts are ranked by the routing weight the chunk
-gives them and read from the store in parallel into free slots of the layer's staging buffer:
+A staged forward starts from the warm set: the experts in VRAM or the RAM tier when it begins. Once a layer's routing is
+known, its cold (NVMe-only) experts are ranked by the routing weight the forward gives them and read from the store in
+parallel into free slots of the layer's staging buffer:
 
-  short forwards (at most EXACT_ROWS = 1,024 rows: an agent step's tool result, a long prompt's last chunk) read every
-      cold expert their routing touches and drop nothing. 100-1,000 rows route 75-165 of the ~250 NVMe-only experts per
-      layer, so the MoE runs the same experts on the same bytes as staging all of them: bit-identical logits, in 5-12 s
-      instead of 15-20 s on a cached 8k prefix.
-  longer forwards read the FETCH_PER_LAYER = 64 heaviest; the picks of the remaining cold experts are dropped
-      (sentinel id, weight 0) and each token's weights are rescaled to their original sum.
+  forwards of at most EXACT_ROWS rows read every cold expert their routing touches and drop nothing, so the MoE runs
+      the same experts on the same bytes as staging all of them: the logits are identical.
+  longer forwards read the FETCH_PER_LAYER heaviest; the picks of the other cold experts are dropped (sentinel id,
+      weight 0) and each token's weights are rescaled to their original sum.
 
-Read-ahead (longer forwards): a layer's reads would otherwise stall the GPU before its MoE. While layer i computes,
-layer i+1's cold experts are guessed with its own router on layer i's router input (exact for DeepSeek's hash-routed
-layers, which route by token id) and read on a background thread into that layer's staging buffer, most likely first.
-Once layer i+1's true routing is known the job is retargeted: guesses it has not read yet are dropped and the true
-experts it has not read are queued, so wasted reads are only those done before the routing was known. The experts used
-are the same top FETCH_PER_LAYER as without read-ahead, so the forward's result is unchanged.
+Read-ahead (longer forwards): while layer i computes, layer i+1's cold experts are guessed with its own router on layer
+i's router input and read on a background thread, most likely first. Once layer i+1's routing is known the job is
+retargeted: guesses not yet read are dropped and the true experts not yet read are queued. The experts used are the
+same as without read-ahead, so the result is unchanged.
 
-Decode is unchanged. Mode nvme-exact, and GLM-5.3-Flash (whose answers react more to approximate prefill), stage every
-expert. Measurements: docs/vllm.md ("Exact short prefills", "Tail checkpoints", "Warm-prefill read-ahead").
+Decode is unchanged. Mode nvme-exact and GLM-5.3-Flash stage every expert.
 """
 import concurrent.futures as cf
 import threading
@@ -30,7 +23,7 @@ import time
 import numpy as np
 import torch
 
-FETCH_PER_LAYER = 64      # cold experts read per layer of a longer staged forward (64 of 384: ~7 % of the weight left)
+FETCH_PER_LAYER = 64      # cold experts read per layer of a longer staged forward
 EXACT_ROWS = 1024         # staged forwards of at most this many rows read every routed cold expert (exact)
 READERS = 16              # parallel store reads (the NVMe needs a deep queue for its full bandwidth)
 BATCH = 16                # experts per read batch; two batches of pinned slots alternate (read one, copy the other)

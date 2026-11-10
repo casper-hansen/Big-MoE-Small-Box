@@ -1,6 +1,6 @@
 """Quality of resuming from a recurrent checkpoint taken while decoding: an agent's next turn extends its previous
-answer, and with a short checkpoint interval (the backends' rc_interval option) its prefill resumes from a page
-boundary inside that answer instead of recomputing it. The resumed state comes from single-token decode forwards, a
+answer, and with checkpoints every 256 decoded tokens (DeepSeek, mode nvme) its prefill resumes from a page boundary
+inside that answer instead of recomputing it. The resumed state comes from single-token decode forwards, a
 full prefill computes it in chunks, so the two differ in fp16 rounding.
 
 On token ids (/generate, no chat template): turn 1 = a prompt, greedy for --answer tokens (the server stashes

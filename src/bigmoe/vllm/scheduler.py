@@ -1,26 +1,15 @@
-"""vLLM's scheduler over the exllamav3 executor (engine.py).
+"""vLLM's scheduler over the exllamav3 executor (engine.py). vLLM makes every scheduling decision; three adapters
+connect it to the engine:
 
-vLLM's own Scheduler makes every scheduling decision: which waiting requests are admitted and in what order (FCFS or
-priority, max_num_seqs), how the step's token budget is split between decodes and prefill chunks (chunked prefill,
-max_num_batched_tokens, long_prefill_token_threshold), which draft tokens are verified, when a request is preempted,
-when it stops. Three adapters connect it to the engine:
+- BoxKVCacheManager replaces vLLM's K/V block manager. get_computed_blocks reserves the request's pages in the engine
+  and returns the prompt tokens the prefix cache saves; allocate_slots fails when the engine has no free pages (the
+  request waits, or vLLM preempts); free returns the pages.
+- _reserve_prefill_lookahead, the last word on a chunk's size in both of vLLM's scheduling loops, shortens a prefill
+  chunk to where exllamav3 can end a forward (engine.plan_chunk), so the engine computes exactly what was scheduled.
+- update_from_output lets vLLM do its bookkeeping, then corrects each request's computed-token count where the engine's
+  differs (counted in /stats: scheduler.corrections), and finishes requests the engine ended on its own.
 
-- BoxKVCacheManager replaces vLLM's KV block manager (the stub models are attention-free, vLLM holds no K/V). The
-  K/V lives in exllamav3's page table, so that is what vLLM's capacity and prefix-cache questions are asked of:
-  get_computed_blocks reserves the request's pages in the engine and answers with the prompt tokens the prefix cache
-  (GPU pages, pinned-RAM and disk tiers, recurrent checkpoints) saves; allocate_slots fails when the engine has no
-  free pages (the request keeps waiting, or vLLM preempts the lowest-priority running request); free returns the
-  pages. vLLM's prefill stats and prefix-cache metrics (usage.prompt_tokens_details.cached_tokens) are its own.
-- _reserve_prefill_lookahead (the last word on a step's chunk size in both of vLLM's scheduling loops) shortens a
-  prefill chunk to where exllamav3 can end a forward (engine.plan_chunk): page boundaries, the max chunk, the
-  recurrent last-page split. The engine then computes exactly what was scheduled.
-- update_from_output lets vLLM do its own bookkeeping (stop checks, draft acceptance: num_computed_tokens -=
-  rejected), then checks each request's computed-token count against the engine's and corrects the rare difference
-  (counted by cause in /stats: scheduler.corrections). A request the engine ended on its own (the cache is full, a
-  failed job) is finished here with finish_reason "length" / "error".
-
-schedule() records each scheduled request's range (computed before the step, scheduled, sequence length) for the
-worker, which hands it to the engine.
+schedule() records each scheduled request's range for the worker.
 """
 from vllm.outputs import RequestError
 from vllm.v1.core.kv_cache_manager import KVCacheManager

@@ -1,25 +1,21 @@
-"""Last-page prefill split sized for staged prefill (exllamav3 generator/job.py, both backends).
+"""The last-page split of exllamav3's Job.prefill, and tail checkpoints (both backends, mode nvme).
 
-For models with recurrent state (GLM-5.3's GDN / KDA layers, DeepSeek-V4's SWA ring and compressor buffers), exllamav3
-ends a prompt's prefill on its last 256-token page boundary and runs the rest of the prompt (up to 255 tokens) as a
-separate forward, so the state can be checkpointed at that page for a follow-up that shares the prompt. Here a prefill
-forward costs nearly the same whatever its length once a layer call has EC_STAGE_MIN picks (it stages the experts), so
-a tail of more than EC_STAGE_MIN / experts_per_token tokens (63 for GLM, 85 for DeepSeek, at 512 picks) is a whole
-extra forward, while a shorter one runs on the per-pick path for a fraction of that.
+For models with recurrent state, exllamav3 ends a prompt's prefill on its last 256-token page boundary and runs the
+rest (up to 255 tokens) as a forward of its own, so that the state can be checkpointed at that page for a follow-up.
+A staged forward costs about the same whatever its length, so a tail long enough to stage (more than
+EC_STAGE_MIN / experts_per_token tokens: tail_limit) would be a whole extra forward. The split is kept only for shorter
+tails, which take the per-pick path; a longer tail stays in the prompt's last forward and a follow-up resumes from the
+last chunk-boundary checkpoint.
 
-The split is kept only for such short tails. A longer tail stays in the prompt's last forward: no extra forward now,
-and a follow-up resumes from the last chunk-boundary checkpoint instead. Applied by tiers.attach: Job.prefill is
-recompiled from its source with one condition added (the installed file is not modified); a source without the expected
-stock snippet is left alone with a warning.
+Tail checkpoints, for models whose recurrent state can be moved back by its cursor (DeepSeek-V4: rewindable()): no
+split at all. The prompt's last forward runs to its end, and the checkpoint at the last page boundary is stashed from
+the end state with every cursor moved back to the boundary (stash_tail). DeepSeek-V4's state is position-derived and
+keeps at least a page of history (the SWA ring, the compressor rings, the CSA overlap snapshots; exllamav3 rewinds
+drafts the same way), and the Engram layers carry only the last token ids, which are rebuilt for the boundary. The
+result is the checkpoint the split would have stashed, without its forward.
 
-Tail checkpoints (models whose recurrent state rewinds by cursor: DeepSeek-V4, rewindable()): no split at all. The prompt's last forward runs to
-its end, and the checkpoint at the last page boundary is stashed afterwards from the end state with its position moved
-back to the boundary. DeepSeek-V4's recurrent state is position-derived and keeps at least a page of history (the SWA
-ring, the compressor rings and the CSA overlap snapshots: exllamav3 rewinds them by moving the cursor, cache/dsa.py), and
-V4.1's Engram layers carry only the last token ids (no conv state), which are rebuilt for the boundary. The checkpoint
-is the one the split would have stashed (same position, same page), without the tail's forward of its own, which re-read
-from NVMe most of the experts the forward before it had just read (~3-4 s per agent step whose tail is 1-85 tokens, and
-a checkpoint that longer tails did not get at all).
+apply() recompiles Job.prefill from its source with the snippets below replaced (the installed file is not modified);
+a source without the expected snippets is left alone with a warning.
 """
 import ast
 import inspect

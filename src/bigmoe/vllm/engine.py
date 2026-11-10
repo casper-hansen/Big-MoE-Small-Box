@@ -1,38 +1,15 @@
 """The model executor behind vLLM's scheduler: exllamav3's model, paged K/V cache and prefix-cache tiers over the
-shared expert engine, driven one vLLM step at a time.
+expert engine, run one vLLM step at a time. exllamav3's own scheduling loop (Generator.iterate) is never called.
 
-vLLM decides; this module executes. exllamav3's own scheduling loop (Generator.iterate: its admission in
-iterate_start_jobs, its prefill rotation / cooldown / shared chunk, its draft-then-verify rounds) is never called.
-Instead:
+  reserve / ensure / release   BoxKVCacheManager's admission, slot allocation and frees: a request becomes an
+                               exllamav3 Job with its pages allocated and its cached prefix skipped
+  plan                         the largest part of vLLM's offered chunk that ends where exllamav3 can end a forward
+  execute                      exactly the scheduled step: prefill chunks, one batched sample / verify forward over the
+                               requests that reached their last token, then the drafter's next drafts (take_drafts)
 
-  admission     BoxKVCacheManager (scheduler.py) asks reserve() when vLLM's scheduler looks a waiting request up in its
-                prefix cache: the request becomes an exllamav3 Job whose pages are allocated (reviving cached prefix pages
-                from the GPU, pinned-RAM and disk tiers, and the recurrent checkpoint they need), and the cached prefix
-                is skipped right away. The number of prompt tokens skipped is vLLM's prefix-cache hit (its
-                num_computed_tokens, its usage.prompt_tokens_details.cached_tokens). No free pages: None, vLLM keeps the
-                request waiting (or preempts, for a running one that needs pages to continue, see ensure()).
-  chunking      vLLM's token budget and long-prefill threshold size every prefill chunk; plan() aligns a chunk's end to
-                where exllamav3 can end a forward (a 256-token page, the generator's max chunk, the recurrent last-page
-                split), so the engine computes exactly what vLLM scheduled.
-  a step        execute() runs, for the requests vLLM scheduled and only those: their prefill chunk (Job.prefill), then
-                one batched target forward for every request whose scheduled range reaches its last token
-                (Generator.iterate_gen over exactly that batch, verifying the draft tokens vLLM scheduled), then the
-                drafter (DSpark / MTP, a draft model, n-gram) for the next step's drafts, which go back to vLLM
-                (take_drafts -> Scheduler.update_draft_token_ids). vLLM schedules them as spec tokens and does the
-                acceptance accounting (num_computed_tokens -= rejected) and spec-decode metrics itself.
-
-  grammars      vLLM's structured outputs (response_format / JSON schemas, and the structural tags its tool parsers add
-                for strict tool calling) are vLLM's xgrammar state machines; each step's bitmask rows (one per
-                sampled position, drafts included) reach exllamav3's sampler through a Filter on the job
-                (grammar_filter), and vLLM advances and checks the state machine with the accepted tokens.
-
-The engine reports each scheduled request's position after the step (Progress); BoxScheduler compares it with vLLM's
-own count and only corrects (and counts, /stats "scheduler.corrections") where they differ: an out-of-memory retry, an
-exllamav3 requeue that is waiting for pages, a multimodal chunk boundary.
-
-Around a job: the EOS set, an out-of-memory failure before the first token
-re-run once with half-size prefill chunks, a per-request log line, draft statistics, idle disk flushes. Stdlib only at
-import time; torch and exllamav3 are imported in ExlEngine.load().
+execute reports each request's position after the step (Progress); BoxScheduler corrects vLLM's count where the two
+differ. vLLM's structured-output bitmask rows reach exllamav3's sampler through grammar_filter. Stdlib only at import
+time; torch and exllamav3 are imported in ExlEngine.load().
 """
 import argparse
 import dataclasses

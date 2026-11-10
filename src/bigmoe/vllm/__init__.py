@@ -1,22 +1,15 @@
-"""vLLM is the serving engine of both backends; exllamav3 over the shared expert engine is its model executor.
+"""vLLM serves; exllamav3 over the expert engine (bigmoe.engine) computes. Overview: docs/architecture.md.
 
-vLLM 0.33 cannot run either model's attention on sm86 (DeepSeek-V4.1's sparse-MLA backends are sm90/100/120 only,
-GLM-5.3's sparse indexer needs DeepGEMM) and has no EXL3 quantization, so vLLM runs everything except the forward
-passes and the K/V memory:
+  API server   vLLM's OpenAI / Anthropic server (rendering, tool and reasoning parsers, image preprocessing,
+               detokenization, stop strings) plus routes.py (/stats, /server_info, /generate, diagnostics)
+  EngineCore   vLLM's scheduler (BoxScheduler, scheduler.py) and one in-process worker (BoxWorker, worker.py) that runs
+               each scheduled step on exllamav3 (engine.py)
 
-  API server process   vLLM's OpenAI / Anthropic server (chat / completions / responses, tool + reasoning parsers, the
-                       model's renderer or chat template, multimodal input processing, detokenization, stop strings,
-                       metrics) plus this package's routes (routes.py: /stats, /server_info, /generate, KL tools)
-  EngineCore process   vLLM's scheduler (BoxScheduler: admission and preemption, chunked prefill and the token budget,
-                       draft-token scheduling and acceptance, stop checks, outputs) and one in-process worker (BoxWorker)
-                       that executes each scheduled step on exllamav3 (engine.py): prefill chunks, one batched
-                       sampling / verify forward, the drafter's next drafts.
+vLLM cannot run either model's attention on sm86 and has no EXL3 quantization, so the forwards and the K/V cache stay
+exllamav3's: the model classes vLLM sees are attention-free stubs (models.py), and BoxKVCacheManager answers vLLM's
+capacity and prefix-cache questions from exllamav3's page table.
 
-vLLM's KV block manager is replaced by BoxKVCacheManager (scheduler.py), which answers vLLM's capacity and
-prefix-cache questions from exllamav3's page table (GPU pages, the pinned-RAM and disk tiers, recurrent checkpoints).
-The stub model classes are attention-free (models.py), so vLLM allocates no K/V of its own.
-
-register() is the vllm.general_plugins entry point: vLLM calls it in every process it starts.
+register() is the vllm.general_plugins entry point; vLLM calls it in every process it starts.
 """
 
 ARCHS = {

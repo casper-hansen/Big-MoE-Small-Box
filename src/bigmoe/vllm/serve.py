@@ -1,15 +1,11 @@
 """Entry point of the servers: python -m bigmoe.vllm.serve --backend {dsv41,glm53} <engine args>.
 
-Takes the engine's command line (exllamav3's model_init arguments plus --host / --port / --served-name /
---max-batch-size), hands it to the worker through BIGMOE_EXL_ARGV and starts vLLM's OpenAI server with:
-
-  the stub architecture of the backend (models.py, hf_overrides), BoxWorker / BoxScheduler, one in-process worker,
-  max_model_len = the exllamav3 cache (-cs), max_num_seqs = --max-batch-size, vLLM's chunked-prefill token budget
-  (one prefill chunk of -chunk_size tokens per step beside every running decode and its draft tokens; a long prefill
-  is capped at one chunk while other requests run), a speculative config when the engine drafts (DSpark / MTP, a
-  draft model, n-gram: vLLM schedules and accounts the drafts the engine proposes; "ngram" is only the config's
-  method name, vLLM runs no proposer of its own), the backend's tool-call and reasoning parsers, the SSE keepalive
-  middleware and this package's extra routes (routes.py).
+Hands the engine's command line (exllamav3's model_init arguments plus --host / --port / --served-name /
+--max-batch-size) to the worker through BIGMOE_EXL_ARGV and starts vLLM's OpenAI server with the backend's stub
+architecture, BoxWorker and BoxScheduler, max_num_seqs from the engine's recurrent-state slots, a token budget of one
+prefill chunk beside every running decode and its drafts, a speculative config when the engine drafts (vLLM only
+schedules and accounts the drafts; "ngram" is just the method name it needs), the backend's parsers, the middlewares
+and the extra routes (routes.py).
 
 Extra vLLM arguments go after "--" (e.g. -- --enable-log-requests).
 """
@@ -54,12 +50,9 @@ def glm_template(text: str, images: bool) -> str:
     return text
 
 
-# DeepSeek-V4.1 writes a tool call after text as text + "\n\n" + the calls block; vLLM's parser returns the text with
-# that blank line as the message content, and the checkpoint's template puts its own "\n\n" before the calls block,
-# so the history rendered for the next request had four newlines where the model had generated two: other tokens
-# from there on, i.e. the prefix cache (and a turn checkpoint) ended at the start of every such call, and the model
-# saw, and started to copy, a spacing it had not written. The overlay template adds the blank line only when the
-# content does not already end with it, which renders exactly the generated tokens.
+# DeepSeek-V4.1's template always puts "\n\n" before a tool-call block, but the content vLLM's parser returns already
+# ends with the blank line the model wrote. The overlay adds it only when it is missing, so the history renders to the
+# tokens that were generated and the prefix cache (and a turn checkpoint) matches.
 DS_CALLS = '{{- "\\n\\n<" ~ DSML ~ " calls>\\n" ~ tcs.lines'
 DS_CALLS_EXACT = ('{{- ("" if content is string and content.endswith("\\n\\n") else "\\n\\n") ~ "<" ~ DSML ~ " calls>\\n" '
                   '~ tcs.lines')

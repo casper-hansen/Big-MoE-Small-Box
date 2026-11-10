@@ -1,9 +1,8 @@
 """Image input through vLLM: the stub models' multimodal processor (API server) and the worker side.
 
 API server (vLLM's chat parsing / media loading -> this processor):
-  each image is preprocessed with exllamav3's own preprocess() (resize / normalize / patchify, the reference
-  preprocessing; exllamav3 is imported on the first image only, ~0.1 GB) and its prompt placeholder is expanded to the
-  tokens the embedding will occupy:
+  each image is preprocessed with exllamav3's own preprocess() (resize / normalize / patchify; exllamav3 is imported on
+  the first image) and its prompt placeholder is expanded to the tokens the embedding will occupy:
     DeepSeek-V4.1  the template's <｜deepseek_image｜> -> 2 + h * (w + 1) positions, all embedding rows (the block's
                    start / newline / end markers are learned embeddings too)
     GLM-5.3        <|begin_of_image|><|image|><|end_of_image|> (the overlay template renders image blocks so,
@@ -12,8 +11,8 @@ API server (vLLM's chat parsing / media loading -> this processor):
 
 Executor (engine.ExlEngine.reserve, when vLLM admits the request -> embed()): the content hash keys the embedding
 cache (RAM, then disk; multimodal.Vision); a miss loads the tower, encodes and unloads it (VRAM lent by the expert
-cache when short). The placeholder positions are replaced by the embedding's ids (fixed per content hash for the process lifetime), so a resent image gives the same
-token ids and the prefix cache reuses the prompt through it.
+cache when short). The placeholder positions are replaced by the embedding's ids, fixed per content hash for the
+process lifetime, so a resent image gives the same token ids and the prefix cache reuses the prompt through it.
 """
 import threading
 from collections.abc import Mapping

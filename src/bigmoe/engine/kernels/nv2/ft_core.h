@@ -122,8 +122,8 @@ inline void permute_rows(const float* xt16, float* xp32)   // one tile row: 16 i
 }
 
 inline float silu(float g) { return g / (1.0f + std::exp(-g)); }
-// B004: swiglu clamp with exllamav3 act_gate semantics (exl3_moe_coop_kernel.cuh: u clamped to [-limit, limit],
-// silu(g) clamped from above). GLM-5.3-Flash has swiglu_limit 10; 0 = off (pre-B004 behaviour). Set by tier_set_limit.
+// swiglu clamp with exllamav3's act_gate semantics (exl3_moe_coop_kernel.cuh: u clamped to [-limit, limit], silu(g)
+// clamped from above); GLM-5.3-Flash has swiglu_limit 10, 0 = off. Set by tier_set_limit.
 inline float g_act_limit = 0.0f;
 inline float act_gu(float g, float u)
 {
@@ -423,7 +423,7 @@ inline float quant_block_i16(const float* xt, int32_t* xq_blk /* 8 tile rows x 3
 
 // AMD MONITORX / MWAITX waits (user mode): with g_mwx > 0 (NV_LANE_MWX timer cycles) the CPU lane's spin-waits
 // sleep in C1 until the watched line is written (~0.1-0.4 us) or the timer expires, instead of spinning on PAUSE: the
-// lane cores share one voltage rail and power budget with each other, so waiting cores no longer cost the busy ones clock
+// lane cores share one power budget, so a sleeping core leaves more clock to the busy ones
 inline unsigned g_mwx = 0;
 __attribute__((target("mwaitx"))) inline void mwx_while_eq64(const void* p, uint64_t v)
 {

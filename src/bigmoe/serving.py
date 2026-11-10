@@ -1,13 +1,11 @@
-"""What the vLLM servers (bigmoe/vllm) share around the exllamav3 executor: OpenAI-style errors, the context rule,
-timings and a log line per request, the prefix-cache tiers, and out-of-GPU-memory cleanup. Stdlib only at import time,
-so it is testable without the GPU stack.
+"""What the servers share around the exllamav3 executor: OpenAI-style errors, the context rule, timings and a log
+line per request, the prefix-cache tiers, and out-of-GPU-memory cleanup. Stdlib only at import time.
 
-- A prompt that does not fit the cache is a 400 `context_length_exceeded`, worded the way OpenAI words it, before
-  anything is streamed; agent clients (DeepSeek Harness) recognize it and compact the conversation.
-- A job that runs out of GPU memory (exllamav3 contains it to that job): the exception's traceback keeps the failed
-  forward's activations alive (GBs), in reference cycles only a full garbage collection frees, so every later request
-  ran out of memory too until a restart. release_failed frees them; the executor re-runs a job that failed before its
-  first token once with half-size prefill chunks (vllm/engine.py).
+- A prompt that does not fit the cache is a 400 `context_length_exceeded`, worded as OpenAI words it, before anything
+  is streamed; agent clients recognize it and compact the conversation.
+- A job that runs out of GPU memory: the exception's traceback keeps the failed forward's activations alive, in
+  reference cycles that only a full garbage collection frees. release_failed frees them; the executor runs a job that
+  failed before its first token once more with half-size prefill chunks (vllm/engine.py).
 """
 import gc
 import time
