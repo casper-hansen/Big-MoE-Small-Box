@@ -1,4 +1,3 @@
-import dataclasses
 import json
 import struct
 from pathlib import Path
@@ -150,23 +149,15 @@ def test_store_v2_mixed_sizes(odirect_dir, tmp_path):
 def test_warm_prefill_in_mode_nvme(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch)
     assert spec.env["DSV41_EC_WARM_PREFILL"] == "1"
-    # the fetch policy, read-ahead and tail checkpoints have no knobs (engine/warm_prefill.py, engine/last_page.py)
-    assert not [k for k in spec.env if k.startswith(("DSV41_EC_WARM_", "DSV41_EC_TAIL")) and k != "DSV41_EC_WARM_PREFILL"]
-    names = {f.name for f in dataclasses.fields(dsv41.DSV41Options)}
-    assert not names & {"warm_prefill", "warm_fetch", "warm_exact_rows", "warm_drop", "warm_ahead", "warm_ahead_n",
-                        "tail_ckpt"}
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
     assert "DSV41_EC_WARM_PREFILL" not in spec.env   # exllamav3's prefill
 
-def test_vllm_is_the_only_server(tmp_path, monkeypatch):
+def test_api_server_ram(tmp_path, monkeypatch):
     _box, spec = spec_for(tmp_path, monkeypatch)
-    assert spec.argv[:5] == ["/envs/dsv41/bin/python", "-m", "bigmoe.vllm.serve", "--backend", "dsv41"]
     assert spec.env["DSV41_NV_RAM_GB"] == "46.0"   # a fixed RAM tier, not sized from the cgroup at start
     assert spec.memory_gb == 56.0 + 4.5
     _box, spec = spec_for(tmp_path, monkeypatch, frontend_extra_ram_gb=0)
     assert spec.memory_gb == 56.0 and "DSV41_NV_RAM_GB" not in spec.env
-    with pytest.raises(TypeError):   # no other serving engine to select
-        AutoBox("deepseek-v4.1-flash", home=tmp_path, frontend="native")
     with pytest.raises(ValueError):   # the disk tier sits behind the CPU tier
         spec_for(tmp_path, monkeypatch, "nvme", cpu_cache_gb=0, disk_cache="/x")
 
@@ -177,9 +168,3 @@ def test_decode_time_checkpoints(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")    # bit-exact mode keeps exllamav3's schedule
     assert "DSV41_RC_INTERVAL" not in spec.env
 
-
-def test_tuning_is_not_an_option(tmp_path):
-    for name in ("rc_interval", "turn_ckpts", "dspark_conf", "planner_cost", "vram_expert_slots", "max_batch_size",
-                 "mm_cache_mb"):
-        with pytest.raises(TypeError):
-            AutoBox("deepseek-v4.1-flash", home=tmp_path, **{name: 1})

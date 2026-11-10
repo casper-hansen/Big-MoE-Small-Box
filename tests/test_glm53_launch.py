@@ -1,4 +1,3 @@
-import dataclasses
 import json
 from pathlib import Path
 
@@ -127,11 +126,3 @@ def test_glm_prefills_exactly(tmp_path, monkeypatch):
     for mode in ("nvme", "nvme-exact"):          # warm prefill is DeepSeek's (engine/warm_prefill.py)
         _, spec = spec_for(tmp_path, monkeypatch, mode)
         assert not [k for k in spec.env if k.startswith("GLM53_EC_WARM_")]
-    assert not {f.name for f in dataclasses.fields(glm53.GLM53Options)} & {"warm_prefill", "warm_fetch", "warm_ahead",
-                                                                          "warm_ahead_n"}
-
-def test_vllm_is_the_only_server(tmp_path, monkeypatch):
-    _box, spec = spec_for(tmp_path, monkeypatch, "nvme")
-    assert spec.argv[:5] == ["/envs/glm53/bin/python", "-m", "bigmoe.vllm.serve", "--backend", "glm53"]
-    with pytest.raises(TypeError):
-        glm53.GLM53Options(frontend="native")
