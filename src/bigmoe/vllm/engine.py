@@ -902,6 +902,17 @@ class ExlEngine:
         from ..engine import warm_prefill
         return warm_prefill.set_fetch(n, drop, exact_rows)
 
+    def tail_ckpt(self, on: int = 1) -> dict:
+        """Runtime switch (A/B runs on one server): tail checkpoints (engine/last_page.py) or the last-page split."""
+        from ..engine import last_page
+        return last_page.set_tail_ckpt(bool(on))
+
+    def warm_timeline(self, on: int = 1) -> dict:
+        """Debug: per staged layer call, when route() was entered, ranked (a GPU sync), had read, and returned (on=1
+        starts a record; on=0 ends it and returns it)."""
+        from ..engine import warm_prefill
+        return {"calls": warm_prefill.set_timeline(bool(on))}
+
     def warm_trace(self, on: int = 1, path: str = "") -> dict:
         """Debug: record warm prefill's per-layer routing (on=1 starts a record; on=0 ends it and saves it to path)."""
         from ..engine import warm_prefill

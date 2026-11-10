@@ -151,6 +151,9 @@ def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
     assert spec.env["DSV41_EC_WARM_PREFILL"] == "1" and spec.env["DSV41_EC_WARM_FETCH"] == "64"
     assert spec.env["DSV41_EC_WARM_AHEAD"] == "1" and "DSV41_EC_WARM_AHEAD_N" not in spec.env
     assert spec.env["DSV41_EC_WARM_EXACT_ROWS"] == "1024" and spec.env["DSV41_EC_WARM_DROP"] == "0"
+    assert spec.env["DSV41_EC_TAIL_CKPT"] == "1"
+    _, spec = spec_for(tmp_path, monkeypatch, tail_ckpt=False)
+    assert spec.env["DSV41_EC_TAIL_CKPT"] == "0"
     _, spec = spec_for(tmp_path, monkeypatch, warm_exact_rows=0, warm_drop=0.005)
     assert spec.env["DSV41_EC_WARM_EXACT_ROWS"] == "0" and spec.env["DSV41_EC_WARM_DROP"] == "0.005"
     for bad in ({"warm_exact_rows": -1}, {"warm_drop": 1.0}):
@@ -165,7 +168,7 @@ def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         spec_for(tmp_path, monkeypatch, warm_ahead_n=385)
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
-    assert "DSV41_EC_WARM_PREFILL" not in spec.env
+    assert "DSV41_EC_WARM_PREFILL" not in spec.env and "DSV41_EC_TAIL_CKPT" not in spec.env   # exllamav3's prefill
 
 
 def test_vllm_is_the_only_server(tmp_path, monkeypatch):

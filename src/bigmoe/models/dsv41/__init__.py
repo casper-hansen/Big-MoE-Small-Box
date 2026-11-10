@@ -91,6 +91,9 @@ class DSV41Options:
     # warm prefill, longer forwards: stop reading a layer's cold experts once the routing weight left out is at most
     # this fraction (still at most warm_fetch; 0 = always warm_fetch). With warm_fetch=384, 0.005 is a middle ground
     warm_drop: float = 0.0
+    # mode nvme: no separate forward for a prompt's last partial page; its recurrent checkpoint is stashed from the end
+    # of the prompt's last forward instead (engine/last_page.py, docs/vllm.md "Tail checkpoints")
+    tail_ckpt: bool = True
     # warm prefill: guess and read the next layer's cold experts while this layer computes, retargeting unread guesses
     # once the real routing is known. warm_ahead_n widens the guess window beyond warm_fetch (0 = warm_fetch).
     warm_ahead: bool = True
@@ -321,6 +324,7 @@ class DSV41(ModelBackend):
         if env["DSV41_NV_CPU"] == "1":
             env["DSV41_NV_CPU_CPUS"] = format_cpus(lay.lane)
             env["DSV41_EC_WARM_PREFILL"] = "1" if o.warm_prefill else "0"
+            env["DSV41_EC_TAIL_CKPT"] = "1" if o.tail_ckpt else "0"
             if o.warm_prefill:
                 env["DSV41_EC_WARM_FETCH"] = str(int(o.warm_fetch))
                 env["DSV41_EC_WARM_EXACT_ROWS"] = str(int(o.warm_exact_rows))

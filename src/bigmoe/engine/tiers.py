@@ -14,7 +14,8 @@
 Knobs (<prefix>NAME, see env.py): NV_STORE (store .bin), EC_RESERVE_GB (VRAM left to torch, 2.5), EC_MAX_SLOTS,
 EC_ADMIT_MAX (64), EC_CHUNK_SLOTS (32), EC_STAGE_SLOTS / EC_STAGE_GB (staging buffer size; 0 = no staged prefill),
 EC_STAGE_MIN (picks per layer call that stage, 8192), EC_ELASTIC_GB (0 = off), EC_ELASTIC_DYN (1),
-EC_ACT_MB_PER_TOK (0.6), EC_COPY_GRID, EC_WARM (JSON {layer key: [score x E]}), EC_WARM_PREFILL (0; mode nvme only).
+EC_ACT_MB_PER_TOK (0.6), EC_COPY_GRID, EC_WARM (JSON {layer key: [score x E]}), EC_WARM_PREFILL (0; mode nvme only),
+EC_TAIL_CKPT (0; mode nvme only, last_page.py).
 """
 import ctypes
 import gc
@@ -565,7 +566,13 @@ class Pool:
                 "hit_rate": round(s[0] / max(1, s[0] + s[1]), 4),
                 "stage": dict(self.stage_stats, per_buffer=self.stage_n) if self.stage_n else None,
                 "warm_prefill": self.warm_prefill.summary() if self.warm_prefill is not None else None,
+                "last_page": _last_page_stats(),
                 "picks_hist": dict(sorted(self.size_hist.items()))}
+
+
+def _last_page_stats():
+    from . import last_page
+    return dict(last_page.STATS, **last_page._ON)
 
 
 class BCProxy:
@@ -730,7 +737,12 @@ def attach(model):
         _hook_prefill(type(model))
     if approx_prefill:
         from . import last_page
-        log(last_page.apply(p.stage_min, p.topk))
+        tail_ckpt = False
+        if env("EC_TAIL_CKPT", "0") == "1":
+            tail_ckpt, what = last_page.rewindable(model)
+            if not tail_ckpt:
+                log(f"tail checkpoints off: recurrent modules {what}")
+        log(last_page.apply(p.stage_min, p.topk, tail_ckpt))
     log(f"pool: {len(mods)} MoE layers (experts {p.first}..{p.first + p.E - 1}), {p.S} slots x {p.rec / 1e6:.2f} MB = "
         f"{p.S * p.rec / GiB:.2f} GiB ({p.S / len(mods):.1f}/layer), {'uniform' if p.uniform else 'per-layer'} geometry, "
         f"admit <= {admit_max} picks, stage 2 x {p.stage_n} experts (>= {stage_min} picks), elastic "

@@ -64,6 +64,17 @@ def set_trace(on: bool):
     return prev
 
 
+TIMELINE = None           # debug (set_timeline): per staged layer call (li, rows, fetched, enter, ranked, read, exit) seconds
+
+
+def set_timeline(on: bool):
+    """Debug: record when each staged layer call entered route(), had its ranking (a GPU sync), had its reads, and
+    returned; returns the previous record."""
+    global TIMELINE
+    prev, TIMELINE = TIMELINE, ([] if on else None)
+    return prev
+
+
 def set_fetch(n: int | None = None, drop: float | None = None, exact_rows: int | None = None) -> dict:
     """Runtime warm_fetch / warm_drop / warm_exact_rows (A/B on one server); None keeps a value."""
     global FETCH_PER_LAYER, DROP, EXACT_ROWS
@@ -196,6 +207,7 @@ class WarmPrefill:
         if self.cold is None:
             return sel, w
         p = self.pool
+        t_in = time.perf_counter()
         cur = torch.cuda.current_stream(p.device)
         free = torch.cuda.Event()
         free.record(cur)                       # buffer li % 2 was last used by layer li - 2, buffer (li+1) % 2 by li - 1
@@ -207,6 +219,7 @@ class WarmPrefill:
         if drop == 0.0 and limit >= p.stage_n - used:
             self.st["exact_calls"] = self.st.get("exact_calls", 0) + 1
         fetch = rank_cold(sel, w, self.cold[li], p.first, limit, drop).cpu().tolist()
+        t_rank = t_read = time.perf_counter()
         pairs = self._take_ahead(li, b, used, limit, fetch, cur) if self.ahead is not None else None
         if pairs is None and fetch:           # no read-ahead for this layer: read them now
             t0 = time.perf_counter()
@@ -214,7 +227,8 @@ class WarmPrefill:
             self.stream.wait_event(free)
             self._read_into(li, b, pairs)
             cur.wait_stream(self.stream)
-            self.st["read_ms"] += (time.perf_counter() - t0) * 1e3
+            t_read = time.perf_counter()
+            self.st["read_ms"] += (t_read - t0) * 1e3
         if pairs:
             self._point(li, b, staged, pairs)
         sel2, w2, m = drop_cold(sel, w, self.cold[li], p.first)
@@ -226,6 +240,8 @@ class WarmPrefill:
         # after this layer's routing is consumed: small row counts share exllamav3's routing buffers across layers
         if AHEAD and z is not None and bsz is not None and bsz >= AHEAD_MIN and li + 1 < len(p.mods):
             self._start_ahead(li + 1, z, params, bsz, free)
+        if TIMELINE is not None:
+            TIMELINE.append((li, int(sel.shape[0]), len(fetch), t_in, t_rank, t_read, time.perf_counter()))
         return sel2, w2
 
     # ---- read-ahead ---------------------------------------------------------------------------------------------

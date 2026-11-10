@@ -52,7 +52,8 @@ rotation, cooldown and shared chunk, its draft-then-verify round) is never calle
   token and drafts (`max_num_batched_tokens`), with `long_prefill_token_threshold = chunk_size`. vLLM sizes every chunk;
   `BoxScheduler._reserve_prefill_lookahead` (the last word on a chunk's size in both of vLLM's scheduling loops) shortens
   it to where exllamav3 can end a forward (`engine.plan_chunk`: a 256-token page, the max chunk, the recurrent
-  last-page split of `engine/last_page.py`), so the engine computes exactly what was scheduled. vLLM's EngineCore turns
+  last-page split of `engine/last_page.py`, which DeepSeek's tail checkpoints turn off), so the engine computes exactly
+  what was scheduled. vLLM's EngineCore turns
   chunked prefill off for a model without KV cache groups; `BoxScheduler` turns it back on.
 - **Speculative decoding.** DSpark (DeepSeek) and n-gram drafts (GLM `speculation="ngram"`) are proposed by
   exllamav3's drafters right after each step's verify forward, for exactly the requests that sampled, and handed to
@@ -90,8 +91,9 @@ An explicit `DSV41_NV_RAM_GB` wins; `frontend_extra_ram_gb=0` sizes the tier aut
   vLLM admits the request. A repeated image keeps its placeholder IDs, so the prefix cache reuses the prompt through it.
 - **Prefix caching.** The GPU page cache, pinned-RAM tier, disk tier and recurrent checkpoints are exllamav3's; vLLM's
   block-hash cache stays off (`--disable-prefix-caching`) and vLLM asks `BoxKVCacheManager` instead. Models with
-  recurrent state reuse a prefix only up to a checkpoint: a chunk end, a short last page, or a page boundary while
-  decoding (every 256 tokens for DeepSeek in mode `nvme`, `rc_interval`; exllamav3's 2,048 otherwise). `/stats`
+  recurrent state reuse a prefix only up to a checkpoint: a chunk end, a prompt's last page boundary (GLM: when its
+  tail is short; DeepSeek in mode `nvme`: always, [tail checkpoints](#tail-checkpoints-deepseek-mode-nvme-2026-11-10)),
+  or a page boundary while decoding (every 256 tokens for DeepSeek in mode `nvme`, `rc_interval`; exllamav3's 2,048 otherwise). `/stats`
   exposes `prefix_cache` occupancy and hit counters. Idle disk flushes continue between requests.
 - **Operational behavior.** `/health`, `/stats` (with `scheduler`: steps, reservations, page refusals, verify steps,
   corrections, time in the executor and between steps), `/server_info`, `/generate`, `/tokenize`, `/kl_capture`, `/kl_force`, `/kl_teacher`, `/nv_verify`,
@@ -200,8 +202,8 @@ refusals and no dropped drafts. What the benchmark shows about these models on t
 - **Prefix reuse is bounded by recurrent checkpoints.** Both models have recurrent state, so a conversation resumes
   only from a checkpoint: a chunk end, a page boundary at least `rc_interval` tokens (exllamav3: 2,048) past the last
   checkpoint, or a prompt
-  whose tail past its last page boundary is short enough to split off cheaply (`engine/last_page.py`: 85 tokens for
-  DeepSeek, 63 for GLM). Short agent conversations (all of these stay under 3k tokens) therefore reuse only what their
+  whose tail past its last page boundary is short enough to split off cheaply (`engine/last_page.py`: 63 tokens for
+  GLM; 85 for DeepSeek when this was measured, every tail since its tail checkpoints). Short agent conversations (all of these stay under 3k tokens) therefore reuse only what their
   earlier prompts' lengths happened to checkpoint: GLM's runs range from 0 % to 70 % per task for that reason alone.
   Splitting every tail would not pay on this box: a staged GLM forward costs ~8.8 s whatever its length, about what
   the re-prefill it would save costs. Long agent sessions get a checkpoint at every 8,192-token chunk end. For
@@ -455,3 +457,86 @@ Measured, not kept (same samples, sizes 100-1,000, sum of prefill times / top-1 
 Tools: `warm_kl.py force --min-n 100` skips the per-pick control sizes. The debug RPCs `warm_fetch` (`n`, `drop`,
 `exact_rows`, at runtime) and `warm_trace` (records each staged layer call's routing and cold set to a file) need
 `BIGMOE_DEBUG_RPC=1`.
+
+## Tail checkpoints (DeepSeek, mode `nvme`, 2026-11-10)
+
+Where an exact short prefill's time goes (`warm_timeline` debug RPC, one forward per size, 8k cached prefix): at 100 new
+tokens, 4.64 s of the 5.16 s between the first and last MoE layer is waiting for that layer's NVMe-only experts (75 per
+layer); at 1,000 new tokens, 10.1 s of 11.5 s (163 per layer). The forward is NVMe-bound, at the SSD's ~6 GB/s, so the
+time is set by how many expert bytes it reads and how many forwards read them.
+
+A prompt whose tail past its last 256-token page boundary is 1-85 tokens paid for a second forward: exllamav3 runs
+that tail on its own to checkpoint the recurrent state at the boundary (`engine/last_page.py`). That forward is per-pick
+(under 512 picks per layer), and it reads again from NVMe most of the experts the forward before it had just read
+transiently. About a third of agent steps have such a tail (300 and 800 new tokens below: tails of 43 and 31).
+
+Now there is no split for DeepSeek (`tail_ckpt`, on by default in mode `nvme`). The prompt's last forward runs to its
+end, and the checkpoint at the last page boundary is stashed from the end state with its position moved back to the
+boundary. DeepSeek-V4's recurrent state can do this. Its SWA ring, compressor rings and CSA overlap snapshots are
+addressed by absolute position and keep at least a page of history: exllamav3 rewinds them by moving the cursor
+(`cache/dsa.py`, the same rewind its speculative decoding uses). The Engram layers carry only the last token ids (no
+conv state), which are rebuilt for the boundary. DSpark's drafter state is a DSV4State of its own and moves back with
+the target's. `last_page.rewindable` checks the model's recurrent modules at start (GLM keeps the split), and
+`stash_tail` skips a checkpoint it cannot move back (counted in `/stats`, `tiers[0].vram.last_page`).
+
+Same benchmark as above (`warm_kl.py`, 3 samples per size, prefill seconds from the request log):
+
+| new tokens | tail | exact prefill | before (exact short + split) | **tail checkpoints** (new default) |
+|---|---|---|---|---|
+| 100-200 | (no boundary) | 15.1-15.2 s | 5.0-6.6 s | 5.0-6.6 s (same) |
+| 300 | 43 | 20.3 s | 11.9 s | **7.8 s** |
+| 400-600 | 143 / 87 | 15.2 s | 8.4 / 10.0 s | 8.4 / 10.0 s (same) |
+| 800 | 31 | 19.1 s | 14.0 s | **10.6 s** |
+| 1,000 | 231 | 15.3 s | 11.9 s | 11.9 s (same) |
+| sum, one step of each size | | 145.8 s | 79.0 s | **71.5 s** |
+
+Against the exact reference: top-1 99.76 %, mean KL 0.0005 over the 3,344 positions. Every difference is in the 300-
+and 800-token samples (98.7 % / 0.0018 and 99.2 % / 0.0025). Those six samples are **bit-identical** (KL 0) to exact
+staging (`warm_prefill=false`) with the same tail checkpoints, so the difference is the chunking alone: the tail
+computed in the same forward as the tokens before it instead of in one of its own, which changes the rounding the way
+moving any chunk boundary does. Neither chunking is the exact one. The other 21 samples stay bit-identical to the
+reference.
+
+Follow-ups resumed from these checkpoints (`tools/tail_kl.py`: each prompt, then a follow-up of 32 + 100 new tokens
+that resumes from the prompt's last-page checkpoint; split server as the reference; 2 samples per tail, 1,024 forced
+positions):
+
+| tail | follow-up resumes at (split -> tail checkpoints) | prompt + follow-up prefill (split -> tail ckpt) | top-1 | mean KL |
+|---|---|---|---|---|
+| 43 | 8,448 -> 8,448 | 16.9 / 15.9 s -> 14.7 / 13.8 s | 99.6 % | 0.0010 |
+| 31 | 8,960 -> 8,960 | 18.4 / 19.4 s -> 16.3 / 17.3 s | 99.2 % | 0.0024 |
+| 93 | 8,192 -> **8,448** | 16.6 / 17.4 s -> 14.5 / 15.1 s | 98.4 % | 0.0033 |
+| 193 | 8,192 -> **8,448** | 23.9 / 25.2 s -> 16.2 / 17.8 s | 98.4 % | 0.0043 |
+| all | | 153.7 s -> **125.7 s** | 98.93 % | 0.0027 |
+
+- Tails longer than 85 tokens used to get no checkpoint (a split there cost a whole staged forward), so their
+  follow-ups re-prefilled the whole tail; now every prompt gets one. Every follow-up resumed where expected, and no
+  checkpoint was skipped.
+- The follow-ups after 43- and 31-token tails took 1-2 s more (6.2-6.4 s instead of 4.0-5.3 s): the split's per-pick
+  tail forward had left its experts in the RAM tier, and the follow-up recomputes those same tokens. The prompt saves
+  more than that.
+- The follow-up KL is the size of a chunking change, which is what separates the two checkpoints: in `nvme-exact`
+  a decode-time checkpoint differs from a prefill-time one at the same position by KL 0.0039 (above).
+- Agent benchmark (`bigmoe bench-agent`, mode `nvme`, all defaults): 3/3 tasks, 14 turns, 13 tool calls (0
+  malformed), 152.8 s (earlier runs: 164.5-167.7 s), mean time to first token 5.0-5.3 s per task (5.7 s), prefix reuse
+  79 % (80 %). Agent trajectories differ from run to run, so this is a sanity check, not a measurement of the gain.
+
+The same change applies to the faster, approximate settings (same benchmark, sum of one step of each size / top-1 /
+mean KL against the exact reference):
+
+| setting | before (split) | with tail checkpoints |
+|---|---|---|
+| default (exact short forwards, `warm_exact_rows=1024`) | 79.0 s / 100 % / 0 | **71.5 s / 99.76 % / 0.0005** |
+| `-o warm_exact_rows=0 -o warm_fetch=384 -o warm_drop=0.005` | 69.9 s / 98.09 % / 0.0034 | 62.2 s / 97.82 % / 0.0036 |
+| `-o warm_exact_rows=0` (fetch 64) | 54.2 s / 97.40 % / 0.0065 | 46.3 s / 97.07 % / 0.0076 |
+
+(With the approximate settings the tail now goes through warm prefill too: before it was a per-pick, exact forward.)
+`-o tail_ckpt=false` restores the split. Debug RPC `tail_ckpt` (on / off at runtime) needs `BIGMOE_DEBUG_RPC=1`.
+
+Measured, not kept: **keeping what a prefill reads in the RAM tier.** An exact short forward reads 75-165 NVMe-only
+experts per layer and drops them. Reading the 16 heaviest per layer into RAM-tier slots instead (evicting the
+LRU-oldest RAM experts before the forward, and counting a staged forward's warm experts as used) made the benchmark
+slower: 82.5 s instead of 79.0 s, decode 12.99 s instead of 12.77 s per answer. Offline, on the 27 recorded forwards'
+routing, an LRU that lands 8-384 experts per layer reads 0-98 % more cold experts than leaving the tier alone (the
+landed experts evict ones decode keeps reusing). A frequency-scored swap reads 9-13 % fewer, which is not enough to pay
+for the extra copies.
