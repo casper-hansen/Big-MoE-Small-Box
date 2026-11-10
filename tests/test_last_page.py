@@ -130,6 +130,27 @@ def test_stash_tail_skips_what_it_cannot_rewind():
     assert st.position == 8491
 
 
+def test_stash_tail_needs_the_whole_window_below_the_boundary():
+    """After a forward of a page or more the SWA ring starts at the page boundary below the last window: when the
+    prompt ends a window or more past its last page boundary, the rows before that boundary are gone."""
+    import types
+    job, seq, st, layers, put = _fake_tail_job(window_beg=8448)          # the ring starts at the boundary itself
+    layers["attn.0"].window = 128
+    before = dict(last_page.STATS)
+    last_page.stash_tail(job, seq, 8192, 8491)
+    assert put == [] and last_page.STATS["tail_ckpt_skipped"] == before["tail_ckpt_skipped"] + 1
+    assert last_page.STATS["skipped_why"]["window"] >= 1
+    job, seq, st, layers, put = _fake_tail_job(window_beg=8320)          # exactly a window below it
+    layers["attn.0"].window = 128
+    last_page.stash_tail(job, seq, 8192, 8491)
+    assert [p[1] for p in put] == [[8448]]
+    DSV4State = type("DSV4State", (), {"rollback_capacity": lambda self: self.position - self.window_beg})
+    st0 = DSV4State()
+    st0.position, st0.window_beg = 300, 0
+    st0.cache = types.SimpleNamespace(get_all_recurrent_layers=lambda: layers)
+    assert last_page.cannot_move([st0], 256) is None                     # the ring holds the sequence from its start
+
+
 def test_rewindable_only_for_deepseek_v4_state():
     import types
 

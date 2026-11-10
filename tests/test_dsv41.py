@@ -45,6 +45,7 @@ def test_launch_exact(tmp_path, monkeypatch):
     assert e["DSV41_NV"] == "2" and e["DSV41_NV_CPU"] == "0" and e["DSV41_EC_STAGE_SLOTS"] == "384"
     assert (e["DSV41_EC_STAGE_MIN"], e["DSV41_EC_ELASTIC_GB"], e["DSV41_EC_RESERVE_GB"]) == ("512", "11", "3.0")
     assert "DSV41_NV_CPU_CPUS" not in e and e["DSV41_NV_READER_CPUS"] == "7-11" and e["DSV41_NV_CTL_CPU"] == "6"
+    assert "DSV41_NV_SLRU" not in e
     assert e["DSV41_NV_STORE"].endswith(dsv41.STORE_NAME + ".bin")
     assert e["BIGMOE_ENGINE_PREFIX"] == "DSV41_"
     assert {e["BIGMOE_EC_BUILD"], e["BIGMOE_NV2_BUILD"]} == {"/k/bigmoe_ec-key", "/k/bigmoe_nv2-key"}
@@ -91,6 +92,7 @@ def test_dspark_default_and_off(tmp_path, monkeypatch):
 def test_launch_cpu_lane(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch)   # default mode nvme
     assert spec.env["DSV41_NV_CPU"] == "1" and spec.env["DSV41_NV_CPU_CPUS"] == "1-5"
+    assert spec.env["DSV41_NV_SLRU"] == "80"    # the RAM tier's segmented LRU: mode nvme, where it was measured
     box, _ = spec_for(tmp_path, monkeypatch, flags={"avx2", "fma", "f16c"}, mode="nvme")
     monkeypatch.setattr(system, "gpu_compute_apps", lambda: [])
     monkeypatch.setattr(system, "check_odirect", lambda p: None)
@@ -183,3 +185,12 @@ def test_decode_time_checkpoints(tmp_path, monkeypatch):
     assert spec.env["DSV41_RC_INTERVAL"] == "512"
     with pytest.raises(ValueError):
         spec_for(tmp_path, monkeypatch, rc_interval=300)
+
+
+def test_turn_checkpoints(tmp_path, monkeypatch):
+    _, spec = spec_for(tmp_path, monkeypatch)
+    assert spec.env["DSV41_TURN_CKPTS"] == "4"
+    _, spec = spec_for(tmp_path, monkeypatch, turn_ckpts=0)
+    assert spec.env["DSV41_TURN_CKPTS"] == "0"
+    with pytest.raises(ValueError):
+        spec_for(tmp_path, monkeypatch, turn_ckpts=-1)

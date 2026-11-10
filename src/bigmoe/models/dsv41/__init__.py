@@ -62,6 +62,10 @@ class DSV41Options:
     # "Decode-time checkpoints"). None: RC_NVME in mode nvme, exllamav3's own schedule (2048) in nvme-exact, which
     # stays bit-exact; 0: exllamav3's schedule. Checkpoints share prefix_cache_gb (LRU).
     rc_interval: int = None
+    # mode nvme: checkpoints where a request stops (the end of its prompt, the end of its answer), so the next request
+    # of the conversation resumes at that token instead of the last 256-token page boundary with a checkpoint
+    # (engine/turn_resume.py). The number kept (LRU, ~36 MB each, out of prefix_cache_gb); 0 turns them off.
+    turn_ckpts: int = 4
     # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
     # GPU cache evicts (one long conversation evicts every other) are restored from it instead of prefilled
     # again. disk_cache: a directory for exllamav3's persistent third tier behind it (pages and checkpoints survive
@@ -107,6 +111,8 @@ class DSV41Options:
             raise ValueError("chunk_size and max_batch_size must be positive")
         if self.rc_interval is not None and (int(self.rc_interval) < 0 or int(self.rc_interval) % 256):
             raise ValueError(f"rc_interval must be 0, a multiple of 256 or None, got {self.rc_interval!r}")
+        if not 0 <= int(self.turn_ckpts) <= 64:
+            raise ValueError(f"turn_ckpts must be 0..64, got {self.turn_ckpts!r}")
         if not 0.0 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0..64, got {self.prefix_cache_gb!r}")
         if self.cpu_cache_gb is not None and not 0.0 <= float(self.cpu_cache_gb) <= 64:
@@ -296,6 +302,7 @@ class DSV41(ModelBackend):
         if env["DSV41_NV_CPU"] == "1":
             env["DSV41_NV_CPU_CPUS"] = format_cpus(lay.lane)
             env["DSV41_EC_WARM_PREFILL"] = "1"     # engine/warm_prefill.py; tail checkpoints follow the model (last_page.py)
+            env["DSV41_NV_SLRU"] = "80"            # RAM tier: segmented LRU, 80 % kept (nv2_host.cpp; docs/vllm.md)
             env.update(engine.x16_env("DSV41_", o.x16_layers))
         for spec in self.kernel_specs(box):
             env[spec.env_var] = str(box.runtime.kernel_dirs([spec], box.arch)[spec.name])
@@ -310,6 +317,7 @@ class DSV41(ModelBackend):
         rc = o.rc_interval if o.rc_interval is not None else (RC_NVME if o.mode == "nvme" else None)
         if rc:
             env["DSV41_RC_INTERVAL"] = str(int(rc))
+        env["DSV41_TURN_CKPTS"] = str(int(o.turn_ckpts))
         env["PATH"] = f"{box.runtime.python.parent}:{os.environ.get('PATH', '')}"
         env.update({k_: str(v) for k_, v in box.env.items()})
         argv = [str(box.runtime.python), "-m", "bigmoe.vllm.serve", "--backend", "dsv41", "-m", str(self.model_dir(box)),

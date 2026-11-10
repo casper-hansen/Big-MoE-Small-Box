@@ -90,6 +90,33 @@ def test_glm_template_overlay(tmp_path):
     assert (d / "tokenizer.json").resolve() == (src / "tokenizer.json").resolve()
 
 
+DS_TAIL = ('{%- set DSML = "｜DSML｜" -%}{%- for m in messages -%}{%- set content = m.get("content") -%}'
+           '{%- if m.role == "assistant" -%}{{- content or "" -}}{%- if m.get("tool_calls") -%}'
+           '{%- set tcs = namespace(lines=["CALL"]) -%}'
+           '{{- "\\n\\n<" ~ DSML ~ " calls>\\n" ~ tcs.lines | join("\\n") ~ "\\n</" ~ DSML ~ " calls>" -}}'
+           '{%- endif -%}<eos>{%- else -%}<user>{{- content -}}{%- endif -%}{%- endfor -%}')
+
+
+def test_deepseek_template_overlay_renders_tool_calls_as_generated(tmp_path):
+    jinja2 = pytest.importorskip("jinja2")
+    src = tmp_path / "ds"
+    src.mkdir()
+    (src / "chat_template.jinja").write_text(DS_TAIL)
+    d = Path(serve.tokenizer_overlay("dsv41", str(src), str(tmp_path / "home")))
+    stock, new = (jinja2.Environment().from_string(t) for t in (DS_TAIL, (d / "chat_template.jinja").read_text()))
+
+    def turn(t, content):
+        return t.render(messages=[{"role": "user", "content": "q"},
+                                  {"role": "assistant", "content": content, "tool_calls": [{}]}])
+    calls = "<｜DSML｜ calls>\nCALL\n</｜DSML｜ calls><eos>"
+    # the model writes text, a blank line, the calls; vLLM's parser returns the text with the blank line
+    assert turn(stock, "Let me look.\n\n") == "<user>qLet me look.\n\n\n\n" + calls       # four newlines: not what it wrote
+    assert turn(new, "Let me look.\n\n") == "<user>qLet me look.\n\n" + calls
+    for content in ("Let me look.", None, "", "x\n"):          # everything else renders as before
+        assert turn(new, content) == turn(stock, content)
+    assert serve.dsv41_template("no tool calls here") == "no tool calls here"
+
+
 def test_glm_overlay_without_images(monkeypatch):
     monkeypatch.setenv("BIGMOE_MM", "0")
     out = serve.glm_template(GLM_TAIL, images=False)
@@ -263,6 +290,10 @@ def test_plan_chunk():
     assert plan_chunk(0, 64, 290, 64, False, None, page=16) == 64
     assert plan_chunk(16384, 3616, 20000, 8192, False, None, hold_last=True) == 3615   # drafting: hold the last token
     assert plan_chunk(19999, 6, 20000, 8192, False, None, hold_last=True) == 6
+    # a start inside a page (a turn checkpoint, engine/turn_resume.py): the same ends
+    assert plan_chunk(1456, 20, 1476, 8192, True, -1, hold_last=True) == 19     # a short tool result, one forward
+    assert plan_chunk(700, 19300, 20000, 8192, True, -1) == 8004                # the chunk ends on a page
+    assert plan_chunk(16500, 3500, 20000, 8192, True, -1, hold_last=True) == 3499   # no split: tail checkpoints
 
 
 class FakeJob:

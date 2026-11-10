@@ -30,6 +30,8 @@ Env: NV_RAM_GB (auto), NV_MARGIN_GB (1), NV_THREADS (16 readers), NV_PIECE_KB (2
      of one token), NV_STG / NV_STG_MAX (0 / 3: layer-ahead DMA staging pool, experimental, off) with
      NV_STG_GATE (2: DMA after the copy kernel unless the MoE reads zero-copy, then after the MoE kernel),
      NV_PF_RING_BORROW (1: the prefill ring borrows RAM-tier slots during a staged prefill).
+     NV_SLRU (0: the RAM tier evicts its least recently used expert; N: segmented, N % of the slots are for experts
+     used again after they landed, and the ones that only landed go first. DeepSeek in mode nvme sets 80).
      Round 3: NV_STREAM (1: an NVMe->CPU pick is bound when its read starts and each gate / up / down band of the
      CPU lane waits only for the read pieces that hold it), NV_TRACK_QD (0: pieces of one decode read in flight,
      uncapped), NV_CBT (planner: CPU time left for a streamed NVMe->CPU pick after its last byte lands, ms; < 0
@@ -946,6 +948,7 @@ class Nv2:
         toks = max(1, c["dec_tok"] // self.L)
         r = lambda x: round(x, 3)
         out = {"ram_slots": self.nram, "ram_gib": r(self.nram * self.slot / GiB), "pf_ring": self.pf.n, "exclusive": self.wb_on,
+               "slru_kept_pct": min(99, max(0, int(env("NV_SLRU", "0") or 0))),
                "cpu_tier": self.cpu_on, "pol": self.pol, "host": c, "dev": dev, "py": dict(self.st),
                "decode_per_step": {"steps_est": steps, "tokens_est": toks,
                                    "picks": r(c["picks"] / steps) if c["small_reqs"] == 0 else None,

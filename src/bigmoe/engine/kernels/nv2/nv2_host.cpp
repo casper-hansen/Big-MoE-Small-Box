@@ -336,7 +336,13 @@ struct Engine
     // RAM slot classes (store v2): slot s holds experts of class slot_cls[s] only (0: full slots of slot_bytes, 1: small
     // slots for layers whose trellis fits small_bytes); key class kcls[key]. One free list and one LRU chain per class
     static constexpr int NSC = 2;
-    int lru_old_c[NSC] = { -1, -1 }, lru_new_c[NSC] = { -1, -1 };
+    // Each class's LRU is segmented (NV_SLRU: percent of the class's slots that are "kept", 0: one plain chain). An
+    // expert that lands from NVMe enters the probation chain; a use from RAM moves it to the kept chain, whose
+    // overflow falls back to probation's new end. Victims are taken from probation's old end first, so an expert
+    // that one step read does not outlive the ones decode keeps reusing. Chain of class c, segment g: [c * 2 + g].
+    int lru_old_c[NSC * 2] = { -1, -1, -1, -1 }, lru_new_c[NSC * 2] = { -1, -1, -1, -1 };
+    std::vector<int8_t> lseg;                       // per slot: -1 in no chain, 0 probation, 1 kept
+    int slru_pct = 0, nkept_c[NSC] = { 0, 0 }, kept_cap_c[NSC] = { 0, 0 };
     std::vector<int32_t> freel_c[NSC];
     std::vector<int8_t> slot_cls, kcls;
     int64_t small_bytes = 0; int nslot_c[NSC] = { 0, 0 };
@@ -517,26 +523,51 @@ struct Engine
     // ---------------- LRU over slots ----------------
     void lru_remove(int s)
     {
+        const int g = lseg[s];
+        if (g < 0) return;
         const int c = slot_cls[s];
-        int& lru_old = lru_old_c[c]; int& lru_new = lru_new_c[c];
+        int& lru_old = lru_old_c[c * 2 + g]; int& lru_new = lru_new_c[c * 2 + g];
         const int p = lprev[s], n = lnext[s];
-        if (p >= 0) lnext[p] = n; else if (lru_old == s) lru_old = n;
-        if (n >= 0) lprev[n] = p; else if (lru_new == s) lru_new = p;
-        lprev[s] = lnext[s] = -1;
+        if (p >= 0) lnext[p] = n; else lru_old = n;
+        if (n >= 0) lprev[n] = p; else lru_new = p;
+        lprev[s] = lnext[s] = -1; lseg[s] = -1;
+        if (g) nkept_c[c]--;
     }
-    void lru_push_new(int s)
+    // new end of probation (g 0: a landed expert) or of the kept chain (g 1: an expert used from RAM or VRAM)
+    void lru_push_new(int s, int g = 0)
     {
+        lru_remove(s);
+        if (!slru_pct) g = 0;
         const int c = slot_cls[s];
-        int& lru_old = lru_old_c[c]; int& lru_new = lru_new_c[c];
+        int& lru_old = lru_old_c[c * 2 + g]; int& lru_new = lru_new_c[c * 2 + g];
         lprev[s] = lru_new; lnext[s] = -1; if (lru_new >= 0) lnext[lru_new] = s; lru_new = s; if (lru_old < 0) lru_old = s;
+        lseg[s] = int8_t(g);
+        if (!g) return;
+        nkept_c[c]++;
+        while (nkept_c[c] > kept_cap_c[c])           // the kept chain's oldest falls back to probation's new end
+        {
+            const int y = lru_old_c[c * 2 + 1];
+            if (y < 0 || y == s) break;
+            lru_remove(y); lru_push_new(y, 0);
+        }
     }
-    void lru_push_old(int s)
+    void lru_push_old(int s)                         // the first victim of its class
     {
+        lru_remove(s);
         const int c = slot_cls[s];
-        int& lru_old = lru_old_c[c]; int& lru_new = lru_new_c[c];
+        int& lru_old = lru_old_c[c * 2]; int& lru_new = lru_new_c[c * 2];
         lnext[s] = lru_old; lprev[s] = -1; if (lru_old >= 0) lprev[lru_old] = s; lru_old = s; if (lru_new < 0) lru_new = s;
+        lseg[s] = 0;
     }
-    void lru_touch(int s) { if (lru_new_c[slot_cls[s]] == s) return; lru_remove(s); lru_push_new(s); }
+    void lru_touch(int s)
+    {
+        const int g = slru_pct ? 1 : 0;
+        if (lseg[s] == g && lru_new_c[slot_cls[s] * 2 + g] == s) return;
+        lru_push_new(s, g);
+    }
+    // victim order of class c: probation oldest first, then the kept chain oldest first
+    int lru_first(int c) const { return lru_old_c[c * 2] >= 0 ? lru_old_c[c * 2] : lru_old_c[c * 2 + 1]; }
+    int lru_next(int s) const { return lnext[s] >= 0 ? lnext[s] : (lseg[s] == 0 ? lru_old_c[slot_cls[s] * 2 + 1] : -1); }
     size_t nfree() const { return freel_c[0].size() + freel_c[1].size(); }
 
     void set_home(int key, int64_t a)
@@ -563,7 +594,7 @@ struct Engine
         auto& fl = freel_c[c];
         if (!fl.empty()) { int s = fl.back(); fl.pop_back(); return s; }
         int guard = 0;
-        for (int s = lru_old_c[c]; s >= 0 && guard < nram; s = lnext[s], ++guard)
+        for (int s = lru_first(c); s >= 0 && guard < nram; s = lru_next(s), ++guard)
         {
             const int key = owner[s];
             if (key < 0 || kst[key] != KS_RES || prot[key] || pinc[s] > 0) continue;
@@ -641,7 +672,7 @@ struct Engine
         // resident at once, backed by the VRAM ring slot (valid bytes, device-readable); the wb thread copies it
         // to RAM slot s on a copy engine and then switches home to s. Pinned until then (no eviction).
         owner[s] = key; slot_of[key] = s; kst[key] = KS_RES; kvr[key] = v; pinc[s]++;
-        lru_push_new(s);
+        lru_push_new(s, 1);
         set_home(key, vring_addr[v]);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         __atomic_store_n(&ram_res[key], 1, __ATOMIC_RELEASE);
@@ -783,7 +814,7 @@ struct Engine
             while ((int) freel_c[c].size() < lo && guard++ < 16)
             {
                 int s = -1;
-                for (int x = lru_old_c[c], g = 0; x >= 0 && g < nram; x = lnext[x], ++g)
+                for (int x = lru_first(c), g = 0; x >= 0 && g < nram; x = lru_next(x), ++g)
                 {
                     const int key = owner[x];
                     if (key < 0 || kst[key] != KS_RES || prot[key] || pinc[x] > 0) continue;
@@ -1717,6 +1748,7 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
                                 e.lossy_eps, e.lossy_whi, e.lossy_renorm, e.lossy_pf, e.lossy_bg, e.lossy_lo, e.lossy_hi);
     }
     e.owner.assign(e.nram, SL_FREE); e.pinc.assign(e.nram, 0); e.lprev.assign(e.nram, -1); e.lnext.assign(e.nram, -1);
+    e.lseg.assign(e.nram, -1);
     // slot classes: slot_cls (CPU int8 [nram], 0 full / 1 small) and the small slot size; a layer whose trellis fits a
     // small slot uses class 1 when there are small slots
     e.slot_cls.assign(e.nram, 0);
@@ -1727,6 +1759,10 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, at::Tensor geom, int64_t s
     }
     e.small_bytes = small_bytes;
     for (int s = 0; s < e.nram; ++s) e.nslot_c[e.slot_cls[s]]++;
+    if (const char* pm = penv("NV_SLRU")) e.slru_pct = std::min(99, std::max(0, atoi(pm)));
+    for (int c = 0; c < Engine::NSC; ++c) e.kept_cap_c[c] = int(int64_t(e.nslot_c[c]) * e.slru_pct / 100);
+    if (e.slru_pct) fprintf(stderr, "nv2: RAM tier segmented LRU, kept %d %% (%d + %d of %d + %d slots)\n", e.slru_pct,
+                            e.kept_cap_c[0], e.kept_cap_c[1], e.nslot_c[0], e.nslot_c[1]);
     e.kcls.assign(e.K, 0);
     for (int k = 0; k < e.K; ++k)
         e.kcls[k] = (e.nslot_c[1] > 0 && e.small_bytes > 0 && e.l_len[k / e.E] <= e.small_bytes) ? 1 : 0;
@@ -1858,7 +1894,7 @@ int64_t wb_bulk(at::Tensor keys, at::Tensor src)
     std::lock_guard<std::mutex> lk(e.mu);
     for (auto& [key, s] : done)
     {
-        e.slot_of[key] = s; e.kst[key] = KS_RES; e.lru_push_new(s); e.set_home(key, e.ram_addr[s]);
+        e.slot_of[key] = s; e.kst[key] = KS_RES; e.lru_push_new(s, 1); e.set_home(key, e.ram_addr[s]);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         __atomic_store_n(&e.ram_res[key], 1, __ATOMIC_RELEASE);
     }

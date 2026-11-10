@@ -54,19 +54,38 @@ def glm_template(text: str, images: bool) -> str:
     return text
 
 
+# DeepSeek-V4.1 writes a tool call after text as text + "\n\n" + the calls block; vLLM's parser returns the text with
+# that blank line as the message content, and the checkpoint's template puts its own "\n\n" before the calls block,
+# so the history rendered for the next request had four newlines where the model had generated two: other tokens
+# from there on, i.e. the prefix cache (and a turn checkpoint) ended at the start of every such call, and the model
+# saw, and started to copy, a spacing it had not written. The overlay template adds the blank line only when the
+# content does not already end with it, which renders exactly the generated tokens.
+DS_CALLS = '{{- "\\n\\n<" ~ DSML ~ " calls>\\n" ~ tcs.lines'
+DS_CALLS_EXACT = ('{{- ("" if content is string and content.endswith("\\n\\n") else "\\n\\n") ~ "<" ~ DSML ~ " calls>\\n" '
+                  '~ tcs.lines')
+
+
+def dsv41_template(text: str) -> str:
+    if text.count(DS_CALLS) != 1:
+        print(" !! bigmoe: DeepSeek chat template without the expected tool-call block; template left as is",
+              file=sys.stderr, flush=True)
+        return text
+    return text.replace(DS_CALLS, DS_CALLS_EXACT)
+
+
 def tokenizer_overlay(backend: str, model_dir: str, root: str) -> str | None:
     """A tokenizer directory beside the checkpoint with the backend's template changes (GLM: the thinking switch,
-    image blocks): symlinks to every small file of the checkpoint, the chat template rewritten. None when nothing
-    changes."""
+    image blocks; DeepSeek: tool calls rendered as generated): symlinks to every small file of the checkpoint, the
+    chat template rewritten. None when nothing changes."""
     import hashlib
     from pathlib import Path
     from .. import multimodal
     src = Path(model_dir)
     tpl = src / "chat_template.jinja"
-    if backend != "glm53" or not tpl.is_file():
+    if backend not in ("glm53", "dsv41") or not tpl.is_file():
         return None
     text = tpl.read_text()
-    new = glm_template(text, multimodal.enabled())
+    new = glm_template(text, multimodal.enabled()) if backend == "glm53" else dsv41_template(text)
     if new == text:
         return None
     key = hashlib.sha1((str(src.resolve()) + "\0" + new).encode()).hexdigest()[:16]

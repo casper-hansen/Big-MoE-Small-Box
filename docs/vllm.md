@@ -83,7 +83,9 @@ An explicit `DSV41_NV_RAM_GB` wins; `frontend_extra_ram_gb=0` sizes the tier aut
 
 - **Chat and completions.** vLLM's DeepSeek-V4.1 and GLM-4.7 renderers/parsers with the checkpoints' own chat
   templates. Requests without a `model`, or with any alias, are mapped to the served model name. GLM thinking defaults
-  on; DeepSeek thinking defaults off.
+  on; DeepSeek thinking defaults off. One line of DeepSeek's template is replaced (a tokenizer overlay like GLM's,
+  `serve.dsv41_template`): a tool-call turn is rendered with the one blank line the model writes before its calls, not
+  two, so the history is token for token what was decoded ([turn checkpoints](#turn-checkpoints-deepseek-mode-nvme-2026-11-10)).
 - **Tools and reasoning.** DeepSeek DSML calls and GLM `<tool_call>` blocks are parsed by vLLM, including streaming
   argument deltas. GLM string arguments keep leading/trailing whitespace (file-writing tools need it).
 - **Images.** vLLM loads and validates the image and calls exllamav3's own resize/normalize/patchify code; the
@@ -93,7 +95,10 @@ An explicit `DSV41_NV_RAM_GB` wins; `frontend_extra_ram_gb=0` sizes the tier aut
   block-hash cache stays off (`--disable-prefix-caching`) and vLLM asks `BoxKVCacheManager` instead. Models with
   recurrent state reuse a prefix only up to a checkpoint: a chunk end, a prompt's last page boundary (GLM: when its
   tail is short; DeepSeek in mode `nvme`: always, [tail checkpoints](#tail-checkpoints-deepseek-mode-nvme-2026-11-10)),
-  or a page boundary while decoding (every 256 tokens for DeepSeek in mode `nvme`, `rc_interval`; exllamav3's 2,048 otherwise). `/stats`
+  or a page boundary while decoding (every 256 tokens for DeepSeek in mode `nvme`, `rc_interval`; exllamav3's 2,048 otherwise).
+  DeepSeek in mode `nvme` also resumes inside a page, where the conversation's last request stopped
+  ([turn checkpoints](#turn-checkpoints-deepseek-mode-nvme-2026-11-10), in host RAM only: after a restart or once the
+  conversation's state is evicted, the page-aligned checkpoints apply). `/stats`
   exposes `prefix_cache` occupancy and hit counters. Idle disk flushes continue between requests.
 - **Operational behavior.** `/health`, `/stats` (with `scheduler`: steps, reservations, page refusals, verify steps,
   corrections, time in the executor and between steps), `/server_info`, `/generate`, `/tokenize`, `/kl_capture`, `/kl_force`, `/kl_teacher`, `/nv_verify`,
@@ -135,7 +140,8 @@ The unit suite runs vLLM's real scheduler in-process over a `FakeEngine` with th
 that it computes exactly what was scheduled; a second request admitted into the leftover budget; a long prefill that
 does not stall a decoding request; admission waiting for pages; vLLM-reported prefix hits; drafts scheduled, verified
 and rolled back by vLLM; engine-side errors. `tests/test_agent_bench.py` runs the agentic benchmark against a scripted
-OpenAI server.
+OpenAI server. `tests/test_turn_resume.py` runs the turn checkpoints'
+stash, plan and resume over fake states and pages, and their installation on exllamav3's real classes.
 
 ## Measured results (RTX 3090 box, 2026-11-09)
 
@@ -203,7 +209,8 @@ refusals and no dropped drafts. What the benchmark shows about these models on t
   only from a checkpoint: a chunk end, a page boundary at least `rc_interval` tokens (exllamav3: 2,048) past the last
   checkpoint, or a prompt
   whose tail past its last page boundary is short enough to split off cheaply (`engine/last_page.py`: 63 tokens for
-  GLM; 85 for DeepSeek when this was measured, every tail since its tail checkpoints). Short agent conversations (all of these stay under 3k tokens) therefore reuse only what their
+  GLM; 85 for DeepSeek when this was measured, every tail since its tail checkpoints, and since its
+  [turn checkpoints](#turn-checkpoints-deepseek-mode-nvme-2026-11-10) the exact end of the last request). Short agent conversations (all of these stay under 3k tokens) therefore reuse only what their
   earlier prompts' lengths happened to checkpoint: GLM's runs range from 0 % to 70 % per task for that reason alone.
   Splitting every tail would not pay on this box: a staged GLM forward costs ~8.8 s whatever its length, about what
   the re-prefill it would save costs. Long agent sessions get a checkpoint at every 8,192-token chunk end. For
@@ -548,3 +555,231 @@ reads every NVMe-only expert its routing touches. A longer one reads the 64 heav
 drops the rest. A prompt's last-page checkpoint is stashed from the end of its last forward (`engine/last_page.py`,
 chosen by the model's recurrent state: DeepSeek-V4's rewinds). GLM, and mode `nvme-exact`, stage every expert; GLM
 keeps the last-page split for tails of up to 63 tokens.
+
+## Turn checkpoints (DeepSeek, mode `nvme`, 2026-11-10)
+
+An agent's next request is its last one plus the answer plus a tool result. Where the time of such a session went
+was measured with a replay benchmark, because agent trajectories differ from run to run in mode `nvme` and two
+`bench-agent` runs do different work.
+
+It records agent sessions over the chat API (the three `bench/agent.py` tasks and `repo_session`, a longer one on a
+copy of this package with a harness-sized system prompt and six tools) with each turn's prompt and output token
+ids, and replays them as completions on the prompt ids with the output forced (`vllm_xargs.bigmoe_force`, the path
+of `/kl_force`). Prefix reuse, prefill, drafting and verification run as in the live session, but every
+configuration computes the same tokens. For the quality of a configuration on a whole session the same turns are
+forced through `/kl_force` with KL capture on. The replay and KL tools are not in the repository at this commit.
+
+Three things made a turn prefill tokens the server had already computed:
+
+1. **Checkpoints sit on page boundaries.** exllamav3 resumes a cached prompt from a recurrent checkpoint, at a
+   256-token page boundary (decode-time checkpoints, tail checkpoints). Every turn therefore prefilled again what
+   followed the last boundary: the end of the last prompt and most of the answer the model had just decoded, 100-500
+   tokens, which is a staged forward of 4-8 s where the really new tokens (a short tool result) are often a few dozen
+   that the per-pick path takes in 1-2 s.
+2. **The chat template did not render a tool-call turn the way the model writes it.** The model writes
+   `text\n\n<｜DSML｜ calls>`; vLLM's parser returns the text with those two newlines; the checkpoint's template adds two
+   more. The history then differs from what was decoded at every tool call that follows text, and the prefix is
+   reusable only up to there.
+3. **A tail checkpoint could carry a truncated attention window** (a bug in `engine/last_page.py` from the tail
+   checkpoints above). After a forward of a page or more, DeepSeek-V4's SWA ring starts at the page boundary below the
+   last window. When the prompt ends 127 tokens or more past its last page boundary, that is this very boundary:
+   the state moved back to it has no rows below it, and the first 127 tokens of a follow-up attended to a
+   shorter window than they should.
+
+What changed:
+
+- **Turn checkpoints** (`engine/turn_resume.py`, option `turn_ckpts`, default 4, 0 = off). The recurrent state is
+  also stashed where a request stops: at the *turn end*, when the job gives its pages back (finished, stopped by vLLM,
+  aborted), at its K/V position, which is the prompt and every answer token but the last; and at the *prompt end*,
+  after the prompt's last forward (for a follow-up that keeps the prompt but not the answer as generated: a client
+  that drops the reasoning, a retry, an edited answer). A starting job whose prompt begins with such a sequence resumes
+  there, inside a page: the K/V rows of that page are copied from the page that holds them (exllamav3's partial-page
+  reuse, which it skips for recurrent models), the pages below are the prefix cache's, and `Job.prefill` starts
+  mid-page. Where the new prompt leaves the stashed sequence before its end, the state is moved back to that point if
+  it can be moved exactly (the cursor rewind exllamav3 uses for rejected drafts, at most a page, and not below the
+  rows the SWA ring holds for a whole window), else exllamav3's page-aligned resume applies as before. The store is
+  an LRU of 4 states (36 MB each, taken out of `prefix_cache_gb`) beside exllamav3's hash-keyed checkpoint cache: two
+  per conversation, so two interleaved agents keep theirs. Not in mode `nvme-exact` (its answers stay exllamav3's) and
+  not for GLM, whose recurrent state does not rewind. `/stats` reports it under `tiers[0].vram.turn_resume`.
+- **The DeepSeek template** gets an overlay like GLM's (`serve.dsv41_template`): a tool-call turn whose text ends
+  with the blank line the model wrote gets no second one. Everything else renders as before.
+- **Tail checkpoints** are stashed only when the ring holds a whole window below the boundary
+  (`last_page.cannot_move`, counted as `skipped_why.window`; 20 of 88 prompts in a replay of the trace). Those
+  prompts are covered by the prompt-end checkpoint, which is not moved.
+
+### Replay
+
+Fresh server per row unless noted, one warm-up request, mode `nvme`, all defaults. "TTFT" is the sum of the turns'
+times to the first token (what the agent waits for before the model answers), "answers" the sum of the times from the
+first token to the last; "new tokens" are the prompt tokens the server prefilled.
+
+Trace A, recorded before these changes (30 turns, 4 sessions, 4,594 answer tokens; its history has the template's
+doubled blank lines):
+
+| | total | TTFT | new tokens | answers |
+|---|---|---|---|---|
+| before (commit 1eb269d) | 439.1 s | 201.4 s | 19,677 | 237.8 s (19.2 tok/s) |
+| turn checkpoints | **405.5 s** | **169.2 s** | 16,420 | 236.3 s (19.3 tok/s) |
+
+25 of the 26 follow-up turns resumed from a turn checkpoint, 9 of them below its end (where the template's blank
+lines start: the state moved back by a few tokens); for the other one exllamav3's page checkpoint was as far.
+
+Trace B, recorded with the template overlay (51 turns, 7,121 answer tokens; `repo_session` took 37 turns to a
+20k-token prompt). One server, turn checkpoints switched between runs (with the prefix cache emptied
+before each):
+
+| | total | TTFT | new tokens | answers |
+|---|---|---|---|---|
+| turn checkpoints off | 679.9 s | 295.5 s | 25,323 | 384.5 s (18.4 tok/s) |
+| on (run before the one above) | **619.5 s** | **232.5 s** | 18,109 | 387.0 s (18.3 tok/s) |
+| on (run after it) | **614.7 s** | **231.6 s** | 18,109 | 383.1 s (18.5 tok/s) |
+
+Every follow-up turn (47 of 47) resumed at the exact end of the previous turn. End to end -9 %, time to first token
+-21 %; decode is unchanged. Per turn with turn checkpoints on, by the size of what is new:
+
+| new tokens | turns | mean TTFT |
+|---|---|---|
+| under 50 (mean 28) | 17 | 1.7 s |
+| 50-127 (mean 78) | 8 | 3.2 s |
+| 128-299 (mean 197) | 15 | 5.4 s |
+| 300-1,023 (mean 611) | 7 | 9.7 s |
+| 1,024 and more (mean 2,444) | 4 | 7.3 s |
+
+The same turns live (the recording runs, same tasks): `fix_stats_bug` turns 4 and 5, each a short tool result after
+an answer, took 4.7 s and 6.0 s to the first token before and 1.8 s and 2.0 s after.
+
+Other configurations, same trace:
+
+- **A 1 GiB recurrent cache and the disk prefix tier** (`-o prefix_cache_gb=1 -o disk_cache=<dir>`, a fresh server
+  each): 683.1 s (TTFT 297.0 s) with `-o turn_ckpts=0`, 616.9 s (TTFT 232.1 s) with the default. Turn checkpoints
+  are not written to disk.
+- **Cost.** The replay's 104 stashes took 0.55 s together and its 47 resumes 0.18 s.
+- **Thinking** (`bench.agent --thinking`, `fix_stats_bug`: passed, 5 turns, 67.7 s). The round trip is exact when
+  the client sends `reasoning_content` back. `bench/agent.py` does not, so its history differs from what was decoded
+  where the reasoning stood: those turns resume from the prompt-end checkpoint, or from the turn-end one moved back.
+- **Two agents at once** (`bench.agent --parallel 2`: 2 / 2 solved, 9 turns, 96.1 s, 89 % prefix reuse). Both
+  conversations resumed at their own turn ends while interleaved, and a conversation that starts with another one's
+  system prompt resumes from that one's prompt-end checkpoint, moved back to where they part.
+
+### Quality
+
+Teacher-forced on the recorded tokens against the exact reference: mode `nvme-exact` (exllamav3's staged prefill,
+no approximation in decode), every turn's prompt prefilled from its first token (47 min for trace B). Top-1 is the share of answer positions with the same most likely token:
+
+| | positions | turn checkpoints off | on |
+|---|---|---|---|
+| trace B | 7,121 | 98.97 %, mean KL 0.00233 | 99.02 %, mean KL 0.00239 |
+| trace A | 4,594 | 99.13 %, mean KL 0.00229 | 99.04 %, mean KL 0.00205 |
+
+Resuming at the turn end is as close to exact as prefilling again from the page boundary. On and off against each
+other on trace B: top-1 99.16 %, mean KL 0.00155.
+
+The truncated window, on its own test (`A` then `A` + 8 or 40 tokens of plain text, 48 greedy answer tokens forced, ten
+prompts of 850-2,020 tokens, five of them ending 127 tokens or more past a page boundary; against the same exact
+reference):
+
+| | the five truncated cases | the five others | the ten follow-ups, with their answers |
+|---|---|---|---|
+| before: resumed from the tail checkpoint | 93.3 %, mean KL 0.0168 | 94.2 %, mean KL 0.0091 | not timed alone |
+| now: resumed from the prompt-end checkpoint | 96.7 %, mean KL 0.0075 | 94.2 %, mean KL 0.0079 | 45.2 s |
+| mode `nvme`, prompt prefilled from its first token | 96.7 %, mean KL 0.0084 | 94.6 %, mean KL 0.0079 | 113.2 s |
+
+(These prompts are over 1,024 new tokens, so their prefill is warm prefill's approximate one; that is the 95 % level
+of all three rows.)
+
+
+### Measured, not kept
+
+- **Layer-ahead expert prefetch while decoding** (`NV_PREFETCH=1`, an existing switch: the next layer's router on this
+  layer's MoE input guesses its experts, which are read ahead; and `NV_PFSIDE=1`, the guess on a side stream). Trace A:
+  443.2 s and 442.4 s against 439.1 s; answers 237.3 s and 237.4 s against 237.8 s. A decode step already waits on
+  the SSD at its full rate (below), so reading earlier does not read less.
+- **Suffix-match drafts on top of DSpark** (exllamav3's hybrid drafts, `-hdt`: continue the draft with the text that
+  followed the same n-gram earlier in the context, for tool calls that copy file content). Simulated on trace A's
+  answers with DSpark's recorded windows: at best 6 % fewer verify steps (938 against 999 at 12 extra draft tokens),
+  with more rejected rows, each of which reads its experts. Not run on the server.
+
+## RAM-tier eviction: segmented LRU (DeepSeek, mode `nvme`, 2026-11-10)
+
+Decode waits for the SSD. In the trace B replay above a decode step (one verify forward: 6 rows on average, 4.4
+tokens kept) reads 105 experts, 9.8 MB each, and the replay reads 1.7 TB. The RAM tier (5,223 slots, with the 864 in
+VRAM a cache of 6,087 of the 15,360 experts) evicted its least recently used expert.
+
+**Offline.** Every MoE layer call's picks of one replay were written out (2.04 M decode picks in 66,440 layer calls)
+and run against one cache of 6,087 experts with different policies, staged forwards left out; misses per decode step
+(40 layer calls), counted over the last 70 % of the trace:
+
+| policy | misses per step |
+|---|---|
+| LRU | 88.5 |
+| LRU, 10 % more slots | 69.6 |
+| LRU, 25 % more slots | 47.9 |
+| LRU-2 (evict by the second-last use) | 84.3 |
+| 2Q (probation 3-25 %, ghost list) | 84.4-91.5 |
+| ARC | 86.1 |
+| decayed use count, half-life 10 / 30 / 100 / 300 / 1,000 steps | 82.1 / 78.1 / 85.5 / 94.7 / 102.0 |
+| segmented LRU, 50 / 70 / 80 / 90 / 95 / 97 % protected | 83.3 / 80.0 / 78.6 / 78.3 / 82.5 / 95.9 |
+| Belady (evicts what is used last, knowing the future) | 33.3 |
+
+Three things follow. The cache is small for this workload and every slot counts (the RAM tier is all the RAM there
+is). What an expert was used for long ago says little: counts with a long memory are worse than plain recency. And
+no policy that only sees past picks gets more than 12 %, while knowing the future is worth 62 %; the rest would take
+a predictor of the routing, not an eviction rule. The time since an expert's previous use has no gap to cut at: 41 %
+of the accesses reuse an expert of the step before, 30 % one of the 2-7 steps before, and it thins out evenly from
+there (9 % after 16-31 steps, 5 % after 32-63, 2.5 % after 64-127).
+
+**What changed.** The host's LRU chain per slot class is two chains (`nv2_host.cpp`, `NV_SLRU` = percent of the
+slots that are "kept"; 0 = one chain, as before). An expert that lands from NVMe enters probation; its next use from
+RAM moves it to the kept chain, as does a write-back from VRAM; the kept chain's overflow falls back to probation's new
+end; victims are taken from probation's old end first. An expert that was read for one step and not used again leaves
+once the probation fifth of the tier has turned over, not the whole tier. Lanes, admission and the bytes are as before.
+DeepSeek in mode `nvme` sets 80; GLM and mode `nvme-exact` keep the plain chain (not measured there).
+
+**Measured** (trace B replay with turn checkpoints, a fresh server per row):
+
+| `NV_SLRU` | total | TTFT | answers | NVMe reads |
+|---|---|---|---|---|
+| 0 (LRU) | 616.0 s | 231.7 s | 384.3 s (18.4 tok/s) | 174,659 |
+| 75 | 598.8 s | 229.7 s | 369.1 s (19.2 tok/s) | 162,963 |
+| **80** (the default) | **598.1 s** | 229.2 s | **368.9 s (19.2 tok/s)** | 162,242 |
+| 88 | 597.6 s | 229.8 s | 367.7 s (19.2 tok/s) | 162,909 |
+| 94 | 620.9 s | 231.5 s | 389.4 s (18.2 tok/s) | 173,200 |
+
+7 % fewer reads (the simulation's one cache said 11 %; the real tiers are two, and VRAM's victims re-enter the RAM
+tier), decode 4 % faster, the replay 3 % shorter. Trace A with the default: 398.7 s against 405.5 s (answers
+229.0 s against 236.3 s, 19.9 tok/s).
+
+Quality with both changes (trace B against the exact reference of the section above, 7,121 positions): top-1 99.09 %,
+mean KL 0.00233; without either 98.97 % and 0.00233. The policy decides where an expert is, never its bytes; in mode
+`nvme` the lane that computes it can differ with where it is.
+
+### `bigmoe verify`
+
+`bigmoe verify deepseek-v4.1-flash` with turn checkpoints and the segmented LRU (baselines of 2026-11-06 and 11-09):
+mode `nvme-exact` answers are identical. Agentic benchmark: 3 / 3 tasks in 153.0 s (baseline 164.5 s), 14 turns, no
+malformed tool call, prefix reuse 89 % (79 %), time to first token after a task's first turn 4.3 s (5.7 s); two
+agents at once: 2 / 2 in 79.3 s (83.7 s), reuse 88 % (84 %), 12.9 s (14.1 s). Its 1,024-token prompt prefills in
+13.0 s against the baseline's 5.9 s: that baseline predates the exact short prefills, and the prompt takes 13.0 s
+with `-o turn_ckpts=0` and `NV_SLRU=0` as well. `bigmoe bench`, prefill on a cached 8,192-token prefix, is where it
+was: 8 / 80 / 120 / 200 / 400 / 800 / 2,000 / 5,000 / 10,000 new tokens take 1.2 / 3.4 / 3.4 / 5.6 / 8.0 / 9.7 /
+6.5 / 7.5 / 16.7 s to the first token.
+
+GLM shares the changed files (`engine/last_page.py`, `engine/tiers.py`, `nv2_host.cpp` with one LRU chain) and none of
+the behaviour: `bigmoe bench-agent glm-5.3-flash` solves 3 / 3 with no malformed tool call, at its usual 9-10 s to
+the first token and 10-11 tok/s (24 turns and 447 s this time; its trajectories vary from run to run).
+
+### Where the time goes now
+
+Trace B, 598 s, against 680 s before turn checkpoints and the segmented LRU (-12 %):
+
+- **Decode, 369 s (62 %).** 7,121 tokens in about 1,610 verify steps: 4.4 tokens and 229 ms per step, 81 % of
+  DSpark's drafted tokens accepted. A step makes ~1,400 expert picks (6 rows of 240) and reads ~97 experts from the SSD
+  (0.95 GB, ~150 ms at its 6 GB/s). Decode is still bound by those reads.
+- **Prefill of tool results, 229 s.** What is left to prefill is new. 22 of the 51 turns add 128-1,023 tokens and
+  take about 150 s of it: exact short forwards, which read every NVMe-only expert the new tokens route to (75-165 per
+  layer), also at the SSD's rate.
+- **The first decode steps after a staged forward.** A staged forward borrows the VRAM expert cache's memory for its
+  staging buffers (2 x 384 experts, whatever its length), so decode starts with that cache empty: the first step after
+  one took 0.50-1.06 s instead of the usual 0.2-0.3 s (3-20 VRAM hits in ~900 picks instead of 300-400), the second
+  0.26-0.60 s. After a per-pick prefill (under 86 new tokens) the cache is intact and the first step is a normal one.
+  Not changed: staging fewer experts for a short forward would keep part of the cache, for about 3 % of the replay.

@@ -567,12 +567,18 @@ class Pool:
                 "stage": dict(self.stage_stats, per_buffer=self.stage_n) if self.stage_n else None,
                 "warm_prefill": self.warm_prefill.summary() if self.warm_prefill is not None else None,
                 "last_page": _last_page_stats(),
+                "turn_resume": _turn_resume_stats(),
                 "picks_hist": dict(sorted(self.size_hist.items()))}
 
 
 def _last_page_stats():
     from . import last_page
     return dict(last_page.STATS)
+
+
+def _turn_resume_stats():
+    from . import turn_resume
+    return turn_resume.summary() if turn_resume.CONFIG["entries"] or turn_resume.STATS["stashed"] else None
 
 
 class BCProxy:
@@ -737,7 +743,11 @@ def attach(model):
         _hook_prefill(type(model))
     if approx_prefill:
         from . import last_page
-        log(last_page.apply(p.stage_min, p.topk, last_page.rewindable(model)[0]))
+        rewinds = last_page.rewindable(model)[0]
+        log(last_page.apply(p.stage_min, p.topk, rewinds))
+        if rewinds:      # the next request of a conversation resumes where the last one stopped
+            from . import turn_resume
+            log(turn_resume.install(int(env("TURN_CKPTS", "4"))))
     log(f"pool: {len(mods)} MoE layers (experts {p.first}..{p.first + p.E - 1}), {p.S} slots x {p.rec / 1e6:.2f} MB = "
         f"{p.S * p.rec / GiB:.2f} GiB ({p.S / len(mods):.1f}/layer), {'uniform' if p.uniform else 'per-layer'} geometry, "
         f"admit <= {admit_max} picks, stage 2 x {p.stage_n} experts (>= {stage_min} picks), elastic "

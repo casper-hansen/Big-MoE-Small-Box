@@ -54,8 +54,13 @@ PATCHED_STASH = """\
                     _BIGMOE_TAIL_CKPT(self, seq, prefill_start, prefill_end)   # bigmoe (engine/last_page.py)
 """
 
+# a prefill that starts inside a page: a job resumed from a turn checkpoint (engine/turn_resume.py)
+STOCK_ASSERT = "        assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks\n"
+PATCHED_ASSERT = "        assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks or _BIGMOE_MID_PAGE\n"
+
 # tail checkpoints: stashed / skipped (the state could not be moved back to the boundary) / page not complete
 STATS = {"tail_ckpt": 0, "tail_ckpt_skipped": 0, "tail_ckpt_page": 0}
+TAIL_WINDOW_CHECK = True
 
 
 def tail_limit(stage_min: int, experts_per_token: int) -> int:
@@ -91,6 +96,79 @@ def _skip(why: str):
     STATS["skipped_why"][why] = STATS["skipped_why"].get(why, 0) + 1
 
 
+def cannot_move(comps: list, pos: int):
+    """Why the paired state cannot be checkpointed at `pos` by moving its cursor back (None: it can, exactly). Every
+    side is a DSV4State at or up to a page past `pos`; the SWA ring still holds the whole attention window below
+    `pos` (its rows start at window_beg: after a forward of a page or more the ring is rebased to the page boundary
+    below the last window, so a boundary nearer than the window to the end has lost the rows before it)."""
+    from exllamav3.constants import PAGE_SIZE
+    if not comps:
+        return "no state"
+    for st in comps:
+        if type(st).__name__ != "DSV4State":
+            return type(st).__name__
+        if not 0 <= st.position - pos <= min(st.rollback_capacity(), PAGE_SIZE):
+            return "rollback"
+        if getattr(st, "wshift", 0):
+            return "ring shift pending"
+    window = 0
+    for l in state_layers(comps):
+        name = type(l).__name__
+        if name not in ("DSV4LayerState", "PLELayerState") or (name == "PLELayerState" and l.win):
+            return name
+        window = max(window, int(getattr(l, "window", 0) or 0))
+    for st in comps:       # (a side that already stands at `pos` is not moved)
+        if st.position != pos and st.window_beg > 0 and pos - st.window_beg < window:
+            return "window"
+    return None
+
+
+def state_layers(comps: list) -> list:
+    return list({id(l): l for st in comps for l in st.cache.get_all_recurrent_layers().values()}.values())
+
+
+def engram_ids(l, ids, pos: int):
+    """An Engram (PLE) layer's carried token-id context at `pos`: the prepared ids of the ctx tokens before it
+    (`ids`: the sequence, (1, n), or a callable (a, b) -> (1, b - a)), eos-padded at the sequence start."""
+    import torch
+    ctx = l.ctx
+    lo = max(0, pos - ctx)
+    part = ids(lo, pos) if callable(ids) else ids[:, lo:pos]
+    out = l.module._prepare_ids(part.reshape(1, -1)).reshape(-1)
+    if out.numel() < ctx:
+        pad = torch.full((ctx - out.numel(),), l.module.ple_embedding.eos_token_id, dtype=out.dtype)
+        out = torch.cat([pad, out])
+    return out.to(l.id_state.dtype)
+
+
+def stash_at(rs, ids, pos: int, fn):
+    """Run fn() (a stash of the paired state `rs`) with the state standing at `pos`: every side's cursor is moved
+    there and the Engram layers stash the id context of `pos`; both are put back afterwards. cannot_move(...) must
+    have passed."""
+    from exllamav3.cache.recurrent import host_copy
+    comps = list(rs.components)
+    patched = []
+    for l in state_layers(comps):
+        if type(l).__name__ != "PLELayerState":
+            continue
+        at = engram_ids(l, ids, pos)
+
+        def stash(slot, position=0, _l=l, _ids=at):
+            return host_copy(_l.conv_state[slot, :, :_l.win]), host_copy(_ids)
+        l.stash = stash                # instance attribute: this stash only
+        patched.append(l)
+    was = [st.position for st in comps]
+    for st in comps:
+        st.position = pos
+    try:
+        return fn()
+    finally:
+        for st, p in zip(comps, was):
+            st.position = p
+        for l in patched:
+            del l.stash
+
+
 def stash_tail(job, seq, prefill_start: int, prefill_end: int):
     """After a prompt's last forward (no last-page split): stash the recurrent checkpoint at the last page boundary
     from the end state, as Job.prefill's split would have. Every side of the paired state (the target and DSpark's
@@ -102,50 +180,16 @@ def stash_tail(job, seq, prefill_start: int, prefill_end: int):
         return
     rs = job.recurrent_state
     comps = list(getattr(rs, "components", None) or [])
-    if not comps:
-        return _skip("no state")
-    for st in comps:
-        if type(st).__name__ != "DSV4State":
-            return _skip(type(st).__name__)
-        if not 0 < st.position - lpb <= st.rollback_capacity():
-            return _skip("rollback")
+    why = cannot_move(comps, lpb)
+    if why == "window" and not TAIL_WINDOW_CHECK:
+        why = None
+    if why is not None:
+        return _skip(why)
     page = seq.allocated_pages[lpb // PAGE_SIZE - 1]
     if page.kv_position != PAGE_SIZE:
         STATS["tail_ckpt_page"] += 1
         return
-    layers = list({id(l): l for st in comps for l in st.cache.get_all_recurrent_layers().values()}.values())
-    for l in layers:
-        name = type(l).__name__
-        if name not in ("DSV4LayerState", "PLELayerState") or (name == "PLELayerState" and l.win):
-            return _skip(name)
-    from exllamav3.cache.recurrent import host_copy
-    import torch
-    patched = []
-    for l in layers:
-        if type(l).__name__ != "PLELayerState":
-            continue
-        ctx = l.ctx
-        lo = max(0, lpb - ctx)
-        ids = l.module._prepare_ids(seq.sequence_ids.torch_slice(lo, lpb).reshape(1, -1)).reshape(-1)
-        if ids.numel() < ctx:
-            pad = torch.full((ctx - ids.numel(),), l.module.ple_embedding.eos_token_id, dtype=ids.dtype)
-            ids = torch.cat([pad, ids])
-        ids = ids.to(l.id_state.dtype)
-
-        def stash(slot, position=0, _l=l, _ids=ids):
-            return host_copy(_l.conv_state[slot, :, :_l.win]), host_copy(_ids)
-        l.stash = stash                # instance attribute: this stash only
-        patched.append(l)
-    pos = [st.position for st in comps]
-    for st in comps:
-        st.position = lpb
-    try:
-        job.generator.recurrent_cache.put(page.phash, rs)
-    finally:
-        for st, p in zip(comps, pos):
-            st.position = p
-        for l in patched:
-            del l.stash
+    stash_at(rs, seq.sequence_ids.torch_slice, lpb, lambda: job.generator.recurrent_cache.put(page.phash, rs))
     job.last_recurrent_checkpoint_pos = lpb
     STATS["tail_ckpt"] += 1
 
@@ -157,6 +201,7 @@ def apply(stage_min: int, experts_per_token: int, tail_ckpt: bool = False) -> st
     limit = tail_limit(stage_min, experts_per_token)
     J._BIGMOE_LAST_PAGE_MAX = limit
     J._BIGMOE_TAIL_CKPT = None
+    J._BIGMOE_MID_PAGE = False
     if not getattr(J.Job.prefill, "_bigmoe_last_page", False):
         src = textwrap.dedent(inspect.getsource(J.Job.prefill))
         # dedent(getsource) leaves the method body at 4 spaces; the snippets sit two levels deeper
@@ -170,6 +215,9 @@ def apply(stage_min: int, experts_per_token: int, tail_ckpt: bool = False) -> st
         has_hook = src.count(stock_s) == 1
         if has_hook:
             src = src.replace(stock_s, patched_s)
+        mid_page = src.count(STOCK_ASSERT) == 1
+        if mid_page:
+            src = src.replace(STOCK_ASSERT, PATCHED_ASSERT)
         tree = ast.parse(src)
         ast.increment_lineno(tree, inspect.getsourcelines(J.Job.prefill)[1] - 1)   # tracebacks point into job.py
         ns = {}
@@ -177,6 +225,7 @@ def apply(stage_min: int, experts_per_token: int, tail_ckpt: bool = False) -> st
         fn = ns["prefill"]
         fn._bigmoe_last_page = True
         fn._bigmoe_tail_ckpt = has_hook
+        fn._bigmoe_mid_page = mid_page
         fn.__qualname__ = J.Job.prefill.__qualname__
         J.Job.prefill = fn
     if tail_ckpt:
