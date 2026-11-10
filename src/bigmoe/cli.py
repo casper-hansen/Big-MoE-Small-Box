@@ -33,10 +33,8 @@ def _add_box_args(p):
     g.add_argument("--home", help="artifact directory (default $BIGMOE_HOME or ~/.cache/bigmoe)")
     g.add_argument("--runtime", default="managed", help="managed | current | /path/to/python")
     g.add_argument("--mode", help="backend option: nvme (CPU lane, default) | nvme-exact")
-    g.add_argument("--cache-quant", type=int, help="backend option: KV-cache bits")
-    g.add_argument("--chunk-size", type=int, help="backend option: prefill chunk")
     g.add_argument("-o", "--option", action="append", default=[], metavar="KEY=VALUE",
-                   help="any backend option (JSON values: -o vram_expert_slots=null)")
+                   help="a backend option, see `bigmoe models` (JSON values: -o x16_layers=21)")
     g.add_argument("-e", "--env", action="append", default=[], metavar="KEY=VALUE", help="extra server environment")
     g.add_argument("--arg", action="append", default=[], dest="extra_args", metavar="ARG", help="extra server argument")
 
@@ -47,9 +45,8 @@ def _box(a):
     for item in a.option:
         k, _, v = item.partition("=")
         opts[k.strip()] = _value(v)
-    for name in ("mode", "cache_quant", "chunk_size"):
-        if getattr(a, name, None) is not None:
-            opts[name] = getattr(a, name)
+    if a.mode is not None:
+        opts["mode"] = a.mode
     env = dict(kv.split("=", 1) for kv in a.env)
     return AutoBox(a.model, revision=a.revision, backend=a.backend, context=a.context, memory_gb=a.memory_gb,
                    host=a.host, port=a.port, served_name=a.served_name, home=a.home, runtime=a.runtime, env=env,

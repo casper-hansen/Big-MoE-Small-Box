@@ -235,7 +235,7 @@ class ExlEngine:
         self.stats = {"requests": 0, "completion_tokens": 0,
                       "scheduler": {"steps": 0, "reserved": 0, "no_pages": 0, "requeue_waits": 0,
                                     "prefill_tokens": 0, "verify_steps": 0, "drafts_dropped": 0}}
-        self.kl = {"on": os.environ.get(f"{self.prefix}KL_CAPTURE") == "1", "prompt": None, "gen": [], "steps": []}
+        self.kl = {"on": False, "prompt": None, "gen": [], "steps": []}
         self.vision = None
         self.tiers = None
 
@@ -252,22 +252,9 @@ class ExlEngine:
         self.torch = torch
         args = self.args = parse_exl_args(self.argv)
         engine = None
-        if self.backend == "dsv41":
-            if os.environ.get("DSV41_NV_STORE"):
-                from ..engine import tiers as engine
-                engine.install()
-        else:
-            from ..models.glm53.engine import NOT_INCLUDED
-            for var, mod in NOT_INCLUDED.items():
-                if os.environ.get(var) not in (None, "", "0"):
-                    raise SystemExit(f"{var}={os.environ[var]} needs upstream glm-flash-lite's {mod}, which bigmoe "
-                                     f"does not include")
-            if os.environ.get("GLM53_NV") == "2":
-                assert os.environ.get("GLM53_EC"), "GLM53_NV=2 needs GLM53_EC=1 (the VRAM expert cache)"
-                from ..engine import tiers as engine
-                engine.install()
-            elif os.environ.get("GLM53_NV") not in (None, "", "0") or os.environ.get("GLM53_EC"):
-                raise SystemExit("GLM53_NV must be 2 (the shared engine) when the expert cache is on")
+        if os.environ.get(f"{self.prefix}NV_STORE"):
+            from ..engine import tiers as engine
+            engine.install()
         self.tiers = engine
         if engine is not None:
             engine.ARGV = list(self.argv)     # the RAM tier leaves -rcs / -ccs to exllamav3 (tiers._rcs_bytes)
@@ -297,7 +284,7 @@ class ExlEngine:
         cpus = os.environ.get(f"{self.prefix}MAIN_CPUS")
         if cpus:   # the GPU-feeding thread off the CPU-lane / reader cores
             pin_unpinned_threads(set(_cpus(cpus)))
-            torch.set_num_threads(int(os.environ.get(f"{self.prefix}TORCH_THREADS", "1")))
+            torch.set_num_threads(1)
             self.log(f" -- engine thread on cpus {sorted(os.sched_getaffinity(0))}; vLLM I/O threads unpinned")
 
     def _eos_ids(self) -> list:
@@ -328,7 +315,7 @@ class ExlEngine:
                              recurrent_cache_size=int(a.recurrent_cache_size * 1024 ** 3),
                              recurrent_checkpoint_interval=int(os.environ.get(f"{self.prefix}RC_INTERVAL", "0")) or None,
                              **serving.prefix_cache_tiers(a))
-        if self.backend == "glm53" and a.ngram_match_min and os.environ.get("GLM53_NG_POLICY", "1") == "1":
+        if self.backend == "glm53" and a.ngram_match_min:
             from exllamav3.generator.generator import Generator as G
             from exllamav3.generator.job import Job
             from ..models.glm53.engine import ngram_policy
@@ -348,14 +335,13 @@ class ExlEngine:
         nv2 = None
         if backend == "glm53" and self.tiers is not None:
             from ..engine import nv2
-        lossy_dec = os.environ.get("GLM53_NV_LOSSY_DEC") == "1"
 
         def fwd(*a, **kw):
             ids = kw["input_ids"] if "input_ids" in kw else (a[0] if a else None)
             params = kw["params"] if "params" in kw else (a[1] if len(a) > 1 else None)
             staged = isinstance(params, dict) and params.get("pinned_staging")
             if nv2 is not None and staged:
-                nv2.VERIFY[0] = int(ids.shape[-1]) > 1 or lossy_dec
+                nv2.VERIFY[0] = int(ids.shape[-1]) > 1
             try:
                 out = orig(*a, **kw)
             finally:

@@ -192,8 +192,7 @@ def test_launch_env_turns_multimodal_on_by_default(tmp_path, monkeypatch, model)
     env = spec()
     assert env["BIGMOE_MM"] == "1" and "BIGMOE_MM_MAX_TOKENS" not in env
     assert env["BIGMOE_MM_DISK_DIR"].startswith(str(tmp_path)) and env["BIGMOE_MM_DISK_MB"] == "2048"
-    env = spec(image_tokens=512, mm_cache_mb=0)
-    assert env["BIGMOE_MM_MAX_TOKENS"] == "512" and "BIGMOE_MM_DISK_DIR" not in env
+    assert spec(image_tokens=512)["BIGMOE_MM_MAX_TOKENS"] == "512"
     assert spec(multimodal=False)["BIGMOE_MM"] == "0"
     with pytest.raises(ValueError):
         spec(image_tokens=4)

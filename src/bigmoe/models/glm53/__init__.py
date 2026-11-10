@@ -1,6 +1,5 @@
-"""GLM-5.3-Flash (EXL3 3.05 bpw) on one 24 GB GPU with glm-flash-lite's engine: routed experts in a VRAM cache, a
-pinned RAM tier sized from the memory cap, and an NVMe store; mode "nvme" adds an AVX2 CPU lane (near-exact decode),
-"nvme-exact" keeps every expert on the GPU (bit-exact with stock exllamav3).
+"""GLM-5.3-Flash (EXL3 3.05 bpw) on one 24 GB GPU: routed experts in a VRAM cache, a pinned RAM tier and an NVMe store
+(store v1: one record size).
 """
 import dataclasses
 import hashlib
@@ -26,77 +25,47 @@ PKG = Path(__file__).resolve().parent
 DATA = PKG / "data"
 
 REPO = "turboderp/GLM-5.3-Flash-exl3"
-VARIANTS = {"3.05bpw": "332ab457b709b7ba30dd9a448be5de03b80a7ac9"}  # branch -> the commit the engine was validated on
+VARIANTS = {"3.05bpw": "332ab457b709b7ba30dd9a448be5de03b80a7ac9"}  # branch -> the commit the engine is validated on
 DEFAULT_VARIANT = "3.05bpw"
 IGNORE = ("README.md", ".gitattributes", "*.kate-swp", "quantization_config.json")  # never read by the server
 STORE_NAME = "glm53_flash_exl3_3.05bpw_experts"
 MTP_MODEL_LAYER = 45
-# planner cost model "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone" (ms). Upstream's cb = 0.165 ms per CPU-lane expert
-# is calibrated for 22 EPYC cores; with 5 Ryzen lane cores an expert costs ~0.65 ms and the stock model overloads the
-# lane. Tuned on the RTX 3090 box (2026-10-19, C1 chat): cb 0.165 -> 9.5, 0.30 -> 10.1, 0.40 -> 10.1, 0.65 -> 9.7 tok/s.
-# NVMe arrival model (2026-10-20): one 9.44 MB record takes ~1.45 ms of the SN850X at 6.7 GB/s and demand reads queue
-# behind each other (nvdeep 0.395 -> 1.45, nvlat 0.12 -> 0.25). With the engine's zero-copy cost for landed NVMe picks
-# (tnzc 0.6 ms in the MoE kernel vs ~0.39 ms on the CPU lane) the late NVMe picks go to the CPU: +3-5 % decode.
-TUNED_PLANNER = "0.17,0.023,0.38,0.145,0.40,0.10,0.40,0.25,1.45,0.75"
-# CPUs with AVX-512 VBMI + VNNI (Zen 4, Ice Lake and later) run the CPU lane's trellis decode with vpermt2b /
-# vpmultishiftqb (ft_n135.h): an expert takes 0.32 instead of 0.38 ms on the 7600X's 5 lane cores, so the lane takes
-# more experts (cb 0.40 -> 0.32). With the main thread and the controller no longer spinning on core 0 (blocking token
-# event, MWAITX) the lane cores clock 4.8 instead of 4.34 GHz: cb 0.29. Used when planner_cost is left at TUNED_PLANNER.
-TUNED_PLANNER_VBMI = "0.17,0.023,0.38,0.145,0.29,0.10,0.40,0.25,1.45,0.75"
-VBMI_FLAGS = {"avx512f", "avx512bw", "avx512vl", "avx512vbmi", "avx512_vnni"}
 MODES = ("nvme", "nvme-exact")
-KV_BYTES_PER_TOKEN = 17609   # measured: a 4,507,871-byte disk page image, 256 tokens (FP16 KV)
-# speculation: "ngram" drafts tokens from the context (prompt lookup) and verifies them with the target model (see README).
 SPECULATION = ("none", "ngram")
-
-
-RC_NVME = None   # rc_interval in mode nvme when the option is left at None (see Options.rc_interval)
+KV_BYTES_PER_TOKEN = 17609   # FP16 K/V per token of a cached page
+# Planner cost model, ms per expert (Pol in nv2_host.cpp), tuned for 5 Ryzen 7600X lane cores and an SN850X. With
+# AVX-512 VBMI + VNNI the CPU lane decodes the trellis faster, so its per-expert cost (the fifth value) is lower.
+PLANNER_COST = "0.17,0.023,0.38,0.145,0.40,0.10,0.40,0.25,1.45,0.75"
+PLANNER_COST_VBMI = "0.17,0.023,0.38,0.145,0.29,0.10,0.40,0.25,1.45,0.75"
+VBMI_FLAGS = {"avx512f", "avx512bw", "avx512vl", "avx512vbmi", "avx512_vnni"}
+MAX_BATCH_SIZE = 8
+NGRAM_MIN = 2        # speculation="ngram": shortest context match that yields a draft
+DRAFT_TOKENS = 5     # speculation="ngram": drafted tokens verified per step
 
 
 @dataclasses.dataclass
 class GLM53Options:
+    # "nvme": RAM-resident experts may be computed on the CPU lane (near-exact). "nvme-exact": every expert on the GPU,
+    # exllamav3's own arithmetic on the same bytes.
     mode: str = "nvme"
-    cache_quant: int = None  # KV-cache bits (-cq); None = FP16
-    chunk_size: int = 8192
-    max_batch_size: int = 8
-    vram_expert_slots: int = None  # None = all free VRAM (measured best); an int caps the expert cache
-    planner_cost: str = TUNED_PLANNER
-    cpus: object = "auto"  # or a CpuLayout, or {"main", "controller", "lane", "readers"}
-    slim: bool = True
+    cache_quant: int = None        # K/V cache bits (2..8); None = FP16
+    chunk_size: int = 8192         # prefill chunk, tokens
+    cpus: object = "auto"          # or a CpuLayout, or {"main", "controller", "lane", "readers"}
+    slim: bool = True              # punch the expert bytes out of the checkpoint once the store is verified
     verify_weights: bool = True
-    speculation: str = "none"  # "ngram": n-gram drafts from the context, verified by the target (off by default)
-    ngram_min: int = 2          # speculation="ngram": shortest context match that yields a draft
-    draft_tokens: int = 5       # speculation="ngram": drafted tokens verified per step
-    # exllamav3's recurrent-state prefix cache in host RAM (-rcs, GiB; ~143 MB per checkpoint). Every GiB left to the RAM
-    # expert tier instead is ~110 more cached experts: 4 -> 1 GiB measured +5 % decode (fewer NVMe reads)
+    speculation: str = "none"      # "ngram": drafts copied from the context, verified by the model
+    # host RAM for recurrent-state checkpoints (exllamav3 -rcs, ~143 MB each); what it does not take is RAM expert tier
     prefix_cache_gb: float = 1.0
-    # recurrent-state checkpoints while decoding, every rc_interval tokens (a multiple of the 256-token page), so an
-    # agent's next turn, which extends this answer, resumes inside it instead of re-prefilling it (docs/vllm.md,
-    # "Decode-time checkpoints"). None: RC_NVME in mode nvme, exllamav3's own schedule (2048) in nvme-exact, which
-    # stays bit-exact; 0: exllamav3's schedule. Checkpoints share prefix_cache_gb (LRU).
-    rc_interval: int = None
-    # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
-    # GPU cache evicts are restored from it instead of prefilled again. disk_cache: a directory for exllamav3's
-    # persistent third tier behind it (pages and checkpoints survive restarts); written only when pages leave the GPU
-    # or the server goes idle. A restore from disk goes through the RAM tier, so with disk_cache cpu_cache_gb defaults
-    # (None) to the whole context: ~2.5 GiB at 128k (models/prefix_cache.py).
+    # Prefix-cache tiers behind the GPU page cache: cpu_cache_gb of pinned RAM (taken from the RAM expert tier), and
+    # disk_cache, a directory whose pages and checkpoints survive restarts. A prefix returns from disk through the RAM
+    # tier, so with disk_cache the RAM tier defaults to the whole context (models/prefix_cache.py).
     cpu_cache_gb: float = None
     disk_cache: str = None
-    # mode nvme: the first x16_layers MoE layers keep the CPU lane on its bit-exact X16 path (engine/x16.py); 0 = off.
-    # 21 (exllamav3 1.6.6, 2026-11-06): forced-token top-1 agreement with exact decode 99.2 % (mean KL 0.0011) instead of
-    # 97.3 % (0.0096), decode -13 % (8k prompt: 9.85 tok/s instead of 11.28)
-    x16_layers: int = 0
-    # image input (bigmoe/multimodal.py), on by default: OpenAI / Anthropic image blocks in chat messages. The vision tower
-    # is not resident (no VRAM, no RAM while no image comes in); a request with new images loads it from the checkpoint
-    # on NVMe into VRAM lent by the expert cache, encodes them and unloads it. Embeddings are cached by image content
-    # (RAM, then mm_cache_mb on the SSD), so a resent image keeps its token ids and the prefix cache reuses it.
-    # image_tokens caps the tokens per image (None: the model's own budget); False turns image input off (400).
-    # extra cgroup RAM, on top of memory_gb, for vLLM's API server / detokenizer process (bigmoe/vllm); without it nv2
-    # shrinks the RAM expert tier by that process's footprint (~1.3 GiB measured), which costs decode speed.
+    x16_layers: int = 0            # mode nvme: leading MoE layers whose CPU lane is bit-exact (docs/x16.md)
+    # RAM added to memory_gb for vLLM's API server process, which would otherwise come out of the RAM expert tier
     frontend_extra_ram_gb: float = 1.5
-    multimodal: bool = True
-    image_tokens: int = None
-    mm_cache_mb: int = 2048
+    multimodal: bool = True        # image input
+    image_tokens: int = None       # cap on tokens per image; None = the model's own budget
 
     def validate(self):
         if not 0.0 <= float(self.frontend_extra_ram_gb) <= 8.0:
@@ -105,15 +74,11 @@ class GLM53Options:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
         if self.speculation not in SPECULATION:
             raise ValueError(f"speculation must be one of {SPECULATION}, got {self.speculation!r}")
-        if self.ngram_min < 1 or self.draft_tokens < 1:
-            raise ValueError("ngram_min and draft_tokens must be at least 1")
         if self.cache_quant is not None and not 2 <= int(self.cache_quant) <= 8:
             raise ValueError(f"cache_quant must be 2..8 bits or None, got {self.cache_quant!r}")
-        if int(self.chunk_size) <= 0 or int(self.max_batch_size) <= 0:
-            raise ValueError("chunk_size and max_batch_size must be positive")
+        if int(self.chunk_size) <= 0:
+            raise ValueError("chunk_size must be positive")
         engine.check_x16_layers(self.x16_layers)
-        if self.rc_interval is not None and (int(self.rc_interval) < 0 or int(self.rc_interval) % 256):
-            raise ValueError(f"rc_interval must be 0, a multiple of 256 or None, got {self.rc_interval!r}")
         if not 0.25 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0.25..64, got {self.prefix_cache_gb!r}")
         if self.cpu_cache_gb is not None and not 0.0 <= float(self.cpu_cache_gb) <= 64:
@@ -122,8 +87,6 @@ class GLM53Options:
             raise ValueError("disk_cache needs cpu_cache_gb > 0 (exllamav3's disk tier sits behind the CPU tier)")
         if self.image_tokens is not None and not 16 <= int(self.image_tokens) <= 16384:
             raise ValueError(f"image_tokens must be 16..16384 or None, got {self.image_tokens!r}")
-        if int(self.mm_cache_mb) < 0:
-            raise ValueError(f"mm_cache_mb must be >= 0, got {self.mm_cache_mb!r}")
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
             raise ValueError("cpus must be 'auto', a CpuLayout or a dict(main=, controller=, lane=, readers=)")
 
@@ -187,7 +150,6 @@ class GLM53(ModelBackend):
         return runtime_spec("glm53", "import torch, exllamav3; from exllamav3.ext import exllamav3_ext")
 
     def kernel_specs(self, box) -> list:
-        from ... import engine
         return engine.kernel_specs()
 
     def steps(self, box) -> list:
@@ -292,62 +254,40 @@ class GLM53(ModelBackend):
         system.check_odirect(self.store(box).bin)
         return warnings
 
-    @staticmethod
-    def planner(o) -> str:
-        if o.planner_cost == TUNED_PLANNER and VBMI_FLAGS <= system.cpu_flags():
-            return TUNED_PLANNER_VBMI
-        return o.planner_cost
-
     def launch_spec(self, box) -> LaunchSpec:
-        """Same environment and arguments as the measured serve.sh (glm-flash-lite's docker/entrypoint.sh, modes nvme /
-        nvme-exact); tests/test_glm53_launch.py checks it against the reference runs."""
         o, store = box.options, self.store(box)
+        nvme = o.mode == "nvme"
         tune = box.server.run_dir / "coop_autotune_1gpu.bin"  # exllamav3 appends to its tune cache: fresh copy per start
-        env = {"BIGMOE_ENGINE_PREFIX": "GLM53_"}   # shared engine (bigmoe.engine), knobs under GLM53_
-        if o.mode == "nvme-exact":
-            reserve, k, mode_args = "1.0", "0", []
-            env.update(GLM53_NV="2", GLM53_NV_CPU="0")
-        else:
-            reserve, k, mode_args = "1.5", "1", ["-ambs", "4"]
-            env.update(GLM53_NV="2", GLM53_NV_CPU="1", GLM53_K_FTSPLIT="0", GLM53_K_OVL="0", GLM53_NV_VRING="24",
-                       GLM53_NV_PREFETCH="1", GLM53_MAX_RQ_TOKENS="4096", GLM53_NV_CPU_KERN="1",
-                       GLM53_NV_PUBFAST="1", GLM53_NV_PFSIDE="1", GLM53_NV_POL=self.planner(o))
-            env.update(engine.x16_env("GLM53_", o.x16_layers))
-        env["GLM53_EC_STAGE_MIN"] = "512"
-        env["GLM53_NV_STORE"] = str(store.bin)
-        for var in ("GLM53_K_FTSPLIT", "GLM53_K_OVL"):
-            env.setdefault(var, k)
         stats = str(DATA / "stats_own_dec.json")
-        env.update(GLM53_ZC_STATS=stats, GLM53_EC="1", GLM53_EC_WARM=stats, GLM53_EC_RESERVE_GB=reserve,
-                   GLM53_EC_STAGE_GB="2.6", GLM53_EC_ELASTIC_GB="10", GLM53_CPU_TIER="0",
-                   EXLLAMAV3_TUNE_CACHE=str(tune), TRITON_CACHE_DIR=str(box.home.triton), PYTHONUNBUFFERED="1",
-                   # exllamav3's fused hyper-connection sites (mix + RMSNorm, deferred apply), bit-identical to the
-                   # unfused launches; off by default on CUDA, measured on par with the 1.5.1 runtime's custom kernels
-                   EXL3_HC_FOLD="1")
-        if o.vram_expert_slots is not None:
-            env["GLM53_EC_MAX_SLOTS"] = str(int(o.vram_expert_slots))
+        env = {"BIGMOE_ENGINE_PREFIX": "GLM53_", "GLM53_NV_STORE": str(store.bin), "GLM53_NV_CPU": "1" if nvme else "0",
+               "GLM53_EC_WARM": stats, "GLM53_EC_RESERVE_GB": "1.5" if nvme else "1.0", "GLM53_EC_STAGE_GB": "2.6",
+               "GLM53_EC_STAGE_MIN": "512", "GLM53_EC_ELASTIC_GB": "10", "EXLLAMAV3_TUNE_CACHE": str(tune),
+               "TRITON_CACHE_DIR": str(box.home.triton), "PYTHONUNBUFFERED": "1",
+               "EXL3_HC_FOLD": "1"}   # exllamav3's fused hyper-connection sites: same results, faster decode
         lay = self.cpu_layout(box)
         env.update(GLM53_MAIN_CPUS=format_cpus(lay.main), GLM53_NV_CTL_CPU=str(lay.controller),
                    GLM53_NV_READER_CPUS=format_cpus(lay.readers))
-        if env["GLM53_NV_CPU"] == "1":
-            env["GLM53_NV_CPU_CPUS"] = format_cpus(lay.lane)
-        small = ["-rcs", f"{float(o.prefix_cache_gb):g}"]
-        if box.memory_gb < 24:  # upstream's small-host budget
+        if nvme:
+            planner = PLANNER_COST_VBMI if VBMI_FLAGS <= system.cpu_flags() else PLANNER_COST
+            env.update(GLM53_NV_CPU_CPUS=format_cpus(lay.lane), GLM53_NV_POL=planner, GLM53_NV_VRING="24",
+                       GLM53_NV_PREFETCH="1", GLM53_NV_PFSIDE="1", GLM53_NV_PUBFAST="1", GLM53_MAX_RQ_TOKENS="4096")
+            env.update(engine.x16_env("GLM53_", o.x16_layers))
+        rcs = float(o.prefix_cache_gb)
+        if box.memory_gb < 24:   # small hosts: a smaller prefill ring, more reader threads, smaller read pieces
             env.update(GLM53_NV_MARGIN_GB="1.5", GLM53_NV_PF_RING="128", GLM53_NV_THREADS="48", GLM53_NV_PIECE_KB="1024")
-            small = ["-rcs", f"{min(1.0, float(o.prefix_cache_gb)):g}"]
+            rcs = min(1.0, rcs)
         for spec in self.kernel_specs(box):
             env[spec.env_var] = str(box.runtime.kernel_dirs([spec], box.arch)[spec.name])
         if not system.systemd_scope_available():  # no cgroup cap to size the RAM tier from: give it explicitly
             env["GLM53_NV_RAM_GB"] = f"{max(4.0, box.memory_gb - 12.5):.1f}"
         env.update(multimodal_env(box, self.name))
-        rc = o.rc_interval if o.rc_interval is not None else (RC_NVME if o.mode == "nvme" else None)
-        if rc:
-            env["GLM53_RC_INTERVAL"] = str(int(rc))
         env["PATH"] = f"{box.runtime.python.parent}:{os.environ.get('PATH', '')}"
         env.update({k_: str(v) for k_, v in box.env.items()})
         argv = [str(box.runtime.python), "-m", "bigmoe.vllm.serve", "--backend", "glm53", "-m", str(self.model_dir(box)),
-                "-cs", str(box.context), "--max-batch-size", str(o.max_batch_size), "-chunk_size", str(o.chunk_size),
-                *mode_args, *small]
+                "-cs", str(box.context), "--max-batch-size", str(MAX_BATCH_SIZE), "-chunk_size", str(o.chunk_size)]
+        if nvme:
+            argv += ["-ambs", "4"]
+        argv += ["-rcs", f"{rcs:g}"]
         ccs = cpu_tier_gb(o.cpu_cache_gb, o.disk_cache, box.context, KV_BYTES_PER_TOKEN)
         if ccs:
             argv += ["-ccs", f"{ccs:g}"]
@@ -355,19 +295,20 @@ class GLM53(ModelBackend):
             argv += ["-dcd", str(Path(o.disk_cache).expanduser())]
         if o.cache_quant:
             argv += ["-cq", str(o.cache_quant)]
-        if o.speculation == "ngram":   # n-gram drafts + exact verification; user extra args come after and can override
-            # one recurrent slot: exllamav3 keeps (ndt + 1) recurrent-state snapshots per slot and KDA layer for rewinding
-            # drafts (4 MB each, 34 layers), which at -ambs 4 costs 2.7 GB of VRAM expert cache (1408 -> 1120 slots)
-            argv += ["-ngram", str(o.ngram_min), "-ndt", str(o.draft_tokens), "-ambs", "1"]
+        if o.speculation == "ngram":
+            # one recurrent slot (the later -ambs wins): exllamav3 keeps a recurrent-state snapshot per drafted token
+            # and slot for rewinding, which at four slots would cost 2.7 GB of VRAM expert cache
+            argv += ["-ngram", str(NGRAM_MIN), "-ndt", str(DRAFT_TOKENS), "-ambs", "1"]
         argv += ["--host", box.host, "--port", str(box.port), "--served-name", box.served_name, *box.extra_args]
         # ambient engine variables would silently change the configuration: only the ones set here reach the server
         unset = tuple(v for v in os.environ if v.startswith(("GLM53_", "BIGMOE_", "EXL3_", "EXLLAMAV3_")) and v not in env)
         unset += ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
-        return LaunchSpec(argv=argv, env=env, host=box.host, port=box.port, memory_gb=box.memory_gb + float(o.frontend_extra_ram_gb), unset=unset,
+        return LaunchSpec(argv=argv, env=env, host=box.host, port=box.port,
+                          memory_gb=box.memory_gb + float(o.frontend_extra_ram_gb), unset=unset,
                           served_name=box.served_name, files={str(tune): str(DATA / "coop_autotune_1gpu.bin")},
                           record={"backend": self.name, "model": box.ref.label, "commit": box.commit,
-                                  "context": box.context, "options": {k_: str(v) for k_, v in
-                                                                      dataclasses.asdict(o).items()},
+                                  "context": box.context,
+                                  "options": {k_: str(v) for k_, v in dataclasses.asdict(o).items()},
                                   "cpu_layout": lay.describe()})
 
     def bench_frame(self, n_tokens: int):

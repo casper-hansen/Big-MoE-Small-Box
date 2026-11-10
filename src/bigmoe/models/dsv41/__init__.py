@@ -1,8 +1,6 @@
-"""DeepSeek-V4.1-Flash-1017 (EXL3 2.25 bpw) on one 24 GB GPU, on exllamav3 (models/runtime.py): routed experts in a
-VRAM cache, a pinned RAM tier sized from the memory cap and an NVMe store (store v2: per-layer record sizes, the quant
-mixes 2.5 bpw outer layers with 2.0 bpw middle layers); mode "nvme" adds the CPU lane (AVX-512 VBMI trellis decode for
-K 2 / 2.5), "nvme-exact" keeps every expert on the GPU (bit-exact with stock exllamav3). The 203 GB Engram n-gram tables
-stay in the checkpoint and are streamed from disk by exllamav3 itself (row gathers through the page cache).
+"""DeepSeek-V4.1-Flash-1017 (EXL3 2.25 bpw) on one 24 GB GPU: routed experts in a VRAM cache, a pinned RAM tier and an
+NVMe store (store v2: the quant mixes 2.5 bpw outer layers with 2.0 bpw middle layers, so record sizes differ per
+layer). The 203 GB Engram n-gram tables stay in the checkpoint; exllamav3 streams them from disk.
 """
 import dataclasses
 import hashlib
@@ -14,7 +12,7 @@ from ...bench.longctx import deepseek_frame
 from ...cpus import CpuLayout, format_cpus, plan_layout
 from ...errors import BoxError, PrepareError
 from ...hub import COMMIT_RE, Checkpoint, is_sparse
-from ...kernels import KernelSpec, is_built
+from ...kernels import is_built
 from ...launcher import LaunchSpec
 from ...registry import ModelBackend, register_backend
 from ...steps import Step
@@ -29,72 +27,42 @@ PKG = Path(__file__).resolve().parent
 DATA = PKG / "data"
 
 REPO = "turboderp/DeepSeek-V4.1-Flash-1017-exl3"
-VARIANTS = {"2.25bpw": "9183eaaeb6f08dff6ee5b6e34b852911cf6733c9"}   # branch -> the commit the engine was validated on
+VARIANTS = {"2.25bpw": "9183eaaeb6f08dff6ee5b6e34b852911cf6733c9"}   # branch -> the commit the engine is validated on
 DEFAULT_VARIANT = "2.25bpw"
 IGNORE = ("README.md", ".gitattributes", "quantization_config.json")   # never read by the server
 STORE_NAME = "dsv41_flash_exl3_2.25bpw_experts"
 MODES = ("nvme", "nvme-exact")
-KV_BYTES_PER_TOKEN = 3209   # measured: an 821,470-byte disk page image, 256 tokens (FP16 KV + the DSpark draft's)
 SPECULATION = ("dspark", "none")
-# planner cost model "g0,thit,tzc,ca,cb,ctok,push,nvlat,nvdeep,nvone" (ms per expert), see nv2_host.cpp Pol
-TUNED_PLANNER = "0.17,0.023,0.36,0.145,0.42,0.12,0.40,0.25,1.36,0.75"
-
-
-RC_NVME = 256   # rc_interval in mode nvme when the option is left at None (see Options.rc_interval)
+KV_BYTES_PER_TOKEN = 3209   # FP16 K/V plus the DSpark drafter's, per token of a cached page
+PLANNER_COST = "0.17,0.023,0.36,0.145,0.42,0.12,0.40,0.25,1.36,0.75"   # ms per expert, see Pol in nv2_host.cpp
+MAX_BATCH_SIZE = 4
+RC_INTERVAL = 256     # mode nvme: tokens between recurrent checkpoints while decoding (exllamav3's own: 2048)
+DSPARK_CONF = 0.5     # a DSpark draft is cut where the drafter's confidence falls below this
 
 
 @dataclasses.dataclass
 class DSV41Options:
-    # "nvme" (default): CPU lane on, near-exact (forced-token mean KL 0.0011 vs nvme-exact); "nvme-exact": every expert
-    # on the GPU path (exllamav3's own kernels on the same bytes)
+    # "nvme": RAM-resident experts may be computed on the CPU lane (near-exact). "nvme-exact": every expert on the GPU,
+    # exllamav3's own arithmetic on the same bytes.
     mode: str = "nvme"
-    cache_quant: int = None      # KV-cache bits (-cq); None = FP16
-    chunk_size: int = 8192   # staged prefill streams every non-resident expert once per chunk: 8192 -> ~270-360 tok/s
-    max_batch_size: int = 4
-    vram_expert_slots: int = None
-    planner_cost: str = TUNED_PLANNER
-    cpus: object = "auto"
-    slim: bool = True
+    cache_quant: int = None        # K/V cache bits (2..8); None = FP16
+    chunk_size: int = 8192         # prefill chunk, tokens
+    cpus: object = "auto"          # or a CpuLayout, or {"main", "controller", "lane", "readers"}
+    slim: bool = True              # punch the expert bytes out of the checkpoint once the store is verified
     verify_weights: bool = True
-    prefix_cache_gb: float = 0.5   # exllamav3's SWA-layer state checkpoints in host RAM (-rcs, GiB)
-    # recurrent-state checkpoints while decoding, every rc_interval tokens (a multiple of the 256-token page), so an
-    # agent's next turn, which extends this answer, resumes inside it instead of re-prefilling it (docs/vllm.md,
-    # "Decode-time checkpoints"). None: RC_NVME in mode nvme, exllamav3's own schedule (2048) in nvme-exact, which
-    # stays bit-exact; 0: exllamav3's schedule. Checkpoints share prefix_cache_gb (LRU).
-    rc_interval: int = None
-    # mode nvme: checkpoints where a request stops (the end of its prompt, the end of its answer), so the next request
-    # of the conversation resumes at that token instead of the last 256-token page boundary with a checkpoint
-    # (engine/turn_resume.py). The number kept (LRU, ~36 MB each, out of prefix_cache_gb); 0 turns them off.
-    turn_ckpts: int = 4
-    # exllamav3's second-tier K/V page cache in pinned host RAM (-ccs, GiB; taken from the RAM expert tier): pages the
-    # GPU cache evicts (one long conversation evicts every other) are restored from it instead of prefilled
-    # again. disk_cache: a directory for exllamav3's persistent third tier behind it (pages and checkpoints survive
-    # restarts); written only when pages leave the GPU or the server goes idle. A restore from disk goes through the
-    # RAM tier, so with disk_cache cpu_cache_gb defaults (None) to the whole context (models/prefix_cache.py).
+    prefix_cache_gb: float = 0.5   # host RAM for recurrent-state checkpoints (exllamav3 -rcs)
+    # Prefix-cache tiers behind the GPU page cache: cpu_cache_gb of pinned RAM (taken from the RAM expert tier), and
+    # disk_cache, a directory whose pages and checkpoints survive restarts. A prefix returns from disk through the RAM
+    # tier, so with disk_cache the RAM tier defaults to the whole context (models/prefix_cache.py).
     cpu_cache_gb: float = None
     disk_cache: str = None
-    # DSpark speculative decoding (the checkpoint's own MTP block drafter, exllamav3 -mtp): drafts up to 5 tokens per
-    # step, cut where its confidence head drops below dspark_conf; the target verifies the block in one forward.
-    # Measured in mode nvme: +12.5 % (0.5: 75 % of drafted tokens accepted, 2.83 tokens per verify), 0.25 no gain.
-    # Costs ~3.4 GB of VRAM (the drafter's experts), i.e. ~350 fewer VRAM expert slots. "none" turns it off.
-    speculation: str = "dspark"
-    dspark_conf: float = 0.5
-    # mode nvme: the first x16_layers MoE layers keep the CPU lane on its bit-exact X16 path (engine/x16.py); 0 = off.
-    # Only single-token forwards use it (with DSpark on, verify forwards of those layers run their experts on the GPU)
-    x16_layers: int = 0
-    # image input (bigmoe/multimodal.py), on by default: OpenAI / Anthropic image blocks in chat messages. The vision tower
-    # is not resident (no VRAM, no RAM while no image comes in); a request with new images loads it from the checkpoint
-    # on NVMe into VRAM lent by the expert cache, encodes them and unloads it. Embeddings are cached by image content
-    # (RAM, then mm_cache_mb on the SSD), so a resent image keeps its token ids and the prefix cache reuses it.
-    # image_tokens caps the tokens per image (None: the model's own budget); False turns image input off (400).
-    # extra cgroup RAM for vLLM's API server process (bigmoe/vllm) and its loader/runtime footprint, on top of
-    # memory_gb; with it the RAM expert tier is a fixed 46.0 GiB (nvme) / 47.5 GiB (nvme-exact) instead of being
-    # sized from the cgroup at start, where cold-start heap variance moved it by several GiB (and DSpark decode speed
-    # with it). 0: no extra RAM, the tier is sized automatically from memory_gb.
+    speculation: str = "dspark"    # the checkpoint's own block drafter (up to 5 tokens per step); "none" turns it off
+    x16_layers: int = 0            # mode nvme: leading MoE layers whose CPU lane is bit-exact (docs/x16.md)
+    # RAM added to memory_gb for vLLM's API server process. Above 0 the RAM expert tier has a fixed size; at 0 it is
+    # sized from the cgroup when the engine starts.
     frontend_extra_ram_gb: float = 4.5
-    multimodal: bool = True
-    image_tokens: int = None
-    mm_cache_mb: int = 2048
+    multimodal: bool = True        # image input
+    image_tokens: int = None       # cap on tokens per image; None = the model's own budget
 
     def validate(self):
         if not 0.0 <= float(self.frontend_extra_ram_gb) <= 8.0:
@@ -103,16 +71,10 @@ class DSV41Options:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
         if self.speculation not in SPECULATION:
             raise ValueError(f"speculation must be one of {SPECULATION}, got {self.speculation!r}")
-        if not 0.0 <= float(self.dspark_conf) <= 1.0:
-            raise ValueError(f"dspark_conf must be 0..1, got {self.dspark_conf!r}")
         if self.cache_quant is not None and not 2 <= int(self.cache_quant) <= 8:
             raise ValueError(f"cache_quant must be 2..8 bits or None, got {self.cache_quant!r}")
-        if int(self.chunk_size) <= 0 or int(self.max_batch_size) <= 0:
-            raise ValueError("chunk_size and max_batch_size must be positive")
-        if self.rc_interval is not None and (int(self.rc_interval) < 0 or int(self.rc_interval) % 256):
-            raise ValueError(f"rc_interval must be 0, a multiple of 256 or None, got {self.rc_interval!r}")
-        if not 0 <= int(self.turn_ckpts) <= 64:
-            raise ValueError(f"turn_ckpts must be 0..64, got {self.turn_ckpts!r}")
+        if int(self.chunk_size) <= 0:
+            raise ValueError("chunk_size must be positive")
         if not 0.0 <= float(self.prefix_cache_gb) <= 64:
             raise ValueError(f"prefix_cache_gb must be 0..64, got {self.prefix_cache_gb!r}")
         if self.cpu_cache_gb is not None and not 0.0 <= float(self.cpu_cache_gb) <= 64:
@@ -122,8 +84,6 @@ class DSV41Options:
         engine.check_x16_layers(self.x16_layers)
         if self.image_tokens is not None and not 16 <= int(self.image_tokens) <= 16384:
             raise ValueError(f"image_tokens must be 16..16384 or None, got {self.image_tokens!r}")
-        if int(self.mm_cache_mb) < 0:
-            raise ValueError(f"mm_cache_mb must be >= 0, got {self.mm_cache_mb!r}")
         if not (self.cpus == "auto" or isinstance(self.cpus, (CpuLayout, dict))):
             raise ValueError("cpus must be 'auto', a CpuLayout or a dict(main=, controller=, lane=, readers=)")
 
@@ -136,8 +96,6 @@ class DSV41(ModelBackend):
     repos = (REPO,)
     aliases = {"deepseek-v4.1-flash": (REPO, DEFAULT_VARIANT), "dsv41": (REPO, DEFAULT_VARIANT)}
     Options = DSV41Options
-    # 128k: agent sessions grow past 64k; the model's own window is 1M (YaRN). The FP16 KV cache costs 3.2 KB per token
-    # (420 MB at 128k); measured against 64k: the same 864 VRAM expert slots, bigmoe verify within a few percent
     default_context = 131072
     default_port = 30000
     default_served_name = "deepseek-v4.1-flash"
@@ -187,7 +145,6 @@ class DSV41(ModelBackend):
                                      "from exllamav3.architecture.deepseek_v41 import DeepseekV41Config")
 
     def kernel_specs(self, box) -> list:
-        from ... import engine
         return engine.kernel_specs()
 
     def steps(self, box) -> list:
@@ -284,57 +241,50 @@ class DSV41(ModelBackend):
 
     def launch_spec(self, box) -> LaunchSpec:
         o, store = box.options, self.store(box)
-        # shared engine (bigmoe.engine), knobs under DSV41_: staged prefill stages a whole layer (384 experts) per
-        # buffer from 11 GB of elastic VRAM; 3 GB of VRAM stay with torch
-        env = {"BIGMOE_ENGINE_PREFIX": "DSV41_", "DSV41_NV": "2", "DSV41_NV_STORE": str(store.bin),
-               "DSV41_NV_CPU": "1" if o.mode == "nvme" else "0", "DSV41_NV_POL": o.planner_cost,
-               "DSV41_EC_RESERVE_GB": "3.0", "DSV41_EC_STAGE_SLOTS": "384", "DSV41_EC_STAGE_MIN": "512",
-               "DSV41_EC_ELASTIC_GB": "11", "DSV41_MAX_RQ_TOKENS": "4096",
-               "TRITON_CACHE_DIR": str(box.home.triton), "PYTHONUNBUFFERED": "1"}
-        warm = DATA / "stats_dec.json"
-        if warm.is_file():
-            env["DSV41_EC_WARM"] = str(warm)
-        if o.vram_expert_slots is not None:
-            env["DSV41_EC_MAX_SLOTS"] = str(int(o.vram_expert_slots))
+        nvme = o.mode == "nvme"
+        # staged prefill holds a whole layer (384 experts) per staging buffer, in up to 11 GB of VRAM lent by the
+        # expert cache; 3 GB of VRAM stay with torch
+        env = {"BIGMOE_ENGINE_PREFIX": "DSV41_", "DSV41_NV_STORE": str(store.bin), "DSV41_NV_CPU": "1" if nvme else "0",
+               "DSV41_NV_POL": PLANNER_COST, "DSV41_EC_RESERVE_GB": "3.0", "DSV41_EC_STAGE_SLOTS": "384",
+               "DSV41_EC_STAGE_MIN": "512", "DSV41_EC_ELASTIC_GB": "11", "DSV41_MAX_RQ_TOKENS": "4096",
+               "DSV41_EC_WARM": str(DATA / "stats_dec.json"), "TRITON_CACHE_DIR": str(box.home.triton),
+               "PYTHONUNBUFFERED": "1"}
         lay = self.cpu_layout(box)
         env.update(DSV41_MAIN_CPUS=format_cpus(lay.main), DSV41_NV_CTL_CPU=str(lay.controller),
                    DSV41_NV_READER_CPUS=format_cpus(lay.readers))
-        if env["DSV41_NV_CPU"] == "1":
+        if nvme:
             env["DSV41_NV_CPU_CPUS"] = format_cpus(lay.lane)
-            env["DSV41_EC_WARM_PREFILL"] = "1"     # engine/warm_prefill.py; tail checkpoints follow the model (last_page.py)
-            env["DSV41_NV_SLRU"] = "80"            # RAM tier: segmented LRU, 80 % kept (nv2_host.cpp; docs/vllm.md)
+            env["DSV41_EC_WARM_PREFILL"] = "1"     # engine/warm_prefill.py
+            env["DSV41_NV_SLRU"] = "80"            # RAM tier: segmented LRU, 80 % of the slots for reused experts
+            env["DSV41_RC_INTERVAL"] = str(RC_INTERVAL)
             env.update(engine.x16_env("DSV41_", o.x16_layers))
         for spec in self.kernel_specs(box):
             env[spec.env_var] = str(box.runtime.kernel_dirs([spec], box.arch)[spec.name])
         if float(o.frontend_extra_ram_gb) > 0:
-            # Deterministic RAM tier. With two processes and several GiB of cold-start heap variance,
-            # sizing from the cgroup's instantaneous "current" gave 43.7-51.6 GiB across identical starts: either a
-            # measurable decode loss or an unnecessary host-memory squeeze. Users can override through DSV41_NV_RAM_GB.
-            env["DSV41_NV_RAM_GB"] = "46.0" if o.mode == "nvme" else "47.5"
+            # a tier sized from the cgroup's free memory at start varies by several GiB between identical starts
+            env["DSV41_NV_RAM_GB"] = "46.0" if nvme else "47.5"
         elif not system.systemd_scope_available():
             env["DSV41_NV_RAM_GB"] = f"{max(4.0, box.memory_gb - 12.5):.1f}"
         env.update(multimodal_env(box, self.name))
-        rc = o.rc_interval if o.rc_interval is not None else (RC_NVME if o.mode == "nvme" else None)
-        if rc:
-            env["DSV41_RC_INTERVAL"] = str(int(rc))
-        env["DSV41_TURN_CKPTS"] = str(int(o.turn_ckpts))
         env["PATH"] = f"{box.runtime.python.parent}:{os.environ.get('PATH', '')}"
         env.update({k_: str(v) for k_, v in box.env.items()})
         argv = [str(box.runtime.python), "-m", "bigmoe.vllm.serve", "--backend", "dsv41", "-m", str(self.model_dir(box)),
-                "-cs", str(box.context), "--max-batch-size", str(o.max_batch_size), "-chunk_size", str(o.chunk_size),
+                "-cs", str(box.context), "--max-batch-size", str(MAX_BATCH_SIZE), "-chunk_size", str(o.chunk_size),
                 "-ccs", f"{cpu_tier_gb(o.cpu_cache_gb, o.disk_cache, box.context, KV_BYTES_PER_TOKEN):g}",
                 "-rcs", f"{float(o.prefix_cache_gb):g}"]
         if o.disk_cache:
             argv += ["-dcd", str(Path(o.disk_cache).expanduser())]
         if o.cache_quant:
             argv += ["-cq", str(o.cache_quant)]
-        if o.speculation == "dspark":   # the checkpoint's MTP block drafter (mtp.* tensors, never slimmed: not in the store)
+        if o.speculation == "dspark":
             argv += ["-mtp"]
-            env.setdefault("EXL3_DSPARK_CONF", f"{float(o.dspark_conf):g}")   # an explicit env override wins
+            env.setdefault("EXL3_DSPARK_CONF", f"{DSPARK_CONF:g}")   # an explicit env override wins
         argv += ["--host", box.host, "--port", str(box.port), "--served-name", box.served_name, *box.extra_args]
+        # ambient engine variables would silently change the configuration: only the ones set here reach the server
         unset = tuple(v for v in os.environ if v.startswith(("DSV41_", "BIGMOE_", "EXL3_", "EXLLAMAV3_")) and v not in env)
         unset += ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
-        return LaunchSpec(argv=argv, env=env, host=box.host, port=box.port, memory_gb=box.memory_gb + float(o.frontend_extra_ram_gb), unset=unset,
+        return LaunchSpec(argv=argv, env=env, host=box.host, port=box.port,
+                          memory_gb=box.memory_gb + float(o.frontend_extra_ram_gb), unset=unset,
                           served_name=box.served_name,
                           record={"backend": self.name, "model": box.ref.label, "commit": box.commit,
                                   "context": box.context,

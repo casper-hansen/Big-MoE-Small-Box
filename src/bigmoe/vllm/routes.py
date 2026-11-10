@@ -247,13 +247,6 @@ class BigmoeRoutes:
             return JSONResponse({"n": n, "secs": time.time() - t0, "prompt": cap["prompt"], "gen": cap["gen"],
                                  "steps": cap["steps"], "timings": (fin or {}).get("timings")})
 
-        import os
-        if os.environ.get("BIGMOE_DEBUG_RPC") == "1":     # tests only: any engine method
-            @r.post("/bigmoe/rpc")
-            async def rpc(req: Request):
-                b = await req.json()
-                return JSONResponse(await call(req, b["method"], *(b.get("args") or [])))
-
         @r.get("/nv_verify")
         async def nv_verify(req: Request, n: int = 32):
             return JSONResponse(await call(req, "nv_verify", n))

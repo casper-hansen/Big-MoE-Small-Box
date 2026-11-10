@@ -202,14 +202,11 @@ def main(argv=None):
     os.environ["VLLM_PLUGINS"] = "bigmoe,bigmoe_routes"   # endpoint plugins load only when allowlisted
     os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
     os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
-    # The API server / detokenizer is a second process. Keep it off the model's logical CPU but otherwise let the OS
-    # place it: pinning it to MAIN_CPUS stalls the model thread, and forcing it onto nv2's controller stalls the
-    # planner. BIGMOE_API_CPUS overrides the mask for benchmarking; the EngineCore worker pins the model thread after
-    # load, while vLLM's other I/O threads stay unpinned within this mask.
+    # The API server is a second process: it may run on every CPU except the model thread's. The EngineCore worker
+    # pins the model thread after load; vLLM's other threads stay unpinned within this mask.
     from .engine import _cpus
     main = os.environ.get(("DSV41_" if a.backend == "dsv41" else "GLM53_") + "MAIN_CPUS")
-    available = set(range(os.cpu_count() or 1)) - set(_cpus(main)) if main else set(range(os.cpu_count() or 1))
-    cpus = set(_cpus(os.environ["BIGMOE_API_CPUS"])) if os.environ.get("BIGMOE_API_CPUS") else available
+    cpus = set(range(os.cpu_count() or 1)) - set(_cpus(main) if main else ())
     if cpus:
         os.sched_setaffinity(0, cpus)
     from . import register

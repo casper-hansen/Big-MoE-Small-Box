@@ -42,7 +42,7 @@ def test_alias_and_commit(tmp_path):
 def test_launch_exact(tmp_path, monkeypatch):
     box, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
     e = spec.env
-    assert e["DSV41_NV"] == "2" and e["DSV41_NV_CPU"] == "0" and e["DSV41_EC_STAGE_SLOTS"] == "384"
+    assert e["DSV41_NV_CPU"] == "0" and e["DSV41_EC_STAGE_SLOTS"] == "384"
     assert (e["DSV41_EC_STAGE_MIN"], e["DSV41_EC_ELASTIC_GB"], e["DSV41_EC_RESERVE_GB"]) == ("512", "11", "3.0")
     assert "DSV41_NV_CPU_CPUS" not in e and e["DSV41_NV_READER_CPUS"] == "7-11" and e["DSV41_NV_CTL_CPU"] == "6"
     assert "DSV41_NV_SLRU" not in e
@@ -77,12 +77,10 @@ def test_engine_reserves_host_caches(monkeypatch):
 
 def test_dspark_default_and_off(tmp_path, monkeypatch):
     box, spec = spec_for(tmp_path, monkeypatch)
-    assert box.options.speculation == "dspark" and box.options.dspark_conf == 0.5
+    assert box.options.speculation == "dspark"
     assert "-mtp" in spec.argv and spec.env["EXL3_DSPARK_CONF"] == "0.5"
     _, spec = spec_for(tmp_path, monkeypatch, speculation="none")
     assert "-mtp" not in spec.argv and "EXL3_DSPARK_CONF" not in spec.env
-    _, spec = spec_for(tmp_path, monkeypatch, dspark_conf=0.35)
-    assert spec.env["EXL3_DSPARK_CONF"] == "0.35"
     _, spec = spec_for(tmp_path, monkeypatch, env={"EXL3_DSPARK_CONF": "0.6"})
     assert spec.env["EXL3_DSPARK_CONF"] == "0.6"
     with pytest.raises(ValueError):
@@ -179,18 +177,10 @@ def test_decode_time_checkpoints(tmp_path, monkeypatch):
     assert spec.env["DSV41_RC_INTERVAL"] == "256"
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")    # bit-exact mode keeps exllamav3's schedule
     assert "DSV41_RC_INTERVAL" not in spec.env
-    _, spec = spec_for(tmp_path, monkeypatch, rc_interval=0)
-    assert "DSV41_RC_INTERVAL" not in spec.env
-    _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact", rc_interval=512)
-    assert spec.env["DSV41_RC_INTERVAL"] == "512"
-    with pytest.raises(ValueError):
-        spec_for(tmp_path, monkeypatch, rc_interval=300)
 
 
-def test_turn_checkpoints(tmp_path, monkeypatch):
-    _, spec = spec_for(tmp_path, monkeypatch)
-    assert spec.env["DSV41_TURN_CKPTS"] == "4"
-    _, spec = spec_for(tmp_path, monkeypatch, turn_ckpts=0)
-    assert spec.env["DSV41_TURN_CKPTS"] == "0"
-    with pytest.raises(ValueError):
-        spec_for(tmp_path, monkeypatch, turn_ckpts=-1)
+def test_tuning_is_not_an_option(tmp_path):
+    for name in ("rc_interval", "turn_ckpts", "dspark_conf", "planner_cost", "vram_expert_slots", "max_batch_size",
+                 "mm_cache_mb"):
+        with pytest.raises(TypeError):
+            AutoBox("deepseek-v4.1-flash", home=tmp_path, **{name: 1})

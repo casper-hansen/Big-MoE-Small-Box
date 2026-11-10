@@ -8,7 +8,10 @@ from bigmoe import AutoBox, system
 from bigmoe.models import glm53
 
 BASE = Path(glm53.__file__).parent / "baselines"
-PATHS = ("GLM53_EC_WARM", "GLM53_ZC_STATS", "GLM53_NV_STORE")
+PATHS = ("GLM53_EC_WARM", "GLM53_NV_STORE")
+# set by the reference runs and read by nothing (NV_CPU_KERN and EC_WARM_PREFILL: at the engine's defaults)
+UNREAD = ("GLM53_NV", "GLM53_EC", "GLM53_K_FTSPLIT", "GLM53_K_OVL", "GLM53_CPU_TIER", "GLM53_ZC_STATS")
+DEFAULTS = {"GLM53_NV_CPU_KERN": "1", "GLM53_EC_WARM_PREFILL": "0"}
 
 
 class FakeRuntime:
@@ -34,8 +37,10 @@ def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
     box, spec = spec_for(tmp_path, monkeypatch, mode, flags=glm53.VBMI_FLAGS | {"avx2", "fma", "f16c"})
     glm = lambda env: {k: v for k, v in env.items() if k.startswith("GLM53_") and not k.endswith("_BUILD")}
     ref, ours = glm(json.loads((BASE / fname).read_text())["env"]), glm(spec.env)
-    # recorded while GLM's warm prefill was an option (off): unset is the same prefill
-    assert ref.pop("GLM53_EC_WARM_PREFILL", "0") == "0"
+    for var in UNREAD:
+        ref.pop(var, None)
+    for var, value in DEFAULTS.items():
+        assert ref.pop(var, value) == value, var
     assert set(ours) == set(ref)
     for k, v in ref.items():
         if k in PATHS:
@@ -64,20 +69,17 @@ def test_argv(tmp_path, monkeypatch):
 
 def test_overrides_and_ambient_env(tmp_path, monkeypatch):
     monkeypatch.setenv("GLM53_NV_THREADS", "99")
-    _, spec = spec_for(tmp_path, monkeypatch, "nvme", env={"GLM53_NV_POL": "1,2,3"}, vram_expert_slots=None)
+    _, spec = spec_for(tmp_path, monkeypatch, "nvme", env={"GLM53_NV_POL": "1,2,3"})
     assert spec.env["GLM53_NV_POL"] == "1,2,3"
-    assert "GLM53_EC_MAX_SLOTS" not in spec.env
     assert "GLM53_NV_THREADS" in spec.unset
 
 
 def test_vbmi_planner(tmp_path, monkeypatch):
-    # AVX-512 VBMI CPUs: the CPU lane is faster, so the default planner gives it more experts; explicit costs win
+    # AVX-512 VBMI CPUs: the CPU lane is faster, so the planner gives it more experts
     _, spec = spec_for(tmp_path, monkeypatch, "nvme", flags=glm53.VBMI_FLAGS | {"avx2", "fma", "f16c"})
-    assert spec.env["GLM53_NV_POL"] == glm53.TUNED_PLANNER_VBMI
-    _, spec = spec_for(tmp_path, monkeypatch, "nvme", flags=glm53.VBMI_FLAGS | {"avx2", "fma", "f16c"}, planner_cost="1,2,3")
-    assert spec.env["GLM53_NV_POL"] == "1,2,3"
+    assert spec.env["GLM53_NV_POL"] == glm53.PLANNER_COST_VBMI
     _, spec = spec_for(tmp_path, monkeypatch, "nvme")
-    assert spec.env["GLM53_NV_POL"] == glm53.TUNED_PLANNER
+    assert spec.env["GLM53_NV_POL"] == glm53.PLANNER_COST
 
 
 def test_small_host_budget(tmp_path, monkeypatch):
@@ -94,12 +96,8 @@ def test_speculation_option(tmp_path, monkeypatch):
     # one recurrent slot with drafts (the rewind history would take 2.7 GB of expert cache at -ambs 4): the last -ambs wins
     i = len(spec.argv) - 1 - spec.argv[::-1].index("-ambs")
     assert spec.argv[i + 1] == "1" and i > spec.argv.index("-ambs")
-    _, spec = spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram", ngram_min=3, draft_tokens=4)
-    assert spec.argv[spec.argv.index("-ngram") + 1] == "3" and spec.argv[spec.argv.index("-ndt") + 1] == "4"
     with pytest.raises(ValueError):
         spec_for(tmp_path, monkeypatch, "nvme", speculation="dflash")
-    with pytest.raises(ValueError):
-        spec_for(tmp_path, monkeypatch, "nvme", speculation="ngram", draft_tokens=0)
 
 
 def test_prefix_cache_tiers(tmp_path, monkeypatch):

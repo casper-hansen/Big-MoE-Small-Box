@@ -32,8 +32,8 @@ def test_options_are_validated(tmp_path):
         AutoBox("glm-5.3-flash", home=tmp_path, nonsense=1)
     with pytest.raises(ValueError, match="mode"):
         AutoBox("glm-5.3-flash", home=tmp_path, mode="fast")
-    box = AutoBox("glm-5.3-flash", home=tmp_path, mode="nvme-exact", vram_expert_slots=None)
-    assert box.options.mode == "nvme-exact" and box.options.vram_expert_slots is None
+    box = AutoBox("glm-5.3-flash", home=tmp_path, mode="nvme-exact", cache_quant=8)
+    assert box.options.mode == "nvme-exact" and box.options.cache_quant == 8
 
 
 def test_local_checkpoint_dir(tmp_path):
