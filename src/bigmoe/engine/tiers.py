@@ -7,15 +7,15 @@
            record image), so per-layer kernel calls pass geom(li). Prefill chunks stage every non-VRAM expert of the
            next layer into two VRAM buffers on a copy stream; in elastic mode those buffers (and the activations) come
            from the last chunks of the cache, which are handed back to torch for the prefill and reclaimed for decode.
-           In mode nvme with EC_WARM_PREFILL=1 a staged forward stages the warm experts plus each layer's heaviest
-           cold ones (warm_prefill.py; the backends' warm_prefill option).
+           In mode nvme with EC_WARM_PREFILL=1 (the DeepSeek backend) a staged forward stages the warm experts plus the
+           cold ones its routing uses (warm_prefill.py).
   attach   pool + nv2 + routing / combine hooks + bounce proxies for exllamav3's per-expert paths
 
 Knobs (<prefix>NAME, see env.py): NV_STORE (store .bin), EC_RESERVE_GB (VRAM left to torch, 2.5), EC_MAX_SLOTS,
 EC_ADMIT_MAX (64), EC_CHUNK_SLOTS (32), EC_STAGE_SLOTS / EC_STAGE_GB (staging buffer size; 0 = no staged prefill),
 EC_STAGE_MIN (picks per layer call that stage, 8192), EC_ELASTIC_GB (0 = off), EC_ELASTIC_DYN (1),
-EC_ACT_MB_PER_TOK (0.6), EC_COPY_GRID, EC_WARM (JSON {layer key: [score x E]}), EC_WARM_PREFILL (0; mode nvme only),
-EC_TAIL_CKPT (0; mode nvme only, last_page.py).
+EC_ACT_MB_PER_TOK (0.6), EC_COPY_GRID, EC_WARM (JSON {layer key: [score x E]}), EC_WARM_PREFILL (0; set by the DeepSeek
+backend in mode nvme).
 """
 import ctypes
 import gc
@@ -431,7 +431,7 @@ class Pool:
             if self.elastic and not self.in_prefill:
                 self._elastic_enter(n_picks // self.topk)
             self.slot_np = self.slotof.cpu().numpy()    # stable during prefill (no admission)
-            if self.warm_prefill is not None and self.warm_prefill.enabled:
+            if self.warm_prefill is not None:
                 self.slot_np = self.warm_prefill.begin(e, self.slot_np)
             e.stage_begin(torch.from_numpy(np.ascontiguousarray(self.slot_np)), li)
             self._st_open = True
@@ -572,7 +572,7 @@ class Pool:
 
 def _last_page_stats():
     from . import last_page
-    return dict(last_page.STATS, **last_page._ON)
+    return dict(last_page.STATS)
 
 
 class BCProxy:
@@ -680,7 +680,7 @@ def attach(model):
     # mode nvme (approximate, with the CPU lane) also prefills approximately: warm prefill and the last-page split (which
     # changes how the recurrent state's prefill is chunked, so its rounding); mode nvme-exact keeps exllamav3's prefill
     approx_prefill = bool(p.stage_n) and env("NV_CPU", "0") == "1"
-    if approx_prefill and env("EC_WARM_PREFILL", "0") == "1":   # the backend's warm_prefill option
+    if approx_prefill and env("EC_WARM_PREFILL", "0") == "1":   # DeepSeek (GLM's answers react more to it)
         # created before nv2 sizes the RAM tier from the cgroup's free memory, which then excludes its pinned slots
         from .warm_prefill import WarmPrefill
         p.warm_prefill = WarmPrefill(p)
@@ -709,7 +709,7 @@ def attach(model):
             _m._x16 = None
             if not params.get("autosplit_measure") and not params.get("tp_warmup"):
                 pool, li = _m._ec
-                staged = pool.warm_prefill is not None and pool.warm_prefill.enabled and sel.numel() >= pool.stage_min
+                staged = pool.warm_prefill is not None and sel.numel() >= pool.stage_min
                 # X16 lane: a single-token call of one of its layers keeps the original selection for the reduction
                 x16 = nv.x16 is not None and bsz == 1 and li < nv.x16_hi
                 orig_sw = (sel.clone(), w.clone(), z) if x16 else None
@@ -737,12 +737,7 @@ def attach(model):
         _hook_prefill(type(model))
     if approx_prefill:
         from . import last_page
-        tail_ckpt = False
-        if env("EC_TAIL_CKPT", "0") == "1":
-            tail_ckpt, what = last_page.rewindable(model)
-            if not tail_ckpt:
-                log(f"tail checkpoints off: recurrent modules {what}")
-        log(last_page.apply(p.stage_min, p.topk, tail_ckpt))
+        log(last_page.apply(p.stage_min, p.topk, last_page.rewindable(model)[0]))
     log(f"pool: {len(mods)} MoE layers (experts {p.first}..{p.first + p.E - 1}), {p.S} slots x {p.rec / 1e6:.2f} MB = "
         f"{p.S * p.rec / GiB:.2f} GiB ({p.S / len(mods):.1f}/layer), {'uniform' if p.uniform else 'per-layer'} geometry, "
         f"admit <= {admit_max} picks, stage 2 x {p.stage_n} experts (>= {stage_min} picks), elastic "

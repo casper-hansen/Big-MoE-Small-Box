@@ -882,45 +882,6 @@ class ExlEngine:
         nv2.ext().set_read_rate(float(mbps))
         return {"read_rate_mbps": mbps}
 
-    def warm_prefill_switch(self, on: int = 1) -> dict:
-        """Runtime switch of warm prefill itself (quality A/B: an exact prefix on a warm-prefill server)."""
-        if self.tiers is None:
-            return {"error": "the shared engine is off"}
-        from ..engine import tiers
-        pools = [p for p in tiers.POOLS if p.warm_prefill is not None]
-        if not pools:
-            return {"error": "warm prefill is not configured on this server (warm_prefill=False or mode nvme-exact)"}
-        return {"warm_prefill": [p.warm_prefill.set_enabled(bool(on)) for p in pools]}
-
-    def warm_ahead(self, on: int = 1, n: int = 0) -> dict:
-        """Runtime switch of warm prefill's read-ahead (A/B runs on one server)."""
-        from ..engine import warm_prefill
-        return warm_prefill.set_ahead(bool(on), int(n))
-
-    def warm_fetch(self, n: int = None, drop: float = None, exact_rows: int = None) -> dict:
-        """Runtime warm_fetch / warm_drop / warm_exact_rows (A/B runs on one server); None keeps a value."""
-        from ..engine import warm_prefill
-        return warm_prefill.set_fetch(n, drop, exact_rows)
-
-    def tail_ckpt(self, on: int = 1) -> dict:
-        """Runtime switch (A/B runs on one server): tail checkpoints (engine/last_page.py) or the last-page split."""
-        from ..engine import last_page
-        return last_page.set_tail_ckpt(bool(on))
-
-    def warm_timeline(self, on: int = 1) -> dict:
-        """Debug: per staged layer call, when route() was entered, ranked (a GPU sync), had read, and returned (on=1
-        starts a record; on=0 ends it and returns it)."""
-        from ..engine import warm_prefill
-        return {"calls": warm_prefill.set_timeline(bool(on))}
-
-    def warm_trace(self, on: int = 1, path: str = "") -> dict:
-        """Debug: record warm prefill's per-layer routing (on=1 starts a record; on=0 ends it and saves it to path)."""
-        from ..engine import warm_prefill
-        prev = warm_prefill.set_trace(bool(on))
-        if prev is not None and path:
-            self.torch.save(prev, path)
-        return {"calls": len(prev) if prev is not None else None, "path": path}
-
     def cpu_switch(self, on: int = 1) -> dict:
         """Runtime CPU-lane switch (mode nvme): on=0 puts every pick on the GPU path (bit-exact), for A/B runs."""
         from ..engine import nv2

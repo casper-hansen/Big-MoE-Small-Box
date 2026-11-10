@@ -25,40 +25,12 @@ def test_rank_cold_by_summed_weight():
     assert warm.rank_cold(sel + 10, w, cold, 10, 1).tolist() == [3]   # routing_first offset
 
 
-def test_rank_cold_drop_stops_once_the_weight_left_out_is_small():
-    cold = torch.tensor([True, True, False, True, True])
-    sel = torch.tensor([[0, 2], [1, 3], [3, 2]])
-    w = torch.tensor([[0.5, 0.5], [0.2, 0.8], [0.3, 0.7]])
-    # routing weight 3.0; cold 3 -> 1.1, 0 -> 0.5, 1 -> 0.2 (1.8 cold in all)
-    assert warm.rank_cold(sel, w, cold, 0, 8, drop=0.3).tolist() == [3]          # 0.7 left out <= 0.9
-    assert warm.rank_cold(sel, w, cold, 0, 8, drop=0.1).tolist() == [3, 0]       # 0.2 left out <= 0.3
-    assert warm.rank_cold(sel, w, cold, 0, 8, drop=0.05).tolist() == [3, 0, 1]   # nothing left out
-    assert warm.rank_cold(sel, w, cold, 0, 2, drop=0.05).tolist() == [3, 0]      # the limit still caps it
-    assert warm.rank_cold(sel, w, cold, 0, 8, drop=0.9).tolist() == [3]          # the heaviest is always read
-    assert warm.rank_cold(sel, w, torch.zeros(5, dtype=torch.bool), 0, 8, drop=0.1).tolist() == []
-
-
-def test_set_fetch_runtime_switch():
-    old = warm.set_fetch()
-    try:
-        assert warm.set_fetch(384, 0.002, 0) == {"fetch": 384, "drop": 0.002, "exact_rows": 0}
-        assert warm.set_fetch(64) == {"fetch": 64, "drop": 0.002, "exact_rows": 0}   # the others are kept
-    finally:
-        warm.set_fetch(old["fetch"], old["drop"], old["exact_rows"])
-
-
-def test_fetch_policy_exact_short_forwards():
-    old = warm.set_fetch()
-    try:
-        warm.set_fetch(64, 0.005, 1024)
-        assert warm.fetch_policy(99, 300) == (300, 0.0)      # short: every routed cold expert, nothing dropped
-        assert warm.fetch_policy(1024, 250) == (250, 0.0)
-        assert warm.fetch_policy(1025, 250) == (64, 0.005)   # longer: the warm_fetch cap and warm_drop
-        assert warm.fetch_policy(8192, 40) == (40, 0.005)    # never past the free staging slots
-        warm.set_fetch(exact_rows=0)
-        assert warm.fetch_policy(99, 300) == (64, 0.005)     # off
-    finally:
-        warm.set_fetch(old["fetch"], old["drop"], old["exact_rows"])
+def test_fetch_limit_exact_short_forwards():
+    assert warm.EXACT_ROWS == 1024 and warm.FETCH_PER_LAYER == 64
+    assert warm.fetch_limit(99, 300) == 300          # short: every routed cold expert, nothing dropped
+    assert warm.fetch_limit(1024, 250) == 250
+    assert warm.fetch_limit(1025, 250) == 64         # longer: the 64 heaviest
+    assert warm.fetch_limit(8192, 40) == 40          # never past the free staging slots
 
 
 def test_drop_cold_sentinel_and_renormalization():
@@ -108,7 +80,8 @@ def _ahead(wp, *, done, inflight, queue, closed=False, layer=1, b=0, used=4):
 
 def _prefill_for_take():
     wp = object.__new__(warm.WarmPrefill)
-    wp.st = {"ahead_read": 0, "ahead_hit": 0, "ahead_wasted": 0, "ahead_wait_ms": 0.0}
+    wp.st = {"ahead_read": 0, "ahead_hit": 0, "ahead_wasted": 0, "ahead_missed": 0, "ahead_wait_ms": 0.0,
+             "ahead_guessed": 0, "exact_calls": 0}
     wp.stream = _Stream()
     return wp
 
@@ -166,20 +139,6 @@ def test_before_stage_drains_only_a_conflicting_buffer(monkeypatch):
     assert wp.ahead is None and a.fut.calls == 1 and cur.waits == [a.event]
 
 
-def test_runtime_switch_restores_the_borrowed_prefill_ring(monkeypatch):
-    import sys
-    import types
-    calls = []
-    fake_nv2 = types.SimpleNamespace(ext=lambda: types.SimpleNamespace(set_ring_borrow=calls.append))
-    monkeypatch.setitem(sys.modules, "bigmoe.engine.nv2", fake_nv2)
-    monkeypatch.setattr(warm, "nv2", fake_nv2, raising=False)
-    wp = _prefill_for_take()
-    wp.ahead = None
-    wp.pool = types.SimpleNamespace(device="cpu", nv2=types.SimpleNamespace(ring_borrow=True, ring_pf=128))
-    assert wp.set_enabled(False) is False and calls == [128]    # exact staging: the ring borrows RAM slots again
-    assert wp.set_enabled(True) is True and calls == [128, 0]   # warm prefill: no ring borrowing
-
-
 def test_mismatched_ahead_still_finishes_old_copies_before_returning():
     wp = _prefill_for_take()
     a = _ahead(wp, done={1: 4}, inflight={2: 5}, queue=[(3, 6)], layer=9)
@@ -208,12 +167,11 @@ def test_begin_always_orders_new_staging_after_the_warm_stream(monkeypatch):
     assert cur.waits[-1] == wp.stream and wp.ahead is None
 
 
-def test_start_ahead_uses_next_layers_router_and_allows_a_wider_guess_window(monkeypatch):
+def test_start_ahead_uses_next_layers_router(monkeypatch):
     import types
     wp = _prefill_for_take()
     wp.cold_np = np.ones((2, 5), dtype=bool)
     wp.cold = torch.ones((2, 5), dtype=torch.bool)
-    wp.st["ahead_guessed"] = 0
     calls = []
 
     def route(bsz, cfg, z, params):
@@ -230,14 +188,14 @@ def test_start_ahead_uses_next_layers_router_and_allows_a_wider_guess_window(mon
         def __init__(self, layer, b, used, queue):
             self.layer, self.b, self.used, self.queue = layer, b, used, queue
     monkeypatch.setattr(warm, "Ahead", FakeAhead)
-    monkeypatch.setattr(warm, "AHEAD_N", 3)
-    wp._start_ahead(1, "hidden", {"p": 1}, 2, object())
-    assert calls == [(2, "cfg", "hidden", {"p": 1})]
-    assert wp.ahead.queue == [(1, 1), (2, 2), (3, 3)]       # predicted weights .8, .7, .3; RAM expert used slot 0
-    assert len(submitted) == 1 and wp.st["ahead_guessed"] == 3
+    wp._start_ahead(1, "hidden", {"p": 1}, 2048, object())
+    assert calls == [(2048, "cfg", "hidden", {"p": 1})]
+    # predicted weights .8, .7, .3, .2 (all of them: under the 64 cap); the RAM expert staged there uses slot 0
+    assert wp.ahead.queue == [(1, 1), (2, 2), (3, 3), (0, 4)]
+    assert len(submitted) == 1 and wp.st["ahead_guessed"] == 4
 
 
-def test_route_starts_read_ahead_only_at_the_configured_chunk_size(monkeypatch):
+def test_route_reads_ahead_only_for_longer_forwards(monkeypatch):
     import types
     wp = _prefill_for_take()
     wp.ahead = None
@@ -246,8 +204,6 @@ def test_route_starts_read_ahead_only_at_the_configured_chunk_size(monkeypatch):
     wp.pool = types.SimpleNamespace(device="cpu", staged={}, stage_n=100, first=0, mods=[None, None])
     started = []
     wp._start_ahead = lambda *args: started.append(args)
-    monkeypatch.setattr(warm, "AHEAD", True)
-    monkeypatch.setattr(warm, "AHEAD_MIN", 1024)
     monkeypatch.setattr(warm.torch.cuda, "current_stream", lambda device: _Stream())
 
     class Event:
@@ -256,9 +212,9 @@ def test_route_starts_read_ahead_only_at_the_configured_chunk_size(monkeypatch):
     monkeypatch.setattr(warm.torch.cuda, "Event", Event)
     sel = torch.tensor([[0, 1]])
     w = torch.tensor([[0.5, 0.5]])
-    wp.route(0, sel, w, z=torch.zeros(1), params={}, bsz=1023)
+    wp.route(0, sel, w, z=torch.zeros(1), params={}, bsz=1024)       # exact short forward: reads its own experts
     assert started == []
-    wp.route(0, sel, w, z=torch.zeros(1), params={}, bsz=1024)
+    wp.route(0, sel, w, z=torch.zeros(1), params={}, bsz=1025)
     assert len(started) == 1 and started[0][0] == 1
 
 

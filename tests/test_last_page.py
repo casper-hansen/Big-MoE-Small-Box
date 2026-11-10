@@ -33,9 +33,8 @@ def test_tail_checkpoints_drop_the_split_and_hook_the_stash():
         assert last_page.apply(512, 6, tail_ckpt=True).startswith("no last-page split")
         assert J._BIGMOE_LAST_PAGE_MAX == -1 and J._BIGMOE_TAIL_CKPT is last_page.stash_tail
         assert "_BIGMOE_TAIL_CKPT" in J.Job.prefill.__code__.co_names
-        assert last_page.set_tail_ckpt(False) == {"tail_ckpt": False, "last_page_max": 85}
-        assert J._BIGMOE_TAIL_CKPT is None
-        assert last_page.set_tail_ckpt(True)["last_page_max"] == -1
+        assert last_page.apply(512, 8) == "last-page split for tails <= 63 tokens"    # a model that cannot rewind
+        assert J._BIGMOE_LAST_PAGE_MAX == 63 and J._BIGMOE_TAIL_CKPT is None
     finally:
         J.Job.prefill = stock
         J._BIGMOE_TAIL_CKPT = None

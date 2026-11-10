@@ -1,33 +1,27 @@
-"""Warm prefill: staged forwards run on the experts that are already in VRAM or RAM, plus the few NVMe-only experts that
-matter most to each layer of the chunk.
+"""Warm prefill (DeepSeek-V4.1, mode nvme): a staged forward reads from NVMe only the experts its routing uses.
 
 A staged forward (a prefill chunk, >= EC_STAGE_MIN picks per layer) used to stage every expert of every layer, which
 reads every NVMe-only expert once: ~15 s per forward on a 3090 box whatever the chunk's length, the floor of every
 agent step that adds a tool result. Here the forward starts from the warm set (VRAM-resident and RAM-tier experts at
 its start). Once a layer's routing is known, its cold (NVMe-only) experts are ranked by the routing weight the chunk
-gives them; the top FETCH_PER_LAYER are read from the store in parallel into free slots of the layer's staging buffer
-and run exactly. The picks of the remaining cold experts are dropped (sentinel id, weight 0) and each token's weights
-are rescaled to their original sum. Decode is unchanged.
+gives them and read from the store in parallel into free slots of the layer's staging buffer:
 
-Exact short forwards (EC_WARM_EXACT_ROWS; the DeepSeek backend sets 1024, the engine default is 0 = off): a staged forward of at most that many rows reads every cold
-expert its routing touches. Exact staging reads every NVMe-only expert of every layer (~250 of 384) whatever the chunk
-routes; 100-1000 rows route only 75-165 of them, so the forward computes exactly what exact staging does (the MoE runs the
-same experts on the same bytes: bit-identical logits) for 5-12 s instead of 15-20 s. Longer forwards keep the
-FETCH_PER_LAYER cap, optionally cut short once the weight left out is at most EC_WARM_DROP.
+  short forwards (at most EXACT_ROWS = 1,024 rows: an agent step's tool result, a long prompt's last chunk) read every
+      cold expert their routing touches and drop nothing. 100-1,000 rows route 75-165 of the ~250 NVMe-only experts per
+      layer, so the MoE runs the same experts on the same bytes as staging all of them: bit-identical logits, in 5-12 s
+      instead of 15-20 s on a cached 8k prefix.
+  longer forwards read the FETCH_PER_LAYER = 64 heaviest; the picks of the remaining cold experts are dropped
+      (sentinel id, weight 0) and each token's weights are rescaled to their original sum.
 
-Read-ahead (EC_WARM_AHEAD, on by default for chunks of at least EC_WARM_AHEAD_MIN=1024 rows): a layer's reads would
-otherwise stall the GPU before its MoE. While layer i computes, layer i+1's cold experts are guessed with its own router
-on layer i's router input (exact for DeepSeek's hash-routed layers, which route by token id) and read on a background
-thread into that layer's staging buffer, most likely first. Once layer i+1's true routing is known the job is retargeted:
-guesses it has not read yet are dropped and the true experts it has not read are queued, so wasted reads are only those
-done before the routing was known. The experts used are the same top FETCH_PER_LAYER as without read-ahead, so the
-forward's result is unchanged.
+Read-ahead (longer forwards): a layer's reads would otherwise stall the GPU before its MoE. While layer i computes,
+layer i+1's cold experts are guessed with its own router on layer i's router input (exact for DeepSeek's hash-routed
+layers, which route by token id) and read on a background thread into that layer's staging buffer, most likely first.
+Once layer i+1's true routing is known the job is retargeted: guesses it has not read yet are dropped and the true
+experts it has not read are queued, so wasted reads are only those done before the routing was known. The experts used
+are the same top FETCH_PER_LAYER as without read-ahead, so the forward's result is unchanged.
 
-Against exact prefill: DeepSeek-V4.1-Flash on five steps of a DeepSeek Harness agent turn (14k to 36k tokens, decode
-exact) prefills in 77.5 s instead of 116.9 s with top-1 agreement 99.7 % and mean KL 0.0021 on 330 forced answer
-positions; teacher-forced (prompt and answer through warm prefill) DeepSeek keeps 100 % top-1 (mean KL 0.023) and
-GLM-5.3-Flash 94.5 % (0.042). Mode nvme only, as the backends' warm_prefill option (DeepSeek: on by default,
-GLM: off); mode nvme-exact prefills exactly.
+Decode is unchanged. Mode nvme-exact, and GLM-5.3-Flash (whose answers react more to approximate prefill), stage every
+expert. Measurements: docs/vllm.md ("Exact short prefills", "Tail checkpoints", "Warm-prefill read-ahead").
 """
 import concurrent.futures as cf
 import threading
@@ -36,69 +30,18 @@ import time
 import numpy as np
 import torch
 
-from .env import env
-
-# cold experts read per layer of a staged forward (64 of 384: ~7 % of the routing weight left); EC_WARM_FETCH overrides
-FETCH_PER_LAYER = int(env("EC_WARM_FETCH", "64"))
+FETCH_PER_LAYER = 64      # cold experts read per layer of a longer staged forward (64 of 384: ~7 % of the weight left)
+EXACT_ROWS = 1024         # staged forwards of at most this many rows read every routed cold expert (exact)
 READERS = 16              # parallel store reads (the NVMe needs a deep queue for its full bandwidth)
 BATCH = 16                # experts per read batch; two batches of pinned slots alternate (read one, copy the other)
 RAM_RESIDENT = 2          # nv2 host state of an expert in the RAM tier (KS_RES)
-AHEAD = env("EC_WARM_AHEAD", "1") == "1"
-AHEAD_N = int(env("EC_WARM_AHEAD_N", "0")) or None   # guesses read ahead per layer (default FETCH_PER_LAYER)
-# Extra routing / ranking does not pay on short chunks (matched A/B, 2026-11-09); 0 enables it everywhere.
-AHEAD_MIN = int(env("EC_WARM_AHEAD_MIN", "1024"))
-# short staged forwards (at most EXACT_ROWS rows: an agent step's tool result, a long prompt's last chunk) read every cold
-# expert their routing touches, so they compute exactly what exact staging does (bit-identical, docs/vllm.md "Exact
-# short prefills") while reading only the routed experts instead of all of them; 0 = off
-EXACT_ROWS = int(env("EC_WARM_EXACT_ROWS", "0"))
-# longer forwards, adaptive fetch: read a layer's cold experts (heaviest first, at most FETCH_PER_LAYER) until the cold
-# routing weight left out is at most DROP of the layer call's routing weight; 0 = always FETCH_PER_LAYER (if routed)
-DROP = float(env("EC_WARM_DROP", "0"))
-TRACE = None              # debug (set_trace): per staged layer call (li, sel, w, cold before fetching) on the CPU
 
 
-def set_trace(on: bool):
-    """Debug: record the routing of every staged layer call (offline policy studies); returns the previous record."""
-    global TRACE
-    prev, TRACE = TRACE, ([] if on else None)
-    return prev
-
-
-TIMELINE = None           # debug (set_timeline): per staged layer call (li, rows, fetched, enter, ranked, read, exit) seconds
-
-
-def set_timeline(on: bool):
-    """Debug: record when each staged layer call entered route(), had its ranking (a GPU sync), had its reads, and
-    returned; returns the previous record."""
-    global TIMELINE
-    prev, TIMELINE = TIMELINE, ([] if on else None)
-    return prev
-
-
-def set_fetch(n: int | None = None, drop: float | None = None, exact_rows: int | None = None) -> dict:
-    """Runtime warm_fetch / warm_drop / warm_exact_rows (A/B on one server); None keeps a value."""
-    global FETCH_PER_LAYER, DROP, EXACT_ROWS
-    if n is not None:
-        FETCH_PER_LAYER = int(n)
-    if drop is not None:
-        DROP = float(drop)
-    if exact_rows is not None:
-        EXACT_ROWS = int(exact_rows)
-    return {"fetch": FETCH_PER_LAYER, "drop": DROP, "exact_rows": EXACT_ROWS}
-
-
-def fetch_policy(rows: int, room: int) -> tuple:
-    """(cold experts to read at most, drop) for a staged layer call of `rows` rows with `room` free staging slots."""
+def fetch_limit(rows: int, room: int) -> int:
+    """Cold experts a staged layer call of `rows` rows reads at most, with `room` free staging slots."""
     if rows <= EXACT_ROWS:
-        return room, 0.0                    # every routed cold expert (they always fit: staged + cold <= stage_n)
-    return min(FETCH_PER_LAYER, room), DROP
-
-
-def set_ahead(on: bool, n: int | None = None) -> dict:
-    """Runtime switch (A/B on one server, /bigmoe/rpc warm_ahead): read-ahead on/off and its guesses per layer."""
-    global AHEAD, AHEAD_N
-    AHEAD, AHEAD_N = bool(on), (int(n) or None) if n is not None else AHEAD_N
-    return {"ahead": AHEAD, "ahead_n": AHEAD_N}
+        return room                         # every routed cold expert (they always fit: staged + cold <= stage_n)
+    return min(FETCH_PER_LAYER, room)
 
 
 def cold_set(slot_np: np.ndarray, kst: np.ndarray) -> np.ndarray:
@@ -106,11 +49,9 @@ def cold_set(slot_np: np.ndarray, kst: np.ndarray) -> np.ndarray:
     return (slot_np < 0) & (kst.reshape(slot_np.shape) != RAM_RESIDENT)
 
 
-def rank_cold(sel: torch.Tensor, w: torch.Tensor, cold: torch.Tensor, first: int, limit: int,
-              drop: float = 0.0) -> torch.Tensor:
+def rank_cold(sel: torch.Tensor, w: torch.Tensor, cold: torch.Tensor, first: int, limit: int) -> torch.Tensor:
     """The (at most `limit`) cold experts of one layer call with the largest routing weight summed over its tokens, by
-    weight, as local expert ids. sel / w: [tokens, top_k]; cold: [E] bool. With drop > 0 only as many as needed for the
-    cold weight left out to be at most `drop` of the call's routing weight."""
+    weight, as local expert ids. sel / w: [tokens, top_k]; cold: [E] bool."""
     E = cold.numel()
     loc = sel.reshape(-1).long() - first
     valid = (loc >= 0) & (loc < E)
@@ -118,12 +59,7 @@ def rank_cold(sel: torch.Tensor, w: torch.Tensor, cold: torch.Tensor, first: int
     score.index_add_(0, loc.clamp(0, E - 1), w.reshape(-1).float() * valid)
     score = torch.where(cold, score, torch.zeros_like(score))
     top = torch.topk(score, min(limit, E))
-    keep = top.values > 0
-    if drop > 0:
-        left = score.sum() - top.values.cumsum(0)              # cold weight still left out after taking 0..i
-        need = torch.cat([left.new_ones(1, dtype=torch.bool), left[:-1] > drop * (w.reshape(-1).float() * valid).sum()])
-        keep &= need
-    return top.indices[keep]
+    return top.indices[top.values > 0]
 
 
 def drop_cold(sel: torch.Tensor, w: torch.Tensor, cold: torch.Tensor, first: int):
@@ -166,24 +102,12 @@ class WarmPrefill:
         self.copied = [torch.cuda.Event() for _ in range(2)]     # per batch of slots: its last H2D is done
         self.cold = None
         self.acc = torch.zeros(4, dtype=torch.float64, device=pool.device)   # picks, dropped, weight, dropped weight
-        self.st = {"forwards": 0, "fetched": 0, "fetched_bytes": 0, "read_ms": 0.0, "ahead_read": 0, "ahead_hit": 0,
-                   "ahead_wasted": 0, "ahead_wait_ms": 0.0, "ahead_ms": 0.0}
-        self.enabled = True          # runtime switch (set_enabled): off = exact staged prefill on this server
+        self.st = {"forwards": 0, "exact_calls": 0, "fetched": 0, "fetched_bytes": 0, "read_ms": 0.0, "ahead_guessed": 0,
+                   "ahead_read": 0, "ahead_hit": 0, "ahead_wasted": 0, "ahead_missed": 0, "ahead_wait_ms": 0.0,
+                   "ahead_ms": 0.0}
         self.ahead = None            # Ahead of the next layer
         self.flip = 0                # alternating half of the pinned arena
         self.ahead_pool = cf.ThreadPoolExecutor(1, thread_name_prefix="warm-ahead")
-
-    def set_enabled(self, on: bool) -> bool:
-        """Runtime switch between forwards (quality A/B on one server): off stages every expert, exactly as a server
-        started with warm_prefill=False. The prefill ring borrows its RAM slots again while off (warm prefill keeps it
-        from evicting RAM experts that a forward counts as warm)."""
-        from . import nv2 as N2
-        self.drop_ahead()
-        self.enabled = bool(on)
-        nv = self.pool.nv2
-        if getattr(nv, "ring_borrow", False):
-            N2.ext().set_ring_borrow(0 if self.enabled else int(nv.ring_pf))
-        return self.enabled
 
     def begin(self, ext, slot_np: np.ndarray) -> np.ndarray:
         """Start of a staged forward: the cold set of every layer, and the residency snapshot for stage_begin /
@@ -202,24 +126,22 @@ class WarmPrefill:
         return np.where(cold, 0, slot_np).astype(slot_np.dtype)
 
     def route(self, li: int, sel: torch.Tensor, w: torch.Tensor, z=None, params=None, bsz=None):
-        """One layer call of the staged forward: fetch the heaviest cold experts (the ones read ahead already landed),
-        drop the other cold picks, and start reading ahead for the next layer."""
+        """One layer call of the staged forward: fetch its cold experts (every routed one in a short forward, the
+        heaviest in a longer one; those read ahead have landed already), drop any other cold picks, and start reading
+        ahead for the next layer."""
         if self.cold is None:
             return sel, w
         p = self.pool
-        t_in = time.perf_counter()
         cur = torch.cuda.current_stream(p.device)
         free = torch.cuda.Event()
         free.record(cur)                       # buffer li % 2 was last used by layer li - 2, buffer (li+1) % 2 by li - 1
-        if TRACE is not None:
-            TRACE.append((li, sel.cpu().clone(), w.float().cpu().clone(), self.cold[li].cpu().clone(), p.first))
         b, staged = p.staged.get(li, (li % 2, None))
         used = 0 if staged is None else int(staged.numel())
-        limit, drop = fetch_policy(int(sel.shape[0]), p.stage_n - used)
-        if drop == 0.0 and limit >= p.stage_n - used:
-            self.st["exact_calls"] = self.st.get("exact_calls", 0) + 1
-        fetch = rank_cold(sel, w, self.cold[li], p.first, limit, drop).cpu().tolist()
-        t_rank = t_read = time.perf_counter()
+        rows = int(sel.shape[0])
+        limit = fetch_limit(rows, p.stage_n - used)
+        if rows <= EXACT_ROWS:
+            self.st["exact_calls"] += 1
+        fetch = rank_cold(sel, w, self.cold[li], p.first, limit).cpu().tolist()
         pairs = self._take_ahead(li, b, used, limit, fetch, cur) if self.ahead is not None else None
         if pairs is None and fetch:           # no read-ahead for this layer: read them now
             t0 = time.perf_counter()
@@ -227,8 +149,7 @@ class WarmPrefill:
             self.stream.wait_event(free)
             self._read_into(li, b, pairs)
             cur.wait_stream(self.stream)
-            t_read = time.perf_counter()
-            self.st["read_ms"] += (t_read - t0) * 1e3
+            self.st["read_ms"] += (time.perf_counter() - t0) * 1e3
         if pairs:
             self._point(li, b, staged, pairs)
         sel2, w2, m = drop_cold(sel, w, self.cold[li], p.first)
@@ -238,10 +159,8 @@ class WarmPrefill:
         self.acc[2] += wf.sum()
         self.acc[3] += (wf * m).sum()
         # after this layer's routing is consumed: small row counts share exllamav3's routing buffers across layers
-        if AHEAD and z is not None and bsz is not None and bsz >= AHEAD_MIN and li + 1 < len(p.mods):
+        if z is not None and bsz is not None and bsz > EXACT_ROWS and li + 1 < len(p.mods):
             self._start_ahead(li + 1, z, params, bsz, free)
-        if TIMELINE is not None:
-            TIMELINE.append((li, int(sel.shape[0]), len(fetch), t_in, t_rank, t_read, time.perf_counter()))
         return sel2, w2
 
     # ---- read-ahead ---------------------------------------------------------------------------------------------
@@ -253,21 +172,19 @@ class WarmPrefill:
         if h is None or h[0] != nl or not self.cold_np[nl].any():
             return
         b, used = h[1], len(h[2])
-        limit, _ = fetch_policy(int(bsz), p.stage_n - used)
+        limit = fetch_limit(int(bsz), p.stage_n - used)
         route = getattr(p.mods[nl], "_bigmoe_route", None)
         if limit <= 0 or route is None:
             return
         if p.stage is None:
             return
         psel, pw = route(bsz, p.mods[nl].routing_cfg, z, params)
-        # A wider guess window can contain more of the true top `limit`; positions beyond that window are harmless:
-        # only experts selected by the real routing below are pointed at the staging buffer and run.
-        guess_limit = min(AHEAD_N or limit, p.stage_n - used)
-        guess = rank_cold(psel, pw, self.cold[nl], p.first, guess_limit).cpu().tolist()
+        # only experts selected by the real routing are pointed at the staging buffer and run
+        guess = rank_cold(psel, pw, self.cold[nl], p.first, limit).cpu().tolist()
         if not guess:
             return
         a = Ahead(nl, b, used, [(e, used + i) for i, e in enumerate(guess)])
-        self.st["ahead_guessed"] = self.st.get("ahead_guessed", 0) + len(guess)
+        self.st["ahead_guessed"] += len(guess)
 
         def job():
             t0 = time.perf_counter()
@@ -321,7 +238,7 @@ class WarmPrefill:
         self.st["ahead_read"] += len(have)
         self.st["ahead_hit"] += len(hits)
         self.st["ahead_wasted"] += len(have) - len(hits)
-        self.st["ahead_missed"] = self.st.get("ahead_missed", 0) + len(misses)
+        self.st["ahead_missed"] += len(misses)
         return list(hits.items()) + misses
 
     def before_stage(self, b: int):
@@ -383,14 +300,11 @@ class WarmPrefill:
 
     def summary(self) -> dict:
         picks, dropped, weight, dropped_w = self.acc.tolist()
-        return dict(self.st, fetch_per_layer=FETCH_PER_LAYER, drop=DROP, exact_rows=EXACT_ROWS,
-                    fetched_gb=round(self.st["fetched_bytes"] / 1e9, 2),
-                    read_ms=round(self.st["read_ms"]), ahead=AHEAD, ahead_min=AHEAD_MIN,
-                    ahead_ms=round(self.st["ahead_ms"]),
-                    ahead_wait_ms=round(self.st["ahead_wait_ms"]),
-                    ahead_hit_frac=round(self.st["ahead_hit"] / self.st["ahead_read"], 3) if self.st["ahead_read"]
-                    else None,
-                    ahead_cover_frac=round(self.st["ahead_hit"] / (self.st["ahead_hit"] + self.st.get("ahead_missed", 0)), 3)
-                    if self.st["ahead_hit"] + self.st.get("ahead_missed", 0) else None,
+        st = self.st
+        covered = st["ahead_hit"] + st["ahead_missed"]
+        return dict(st, fetched_gb=round(st["fetched_bytes"] / 1e9, 2), read_ms=round(st["read_ms"]),
+                    ahead_ms=round(st["ahead_ms"]), ahead_wait_ms=round(st["ahead_wait_ms"]),
+                    ahead_hit_frac=round(st["ahead_hit"] / st["ahead_read"], 3) if st["ahead_read"] else None,
+                    ahead_cover_frac=round(st["ahead_hit"] / covered, 3) if covered else None,
                     dropped_pick_frac=round(dropped / picks, 4) if picks else None,
                     dropped_weight_frac=round(dropped_w / weight, 4) if weight else None)

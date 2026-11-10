@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 
@@ -33,6 +34,8 @@ def test_env_matches_the_reference_run(tmp_path, monkeypatch, mode, fname):
     box, spec = spec_for(tmp_path, monkeypatch, mode, flags=glm53.VBMI_FLAGS | {"avx2", "fma", "f16c"})
     glm = lambda env: {k: v for k, v in env.items() if k.startswith("GLM53_") and not k.endswith("_BUILD")}
     ref, ours = glm(json.loads((BASE / fname).read_text())["env"]), glm(spec.env)
+    # recorded while GLM's warm prefill was an option (off): unset is the same prefill
+    assert ref.pop("GLM53_EC_WARM_PREFILL", "0") == "0"
     assert set(ours) == set(ref)
     for k, v in ref.items():
         if k in PATHS:
@@ -122,15 +125,12 @@ def test_x16_layers(tmp_path, monkeypatch):
         glm53.GLM53Options(x16_layers=2.5).validate()
 
 
-def test_warm_prefill_off_by_default(tmp_path, monkeypatch):
-    _, spec = spec_for(tmp_path, monkeypatch, "nvme")
-    assert spec.env["GLM53_EC_WARM_PREFILL"] == "0"
-    _, spec = spec_for(tmp_path, monkeypatch, "nvme", warm_prefill=True, warm_ahead_n=96)
-    assert spec.env["GLM53_EC_WARM_PREFILL"] == "1" and spec.env["GLM53_EC_WARM_AHEAD"] == "1"
-    assert spec.env["GLM53_EC_WARM_AHEAD_N"] == "96"
-    _, spec = spec_for(tmp_path, monkeypatch, "nvme-exact", warm_prefill=True)
-    assert "GLM53_EC_WARM_PREFILL" not in spec.env   # exact mode prefills exactly
-
+def test_glm_prefills_exactly(tmp_path, monkeypatch):
+    for mode in ("nvme", "nvme-exact"):          # warm prefill is DeepSeek's (engine/warm_prefill.py)
+        _, spec = spec_for(tmp_path, monkeypatch, mode)
+        assert not [k for k in spec.env if k.startswith("GLM53_EC_WARM_")]
+    assert not {f.name for f in dataclasses.fields(glm53.GLM53Options)} & {"warm_prefill", "warm_fetch", "warm_ahead",
+                                                                          "warm_ahead_n"}
 
 def test_vllm_is_the_only_server(tmp_path, monkeypatch):
     _box, spec = spec_for(tmp_path, monkeypatch, "nvme")

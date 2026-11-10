@@ -304,8 +304,8 @@ So vLLM matches the old engine on both tests, and its default (resuming from dec
 faster than either. The remaining distance to the decode-only figure is warm prefill: re-prefilling exactly restores
 99.44 % at 76 % more time per turn, and reading more NVMe-only experts per layer (`warm_fetch`, default 64 of 384) buys
 most of it back at 25 % more time on fresh prompts. On resumed turns, whose short chunks route few cold experts,
-`warm_fetch=192` costs nothing measurable but gains little; long chunks (file reads, first turns) pay the most. Both
-knobs stay at their defaults; set `-o warm_fetch=192` or `-o warm_prefill=false` to trade prefill time for agreement.
+`warm_fetch=192` costs nothing measurable but gains little; long chunks (file reads, first turns) pay the most. (Short
+chunks are exact since; the knobs are gone: [prefill options removed](#prefill-options-removed-2026-11-10).)
 
 ## Warm-prefill read-ahead (2026-11-09)
 
@@ -314,9 +314,9 @@ of at least 1,024 rows, layer i + 1's router runs on layer i's router input whil
 experts are read on a background thread into the next layer's staging buffer. Once the real routing is known, unread
 guesses are discarded and any missed experts are queued ahead of the remaining guesses. CUDA events order the copies
 before the MoE; pending reads are drained before staging memory returns to the decode pool. The actual fetched set is
-still the top `warm_fetch` experts by real routing weight, so read-ahead changes I/O timing, not the model's computation.
-It is on by default for DeepSeek warm prefill (`warm_ahead`), with 64 guesses per layer; `warm_ahead_n` can widen that
-window. Short chunks keep the old synchronous path (`EC_WARM_AHEAD_MIN`, default 1,024).
+still the top 64 experts by real routing weight, so read-ahead changes I/O timing, not the model's computation. It is
+part of DeepSeek's warm prefill, with 64 guesses per layer (wider windows below did worse). Chunks of up to 1,024 rows
+read synchronously.
 
 Four matched-prompt repetitions per configuration (same token ids and lengths within each A/B cycle, unique prefix to
 prevent cache reuse) on DeepSeek, mode `nvme`:
@@ -349,13 +349,14 @@ The full `bigmoe verify deepseek-v4.1-flash` run passed. In mode `nvme`, 1k / 8k
 and decode is in the same range as the previous vLLM runs. Both `nvme-exact` answers are **byte-identical** (1k and 8k).
 The agent benchmark solved 3/3 tasks in 164.5 s with read-ahead versus 167.7 s without (mean TTFT 5.75 s versus 5.68 s,
 within noise), and the two-agent run solved 2/2 in 83.7 s. There were no malformed tool calls and no scheduler
-corrections. GLM warm prefill remains off by default; with `-o warm_prefill=true`, its off/on teacher-forced check was
-also **1,200/1,200 bit-identical, KL 0**, and took 9.11 s -> 7.33 s.
+corrections. GLM with warm prefill (then an option, off by default, since removed for GLM): its read-ahead off/on
+teacher-forced check was also **1,200/1,200 bit-identical, KL 0**, and took 9.11 s -> 7.33 s.
 
 
 ## Warm prefill on small agent steps (DeepSeek, mode `nvme`, 2026-11-09)
 
-An agent step adds a tool result of N tokens to a cached conversation. `models/dsv41/tools/warm_kl.py` measures what
+An agent step adds a tool result of N tokens to a cached conversation. `models/dsv41/tools/warm_kl.py` (at commit
+d2993fe; [removed](#prefill-options-removed-2026-11-10) with the switches it needed) measures what
 warm-prefilling only those N tokens costs. On both servers, the same 8,192-token prefix was computed exactly and is
 cached. Each sample then adds N new tokens of its own (a file excerpt plus the assistant turn's opening) and a greedy
 128-token answer. The answer is generated with warm prefill off and forced along the same tokens with it on. Decode runs
@@ -397,14 +398,14 @@ lines.
 ## Exact short prefills (DeepSeek, mode `nvme`, 2026-11-09)
 
 Exact staging reads every NVMe-only expert of every layer, about 250 of 384 per layer (~95 GB), however few tokens the
-chunk has. A short chunk routes far fewer of them. Recorded on the samples above (`warm_trace` RPC): 75 per layer at
+chunk has. A short chunk routes far fewer of them. Recorded on the samples above (a debug routing trace): 75 per layer at
 100 new tokens and 153 at 1,000. Warm prefill reads the 64 heaviest and drops the rest, and that drop is where the
 3 % top-1 loss came from. It does not have to read the other ~100-175: no token routes to them.
 
-Now a staged forward of at most `warm_exact_rows` rows (default 1,024) reads **every** routed NVMe-only expert and drops
+Now a staged forward of at most 1,024 rows reads **every** routed NVMe-only expert and drops
 nothing. The MoE then runs the same experts on the same bytes as exact staging, so the logits are bit-identical. Longer
-chunks are unchanged (the 64-expert cap, read-ahead). Same test, same reference (`warm_kl.py`, `ref.json` from the
-`warm_prefill=False` server), 3 samples per size, prefill times from the engine's request log:
+chunks are unchanged (the 64-expert cap, read-ahead). Same test, same reference (`warm_kl.py`, `ref.json` from a
+server with exact prefill), 3 samples per size, prefill times from the engine's request log:
 
 | new tokens | exact prefill | warm prefill (fetch 64) | **exact short prefill** (new default) | top-1 / mean KL |
 |---|---|---|---|---|
@@ -425,11 +426,8 @@ answers in 54 % of its time; against warm prefill it costs +0.4-1.6 s per step u
 expert-sized records on this SSD reach 5.9-6.2 GB/s). The 300 and 800 rows still pay a second forward for their short
 tail (`engine/last_page.py`). A 4,000-token prompt (one 4k-row forward) and a 4,600-token one take no exact layer calls,
 so long prefills are unaffected. The run went through `bigmoe start deepseek-v4.1-flash` with no options set.
-`-o warm_exact_rows=0` restores warm prefill's speed for short steps, and `-o warm_exact_rows=256` keeps exact
-prefill only for steps up to 256 rows (the +0.4-1.6 s ones).
 
-GLM: the engine default is off (`EC_WARM_EXACT_ROWS=0`); GLM's warm prefill is off by default and this was not measured
-there.
+GLM: not measured there (GLM prefills exactly).
 
 Measured, not kept (same samples, sizes 100-1,000, sum of prefill times / top-1 / mean KL):
 
@@ -443,7 +441,7 @@ Measured, not kept (same samples, sizes 100-1,000, sum of prefill times / top-1 
 | every routed expert + read-ahead (64 / 384 guesses, `EC_WARM_AHEAD_MIN=0`) | 78.5 / 78.7 s | 100 % | 0 |
 
 - Leaving out even 0.2 % of the routing weight keeps KL at 0.0027, and it is only 6 % faster than reading every routed
-  expert. Approximation does not pay at these sizes. `warm_drop` is kept as an option for longer chunks (with `warm_fetch=384`), not measured there yet.
+  expert. Approximation does not pay at these sizes.
 - Substituting dropped picks with warm experts moves KL little and top-1 the wrong way.
 - Read-ahead guesses are right (93-95 % of them are used), but it covers only 19-20 % of the reads. A layer's compute is
   much shorter than its reads, so there is little time to run ahead of the real routing, and the reads already saturate
@@ -454,13 +452,10 @@ Measured, not kept (same samples, sizes 100-1,000, sum of prefill times / top-1 
   these samples the cold routing weight would fall from ~0.5 to 0.06-0.15 with an unbounded tier). But a bounded LRU
   evicts decode-hot experts, and it changes decode, so it was not tried either.
 
-Tools: `warm_kl.py force --min-n 100` skips the per-pick control sizes. The debug RPCs `warm_fetch` (`n`, `drop`,
-`exact_rows`, at runtime) and `warm_trace` (records each staged layer call's routing and cold set to a file) need
-`BIGMOE_DEBUG_RPC=1`.
 
 ## Tail checkpoints (DeepSeek, mode `nvme`, 2026-11-10)
 
-Where an exact short prefill's time goes (`warm_timeline` debug RPC, one forward per size, 8k cached prefix): at 100 new
+Where an exact short prefill's time goes (a debug timeline of each layer call, one forward per size, 8k cached prefix): at 100 new
 tokens, 4.64 s of the 5.16 s between the first and last MoE layer is waiting for that layer's NVMe-only experts (75 per
 layer); at 1,000 new tokens, 10.1 s of 11.5 s (163 per layer). The forward is NVMe-bound, at the SSD's ~6 GB/s, so the
 time is set by how many expert bytes it reads and how many forwards read them.
@@ -470,7 +465,7 @@ that tail on its own to checkpoint the recurrent state at the boundary (`engine/
 (under 512 picks per layer), and it reads again from NVMe most of the experts the forward before it had just read
 transiently. About a third of agent steps have such a tail (300 and 800 new tokens below: tails of 43 and 31).
 
-Now there is no split for DeepSeek (`tail_ckpt`, on by default in mode `nvme`). The prompt's last forward runs to its
+Now there is no split for DeepSeek (mode `nvme`). The prompt's last forward runs to its
 end, and the checkpoint at the last page boundary is stashed from the end state with its position moved back to the
 boundary. DeepSeek-V4's recurrent state can do this. Its SWA ring, compressor rings and CSA overlap snapshots are
 addressed by absolute position and keep at least a page of history: exllamav3 rewinds them by moving the cursor
@@ -492,12 +487,12 @@ Same benchmark as above (`warm_kl.py`, 3 samples per size, prefill seconds from 
 
 Against the exact reference: top-1 99.76 %, mean KL 0.0005 over the 3,344 positions. Every difference is in the 300-
 and 800-token samples (98.7 % / 0.0018 and 99.2 % / 0.0025). Those six samples are **bit-identical** (KL 0) to exact
-staging (`warm_prefill=false`) with the same tail checkpoints, so the difference is the chunking alone: the tail
+staging (warm prefill off) with the same tail checkpoints, so the difference is the chunking alone: the tail
 computed in the same forward as the tokens before it instead of in one of its own, which changes the rounding the way
 moving any chunk boundary does. Neither chunking is the exact one. The other 21 samples stay bit-identical to the
 reference.
 
-Follow-ups resumed from these checkpoints (`tools/tail_kl.py`: each prompt, then a follow-up of 32 + 100 new tokens
+Follow-ups resumed from these checkpoints (`tools/tail_kl.py` at commit d2993fe: each prompt, then a follow-up of 32 + 100 new tokens
 that resumes from the prompt's last-page checkpoint; split server as the reference; 2 samples per tail, 1,024 forced
 positions):
 
@@ -521,17 +516,16 @@ positions):
   malformed), 152.8 s (earlier runs: 164.5-167.7 s), mean time to first token 5.0-5.3 s per task (5.7 s), prefix reuse
   79 % (80 %). Agent trajectories differ from run to run, so this is a sanity check, not a measurement of the gain.
 
-The same change applies to the faster, approximate settings (same benchmark, sum of one step of each size / top-1 /
+The faster, approximate settings, which were options then (same benchmark, sum of one step of each size / top-1 /
 mean KL against the exact reference):
 
 | setting | before (split) | with tail checkpoints |
 |---|---|---|
-| default (exact short forwards, `warm_exact_rows=1024`) | 79.0 s / 100 % / 0 | **71.5 s / 99.76 % / 0.0005** |
-| `-o warm_exact_rows=0 -o warm_fetch=384 -o warm_drop=0.005` | 69.9 s / 98.09 % / 0.0034 | 62.2 s / 97.82 % / 0.0036 |
-| `-o warm_exact_rows=0` (fetch 64) | 54.2 s / 97.40 % / 0.0065 | 46.3 s / 97.07 % / 0.0076 |
+| default (exact short forwards) | 79.0 s / 100 % / 0 | **71.5 s / 99.76 % / 0.0005** |
+| `warm_exact_rows=0 warm_fetch=384 warm_drop=0.005` | 69.9 s / 98.09 % / 0.0034 | 62.2 s / 97.82 % / 0.0036 |
+| `warm_exact_rows=0` (fetch 64) | 54.2 s / 97.40 % / 0.0065 | 46.3 s / 97.07 % / 0.0076 |
 
-(With the approximate settings the tail now goes through warm prefill too: before it was a per-pick, exact forward.)
-`-o tail_ckpt=false` restores the split. Debug RPC `tail_ckpt` (on / off at runtime) needs `BIGMOE_DEBUG_RPC=1`.
+(With the approximate settings the tail went through warm prefill too: with the split it was a per-pick, exact forward.)
 
 Measured, not kept: **keeping what a prefill reads in the RAM tier.** An exact short forward reads 75-165 NVMe-only
 experts per layer and drops them. Reading the 16 heaviest per layer into RAM-tier slots instead (evicting the
@@ -540,3 +534,17 @@ slower: 82.5 s instead of 79.0 s, decode 12.99 s instead of 12.77 s per answer. 
 routing, an LRU that lands 8-384 experts per layer reads 0-98 % more cold experts than leaving the tier alone (the
 landed experts evict ones decode keeps reusing). A frequency-scored swap reads 9-13 % fewer, which is not enough to pay
 for the extra copies.
+
+## Prefill options removed (2026-11-10)
+
+The measured default is now the only prefill. Removed: the backend options `warm_prefill` (both models), `warm_fetch`,
+`warm_exact_rows`, `warm_drop`, `warm_ahead`, `warm_ahead_n` and `tail_ckpt`; their engine variables; the debug RPCs
+`warm_prefill_switch`, `warm_ahead`, `warm_fetch`, `warm_trace`, `warm_timeline` and `tail_ckpt`; and the A/B tools
+`models/dsv41/tools/warm_kl.py` and `tail_kl.py`, which needed those switches. The sections above that measure them used
+the code at commit d2993fe. A removed option given with `-o` is refused as unknown.
+
+What is left: DeepSeek in mode `nvme` prefills through `engine/warm_prefill.py`. A staged forward of up to 1,024 rows
+reads every NVMe-only expert its routing touches. A longer one reads the 64 heaviest per layer, with read-ahead, and
+drops the rest. A prompt's last-page checkpoint is stashed from the end of its last forward (`engine/last_page.py`,
+chosen by the model's recurrent state: DeepSeek-V4's rewinds). GLM, and mode `nvme-exact`, stage every expert; GLM
+keeps the last-page split for tails of up to 63 tokens.

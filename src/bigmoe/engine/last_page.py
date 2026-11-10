@@ -12,7 +12,7 @@ and a follow-up resumes from the last chunk-boundary checkpoint instead. Applied
 recompiled from its source with one condition added (the installed file is not modified); a source without the expected
 stock snippet is left alone with a warning.
 
-Tail checkpoints (EC_TAIL_CKPT=1, DeepSeek-V4 only: rewindable()): no split at all. The prompt's last forward runs to
+Tail checkpoints (models whose recurrent state rewinds by cursor: DeepSeek-V4, rewindable()): no split at all. The prompt's last forward runs to
 its end, and the checkpoint at the last page boundary is stashed afterwards from the end state with its position moved
 back to the boundary. DeepSeek-V4's recurrent state is position-derived and keeps at least a page of history (the SWA
 ring, the compressor rings and the CSA overlap snapshots: exllamav3 rewinds them by moving the cursor, cache/dsa.py), and
@@ -56,7 +56,6 @@ PATCHED_STASH = """\
 
 # tail checkpoints: stashed / skipped (the state could not be moved back to the boundary) / page not complete
 STATS = {"tail_ckpt": 0, "tail_ckpt_skipped": 0, "tail_ckpt_page": 0}
-_ON = {"tail_ckpt": False, "limit": 0}
 
 
 def tail_limit(stage_min: int, experts_per_token: int) -> int:
@@ -151,22 +150,11 @@ def stash_tail(job, seq, prefill_start: int, prefill_end: int):
     STATS["tail_ckpt"] += 1
 
 
-def set_tail_ckpt(on: bool) -> dict:
-    """Runtime switch (A/B on one server): tail checkpoints on, or the last-page split for short tails."""
-    from exllamav3.generator import job as J
-    on = bool(on) and getattr(J.Job.prefill, "_bigmoe_tail_ckpt", False)
-    J._BIGMOE_TAIL_CKPT = stash_tail if on else None
-    J._BIGMOE_LAST_PAGE_MAX = -1 if on else _ON["limit"]
-    _ON["tail_ckpt"] = on
-    return {"tail_ckpt": on, "last_page_max": J._BIGMOE_LAST_PAGE_MAX}
-
-
 def apply(stage_min: int, experts_per_token: int, tail_ckpt: bool = False) -> str:
-    """Recompile exllamav3's Job.prefill with the tail limit (and the tail-checkpoint hook) for this engine. Returns a
-    status line."""
+    """Recompile exllamav3's Job.prefill with the tail limit, or with no split and the tail-checkpoint hook
+    (tail_ckpt: the model's state rewinds, rewindable()). Returns a status line."""
     from exllamav3.generator import job as J
     limit = tail_limit(stage_min, experts_per_token)
-    _ON["limit"] = limit
     J._BIGMOE_LAST_PAGE_MAX = limit
     J._BIGMOE_TAIL_CKPT = None
     if not getattr(J.Job.prefill, "_bigmoe_last_page", False):
@@ -195,6 +183,8 @@ def apply(stage_min: int, experts_per_token: int, tail_ckpt: bool = False) -> st
         if not getattr(J.Job.prefill, "_bigmoe_tail_ckpt", False):
             print(" !! last_page: exllamav3's Job.prefill lacks the stock last-page stash; tail checkpoints off",
                   file=sys.stderr, flush=True)
-        elif set_tail_ckpt(True)["tail_ckpt"]:
+        else:
+            J._BIGMOE_LAST_PAGE_MAX = -1
+            J._BIGMOE_TAIL_CKPT = stash_tail
             return "no last-page split: tail checkpoints stashed after the prompt's last forward"
     return f"last-page split for tails <= {limit} tokens"

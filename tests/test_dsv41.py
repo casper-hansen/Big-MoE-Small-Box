@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import struct
 from pathlib import Path
@@ -146,30 +147,17 @@ def test_store_v2_mixed_sizes(odirect_dir, tmp_path):
     assert V2.compare(md, odirect_dir, "s", sample=6, log=lambda m: None) == []
 
 
-def test_warm_prefill_on_by_default(tmp_path, monkeypatch):
+def test_warm_prefill_in_mode_nvme(tmp_path, monkeypatch):
     _, spec = spec_for(tmp_path, monkeypatch)
-    assert spec.env["DSV41_EC_WARM_PREFILL"] == "1" and spec.env["DSV41_EC_WARM_FETCH"] == "64"
-    assert spec.env["DSV41_EC_WARM_AHEAD"] == "1" and "DSV41_EC_WARM_AHEAD_N" not in spec.env
-    assert spec.env["DSV41_EC_WARM_EXACT_ROWS"] == "1024" and spec.env["DSV41_EC_WARM_DROP"] == "0"
-    assert spec.env["DSV41_EC_TAIL_CKPT"] == "1"
-    _, spec = spec_for(tmp_path, monkeypatch, tail_ckpt=False)
-    assert spec.env["DSV41_EC_TAIL_CKPT"] == "0"
-    _, spec = spec_for(tmp_path, monkeypatch, warm_exact_rows=0, warm_drop=0.005)
-    assert spec.env["DSV41_EC_WARM_EXACT_ROWS"] == "0" and spec.env["DSV41_EC_WARM_DROP"] == "0.005"
-    for bad in ({"warm_exact_rows": -1}, {"warm_drop": 1.0}):
-        with pytest.raises(ValueError):
-            spec_for(tmp_path, monkeypatch, **bad)
-    _, spec = spec_for(tmp_path, monkeypatch, warm_fetch=192, warm_ahead_n=128)
-    assert spec.env["DSV41_EC_WARM_FETCH"] == "192" and spec.env["DSV41_EC_WARM_AHEAD_N"] == "128"
-    _, spec = spec_for(tmp_path, monkeypatch, warm_prefill=False)
-    assert spec.env["DSV41_EC_WARM_PREFILL"] == "0" and "DSV41_EC_WARM_AHEAD" not in spec.env
-    _, spec = spec_for(tmp_path, monkeypatch, warm_ahead=False)
-    assert spec.env["DSV41_EC_WARM_AHEAD"] == "0"
-    with pytest.raises(ValueError):
-        spec_for(tmp_path, monkeypatch, warm_ahead_n=385)
+    assert spec.env["DSV41_EC_WARM_PREFILL"] == "1"
+    # no knobs: the fetch policy, read-ahead and tail checkpoints are the implementation (engine/warm_prefill.py,
+    # engine/last_page.py)
+    assert not [k for k in spec.env if k.startswith(("DSV41_EC_WARM_", "DSV41_EC_TAIL")) and k != "DSV41_EC_WARM_PREFILL"]
+    names = {f.name for f in dataclasses.fields(dsv41.DSV41Options)}
+    assert not names & {"warm_prefill", "warm_fetch", "warm_exact_rows", "warm_drop", "warm_ahead", "warm_ahead_n",
+                        "tail_ckpt"}
     _, spec = spec_for(tmp_path, monkeypatch, mode="nvme-exact")
-    assert "DSV41_EC_WARM_PREFILL" not in spec.env and "DSV41_EC_TAIL_CKPT" not in spec.env   # exllamav3's prefill
-
+    assert "DSV41_EC_WARM_PREFILL" not in spec.env   # exllamav3's prefill
 
 def test_vllm_is_the_only_server(tmp_path, monkeypatch):
     _box, spec = spec_for(tmp_path, monkeypatch)
