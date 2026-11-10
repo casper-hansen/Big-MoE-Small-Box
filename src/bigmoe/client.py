@@ -79,9 +79,11 @@ class Client:
             return json.loads(resp.read())
 
     def health(self) -> bool:
+        # vLLM's /health answers 200 with an empty body
         try:
-            return bool(self.request("/health", timeout=5).get("ok"))
-        except BoxError:
+            with urllib.request.urlopen(self.url + "/health", timeout=5) as r:
+                return r.status == 200
+        except (urllib.error.URLError, OSError):
             return False
 
     def models(self) -> list:

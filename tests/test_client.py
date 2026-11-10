@@ -28,6 +28,11 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
 
     def do_GET(self):
+        if self.path == "/health":  # like vLLM: 200, empty body
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self._json({"ok": True})
 
     def do_POST(self):
